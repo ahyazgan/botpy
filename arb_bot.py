@@ -216,18 +216,12 @@ async def verify_opportunity(
 # ── Hızlı ön eleme (CLOB çağırmadan) ────────────────────────────────────
 def quick_screen(market: Market) -> bool:
     """Gamma fiyatlarıyla hızlı kontrol — yanlış pozitif olabilir, OK."""
-    ya, na = market.yes_ask, market.no_ask
-    yb, nb = market.yes_bid, market.no_bid
-
-    if ya is not None and na is not None:
-        if (ya + na) < (1.0 - MIN_PROFIT / 2):  # daha gevşek eşik
-            return True
-
-    if yb is not None and nb is not None:
-        if (yb + nb) > (1.0 + MIN_PROFIT / 2):
-            return True
-
-    return False
+    # Gamma'dan türetilen NO fiyatları YES fiyatlarına matematiksel olarak
+    # bağlı olduğundan (no_ask = 1 - yes_bid, no_bid = 1 - yes_ask),
+    # yes_ask + no_ask her zaman 1 + spread > 1 ve yes_bid + no_bid her
+    # zaman 1 - spread < 1 olur. Gamma verisiyle anlamlı ön eleme yapılamaz;
+    # tüm hacim filtreli marketleri CLOB doğrulamasına gönder.
+    return True
 
 
 # ── Emir gönderici ───────────────────────────────────────────────────────
@@ -306,13 +300,13 @@ async def main_loop(client: ClobClient) -> None:
                 raw_markets = await fetch_markets(session)
                 markets = [m for raw in raw_markets if (m := parse_market(raw))]
 
-                # 2. Gamma fiyatlarıyla hızlı ön eleme
-                candidates = [m for m in markets if quick_screen(m)]
+                # 2. Tüm hacim filtreli marketleri CLOB doğrulamasına gönder
+                candidates = markets  # quick_screen her zaman True döndürür
 
                 scan_ms = (time.monotonic() - t0) * 1000
                 log.info(
-                    "Tarama | %d market | %d aday | %.0fms",
-                    len(markets), len(candidates), scan_ms,
+                    "Tarama | %d market | CLOB dogrulama | %.0fms",
+                    len(markets), scan_ms,
                 )
 
                 # 3. Adaylar için CLOB orderbook'unu paralel çek ve doğrula

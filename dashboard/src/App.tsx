@@ -29,6 +29,25 @@ type BtcPayload = {
   error: string | null;
 };
 
+type TradeRow = {
+  id: string;
+  market_id: string;
+  question: string;
+  side: "YES" | "NO";
+  amount_usdc: number;
+  entry_price: number;
+  shares: number;
+  current_price: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  opened_at: string;
+};
+
+type TradesPayload = {
+  trades: TradeRow[];
+  total_pnl: number;
+};
+
 type SortKey = "question" | "bid" | "ask" | "spread" | "volume24h";
 type SortDir = "asc" | "desc";
 
@@ -55,6 +74,21 @@ function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
   );
 }
 
+function PnlBadge({ pnl, pnl_pct }: { pnl: number | null; pnl_pct: number | null }) {
+  if (pnl === null) return <span className="text-zinc-500">—</span>;
+  const pos = pnl >= 0;
+  return (
+    <span className={pos ? "text-emerald-400" : "text-red-400"}>
+      {pos ? "+" : ""}{pnl.toFixed(2)} USDC
+      {pnl_pct !== null && (
+        <span className="ml-1 text-xs opacity-70">
+          ({pos ? "+" : ""}{pnl_pct.toFixed(1)}%)
+        </span>
+      )}
+    </span>
+  );
+}
+
 export default function App() {
   const [markets, setMarkets] = useState<MarketRow[]>([]);
   const [btc, setBtc] = useState<number | null>(null);
@@ -75,12 +109,19 @@ export default function App() {
   const [sortKey, setSortKey] = useState<SortKey>("volume24h");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
+  // Paper trading
+  const [tradeAmount, setTradeAmount] = useState("100");
+  const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [totalPnl, setTotalPnl] = useState(0);
+  const [tradingId, setTradingId] = useState<string | null>(null); // market being traded
+
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [mRes, bRes] = await Promise.all([
+      const [mRes, bRes, tRes] = await Promise.all([
         fetch(`${API_BASE}/markets`),
         fetch(`${API_BASE}/btc`),
+        fetch(`${API_BASE}/trades`),
       ]);
       if (!mRes.ok) throw new Error(`markets ${mRes.status}`);
       if (!bRes.ok) throw new Error(`btc ${bRes.status}`);
@@ -95,6 +136,11 @@ export default function App() {
         updated_at: mData.updated_at,
       });
       setBtc(bData.price);
+      if (tRes.ok) {
+        const tData: TradesPayload = await tRes.json();
+        setTrades(tData.trades);
+        setTotalPnl(tData.total_pnl);
+      }
       const apiErr = mData.error ?? bData.error;
       if (apiErr) setErr(apiErr);
     } catch (e) {
@@ -144,6 +190,46 @@ export default function App() {
       setMinVol(parsed);
     } else {
       setMinVolInput(String(minVol));
+    }
+  };
+
+  const placeTrade = async (market: MarketRow, side: "YES" | "NO") => {
+    const amount = parseFloat(tradeAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setErr("Gecersiz islem tutari");
+      return;
+    }
+    setTradingId(`${market.id}-${side}`);
+    try {
+      const r = await fetch(`${API_BASE}/trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market_id: market.id, side, amount_usdc: amount }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.detail ?? String(r.status));
+      }
+      // Refresh trades
+      const tRes = await fetch(`${API_BASE}/trades`);
+      if (tRes.ok) {
+        const tData: TradesPayload = await tRes.json();
+        setTrades(tData.trades);
+        setTotalPnl(tData.total_pnl);
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Islem basarisiz");
+    } finally {
+      setTradingId(null);
+    }
+  };
+
+  const closeTrade = async (tradeId: string) => {
+    try {
+      await fetch(`${API_BASE}/trades/${tradeId}`, { method: "DELETE" });
+      setTrades((prev) => prev.filter((t) => t.id !== tradeId));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Kapatma basarisiz");
     }
   };
 
@@ -278,7 +364,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Arama ve filtre araçları */}
+        {/* Arama, filtre ve islem tutari */}
         <div className="mt-6 flex flex-wrap gap-3">
           <input
             type="text"
@@ -299,13 +385,24 @@ export default function App() {
               className="h-10 w-32 rounded-xl border border-zinc-700 bg-zinc-800/80 px-3 text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/30"
             />
           </div>
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-zinc-500 whitespace-nowrap">Islem tutari (USDC)</label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={tradeAmount}
+              onChange={(e) => setTradeAmount(e.target.value)}
+              className="h-10 w-28 rounded-xl border border-zinc-700 bg-zinc-800/80 px-3 text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/30"
+            />
+          </div>
         </div>
       </header>
 
       <main className="mx-auto mt-6 max-w-7xl">
+        {/* Markets table */}
         <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] text-left text-sm">
+            <table className="w-full min-w-[1000px] text-left text-sm">
               <thead>
                 <tr className="border-b border-white/10 bg-zinc-900/90">
                   <th className={thClass} onClick={() => handleSort("question")}>
@@ -323,18 +420,21 @@ export default function App() {
                   <th className={`${thClass} text-right`} onClick={() => handleSort("volume24h")}>
                     Vol 24h <SortIcon active={sortKey === "volume24h"} dir={sortDir} />
                   </th>
+                  <th className="px-4 py-3 font-semibold text-zinc-400 text-center whitespace-nowrap">
+                    Islem
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {loading && markets.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-4 py-12 text-center text-zinc-500">
+                    <td colSpan={6} className="px-4 py-12 text-center text-zinc-500">
                       Yukleniyor…
                     </td>
                   </tr>
                 ) : displayedMarkets.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-4 py-12 text-center text-zinc-500">
+                    <td colSpan={6} className="px-4 py-12 text-center text-zinc-500">
                       Veri yok veya filtre sonucu bos.
                     </td>
                   </tr>
@@ -359,6 +459,26 @@ export default function App() {
                       <td className="px-4 py-3 text-right tabular-nums text-zinc-400">
                         {fmtVol(row.volume24h)}
                       </td>
+                      <td className="px-4 py-3 text-center">
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            type="button"
+                            disabled={tradingId === `${row.id}-YES`}
+                            onClick={() => void placeTrade(row, "YES")}
+                            className="rounded-lg border border-emerald-600/40 bg-emerald-950/50 px-3 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-900/60 disabled:opacity-40"
+                          >
+                            {tradingId === `${row.id}-YES` ? "…" : "Al YES"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={tradingId === `${row.id}-NO`}
+                            onClick={() => void placeTrade(row, "NO")}
+                            className="rounded-lg border border-red-600/40 bg-red-950/50 px-3 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-900/60 disabled:opacity-40"
+                          >
+                            {tradingId === `${row.id}-NO` ? "…" : "Al NO"}
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))
                 )}
@@ -366,6 +486,86 @@ export default function App() {
             </table>
           </div>
         </div>
+
+        {/* Portfolio */}
+        {trades.length > 0 && (
+          <div className="mt-10">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-white">
+                Portfoy{" "}
+                <span className="ml-2 text-sm font-normal text-zinc-500">
+                  ({trades.length} pozisyon)
+                </span>
+              </h2>
+              <span className={`text-sm font-semibold ${totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                Toplam P&L:{" "}
+                {totalPnl >= 0 ? "+" : ""}
+                {totalPnl.toFixed(2)} USDC
+              </span>
+            </div>
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[800px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/10 bg-zinc-900/90">
+                      <th className="px-4 py-3 font-semibold text-zinc-400">Market</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400">Yon</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400">Tutar</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400">Giris</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400">Simdi</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400">P&L</th>
+                      <th className="px-4 py-3 font-semibold text-zinc-400 text-center">Kapat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trades.map((t) => (
+                      <tr
+                        key={t.id}
+                        className="border-b border-white/5 transition hover:bg-white/[0.03]"
+                      >
+                        <td className="max-w-xs px-4 py-3 text-zinc-200 text-xs">
+                          {t.question}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`rounded-md px-2 py-0.5 text-xs font-bold ${
+                              t.side === "YES"
+                                ? "bg-emerald-950/60 text-emerald-300"
+                                : "bg-red-950/60 text-red-300"
+                            }`}
+                          >
+                            {t.side}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-300">
+                          ${t.amount_usdc.toFixed(2)}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-400">
+                          {t.entry_price.toFixed(4)}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-300">
+                          {t.current_price !== null ? t.current_price.toFixed(4) : "—"}
+                        </td>
+                        <td className="px-4 py-3 tabular-nums">
+                          <PnlBadge pnl={t.pnl} pnl_pct={t.pnl_pct} />
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          <button
+                            type="button"
+                            onClick={() => void closeTrade(t.id)}
+                            className="rounded-lg border border-zinc-600/40 bg-zinc-800/60 px-3 py-1 text-xs font-medium text-zinc-300 transition hover:border-red-500/40 hover:text-red-300"
+                          >
+                            Kapat
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

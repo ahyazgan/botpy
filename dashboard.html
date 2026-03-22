@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Polymarket — Tarayıcı Paneli</title>
+    <style>
+      :root {
+        --bg: #0a0a0b;
+        --surface: #121214;
+        --border: #27272a;
+        --text: #e4e4e7;
+        --muted: #a1a1aa;
+        --accent: #34d399;
+        --danger: #f87171;
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background: radial-gradient(
+            ellipse 120% 80% at 50% -20%,
+            rgba(52, 211, 153, 0.12),
+            transparent
+          ),
+          radial-gradient(
+            ellipse 60% 40% at 100% 0%,
+            rgba(59, 130, 246, 0.08),
+            transparent
+          ),
+          var(--bg);
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 2rem 1.25rem 3rem;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.25rem;
+        align-items: flex-start;
+        justify-content: space-between;
+        margin-bottom: 1.75rem;
+      }
+      h1 {
+        margin: 0.15rem 0 0.35rem;
+        font-size: 1.65rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .eyebrow {
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent);
+        margin: 0;
+      }
+      .sub {
+        margin: 0;
+        max-width: 36rem;
+        font-size: 0.9rem;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      .btc-card {
+        border: 1px solid var(--border);
+        border-radius: 1rem;
+        padding: 1rem 1.25rem;
+        background: linear-gradient(
+          145deg,
+          rgba(24, 24, 27, 0.95),
+          rgba(9, 9, 11, 0.98)
+        );
+        box-shadow: var(--shadow);
+        min-width: 200px;
+      }
+      .btc-card label {
+        display: block;
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-bottom: 0.35rem;
+      }
+      .btc-card .price {
+        font-size: 1.75rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.03em;
+      }
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem 1.25rem;
+        font-size: 0.85rem;
+        color: var(--muted);
+        margin-bottom: 1rem;
+      }
+      .meta strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .alert {
+        display: none;
+        border: 1px solid rgba(248, 113, 113, 0.35);
+        background: rgba(127, 29, 29, 0.35);
+        color: #fecaca;
+        padding: 0.75rem 1rem;
+        border-radius: 0.75rem;
+        font-size: 0.875rem;
+        margin-bottom: 1rem;
+      }
+      .alert.visible {
+        display: block;
+      }
+      .table-shell {
+        border: 1px solid var(--border);
+        border-radius: 1rem;
+        overflow: hidden;
+        background: rgba(18, 18, 20, 0.65);
+        backdrop-filter: blur(8px);
+        box-shadow: var(--shadow);
+      }
+      .table-scroll {
+        overflow-x: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.8125rem;
+      }
+      thead {
+        background: rgba(24, 24, 27, 0.95);
+        border-bottom: 1px solid var(--border);
+      }
+      th {
+        text-align: left;
+        padding: 0.75rem 1rem;
+        font-weight: 600;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      th:last-child,
+      td:last-child {
+        text-align: right;
+      }
+      td {
+        padding: 0.65rem 1rem;
+        border-bottom: 1px solid rgba(39, 39, 42, 0.65);
+        vertical-align: top;
+      }
+      tbody tr:hover {
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .q {
+        max-width: 420px;
+        color: var(--text);
+        line-height: 1.4;
+      }
+      .num {
+        font-variant-numeric: tabular-nums;
+        color: #d4d4d8;
+      }
+      .spread {
+        color: var(--accent);
+      }
+      .loading td {
+        text-align: center;
+        color: var(--muted);
+        padding: 2.5rem 1rem;
+      }
+      footer {
+        margin-top: 1.25rem;
+        font-size: 0.75rem;
+        color: #71717a;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div>
+          <p class="eyebrow">Polymarket</p>
+          <h1>Market tarayıcı</h1>
+          <p class="sub">
+            Veriler <code style="color: var(--accent)">http://localhost:3001</code>
+            üzerinden (<code>/markets</code>, <code>/btc</code>). Sayfa her 30 saniyede
+            yenilenir. Önce
+            <code style="color: var(--accent)">uvicorn api:app --reload --port 3001</code>
+            çalıştırın.
+          </p>
+        </div>
+        <div class="btc-card">
+          <label>BTC / USDT (yerel API)</label>
+          <div class="price" id="btcPrice">—</div>
+        </div>
+      </header>
+
+      <div class="alert" id="alert" role="alert"></div>
+
+      <div class="meta" id="meta"></div>
+
+      <div class="table-shell">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th>Bid</th>
+                <th>Ask</th>
+                <th>Spread</th>
+                <th>Vol 24h</th>
+              </tr>
+            </thead>
+            <tbody id="rows">
+              <tr class="loading">
+                <td colspan="5">Yükleniyor…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <footer id="foot"></footer>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        var API_BASE = "http://localhost:3001";
+        var INTERVAL_MS = 30000;
+        /** Çok satırı önlemek için (tüm listeyi DOM’a basmaz) */
+        var MIN_VOL_24H = 10000;
+
+        function $(id) {
+          return document.getElementById(id);
+        }
+
+        function escapeHtml(s) {
+          return String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+        }
+
+        function toNum(v) {
+          if (v === null || v === undefined || v === "") return null;
+          var n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        }
+
+        function fmtPrice(n, d) {
+          if (n === null || n === undefined) return "—";
+          return n.toFixed(d !== undefined ? d : 4);
+        }
+
+        function fmtVol(n) {
+          if (n === null || n === undefined) return "—";
+          return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        }
+
+        function showAlert(msg) {
+          var el = $("alert");
+          if (!msg) {
+            el.textContent = "";
+            el.classList.remove("visible");
+            return;
+          }
+          el.textContent = msg;
+          el.classList.add("visible");
+        }
+
+        function fetchJson(url) {
+          return fetch(url, { method: "GET", cache: "no-store" }).then(
+            function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.json();
+            }
+          );
+        }
+
+        function fetchAllActiveMarkets() {
+          return fetchJson(API_BASE + "/markets").then(function (data) {
+            return Array.isArray(data) ? data : [];
+          });
+        }
+
+        function fetchBtc() {
+          return fetchJson(API_BASE + "/btc").then(function (d) {
+            return toNum(d.price);
+          });
+        }
+
+        function rowSpread(m) {
+          var bid = toNum(m.bestBid);
+          var ask = toNum(m.bestAsk);
+          if (bid !== null && ask !== null) return ask - bid;
+          return toNum(m.spread);
+        }
+
+        function refresh() {
+          showAlert("");
+
+          Promise.all([fetchBtc(), fetchAllActiveMarkets()])
+            .then(function (pair) {
+              var btc = pair[0];
+              var raw = pair[1];
+
+              $("btcPrice").textContent =
+                btc !== null
+                  ? "$" +
+                    btc.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                  : "—";
+
+              var filtered = raw.filter(function (m) {
+                return (toNum(m.volume24hr) || 0) > MIN_VOL_24H;
+              });
+              filtered.sort(function (a, b) {
+                return (
+                  (toNum(b.volume24hr) || 0) - (toNum(a.volume24hr) || 0)
+                );
+              });
+
+              $("meta").innerHTML =
+                "Aktif market: <strong>" +
+                raw.length +
+                "</strong> · Filtre (vol24h &gt; " +
+                MIN_VOL_24H.toLocaleString() +
+                "): <strong>" +
+                filtered.length +
+                "</strong> · Son güncelleme: <strong>" +
+                new Date().toLocaleString() +
+                "</strong>";
+
+              var tbody = $("rows");
+              tbody.innerHTML = "";
+
+              if (!filtered.length) {
+                var tr0 = document.createElement("tr");
+                tr0.className = "loading";
+                tr0.innerHTML =
+                  '<td colspan="5">Filtre sonucu yok veya veri alınamadı.</td>';
+                tbody.appendChild(tr0);
+                return;
+              }
+
+              for (var i = 0; i < filtered.length; i++) {
+                var m = filtered[i];
+                var q = (m.question || m.slug || "?").trim();
+                var bid = toNum(m.bestBid);
+                var ask = toNum(m.bestAsk);
+                var sp = rowSpread(m);
+                var vol = toNum(m.volume24hr);
+
+                var tr = document.createElement("tr");
+                tr.innerHTML =
+                  '<td class="q">' +
+                  escapeHtml(q) +
+                  "</td>" +
+                  '<td class="num">' +
+                  fmtPrice(bid) +
+                  "</td>" +
+                  '<td class="num">' +
+                  fmtPrice(ask) +
+                  "</td>" +
+                  '<td class="num spread">' +
+                  fmtPrice(sp) +
+                  "</td>" +
+                  '<td class="num">' +
+                  fmtVol(vol) +
+                  "</td>";
+                tbody.appendChild(tr);
+              }
+
+              $("foot").textContent =
+                "Backend: http://localhost:3001 (api.py). CORS tarayıcıdan engellenmez.";
+            })
+            .catch(function (e) {
+              $("btcPrice").textContent = "—";
+              $("rows").innerHTML =
+                '<tr class="loading"><td colspan="5">Hata: veri alınamadı.</td></tr>';
+              showAlert(
+                "İstek başarısız — api.py çalışıyor mu? (uvicorn api:app --reload --port 3001). " +
+                  (e && e.message ? e.message : String(e))
+              );
+            });
+        }
+
+        refresh();
+        setInterval(refresh, INTERVAL_MS);
+      })();
+    </script>
+  </body>
+</html>

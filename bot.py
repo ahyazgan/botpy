@@ -1,6 +1,6 @@
 """
 Polymarket market tarayici: Gamma API + Binance BTC spot.
-FastAPI: /markets, /btc, /settings (PAPER_MODE).
+FastAPI: /markets, /btc, /settings (PAPER_MODE), /trade, /trades.
 """
 
 from __future__ import annotations
@@ -10,12 +10,13 @@ import logging
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -37,6 +38,10 @@ _cache: dict[str, Any] = {
     "error": None,
     "updated_at": None,
 }
+
+# In-memory paper trade store
+_trades_lock = threading.Lock()
+_paper_trades: list[dict[str, Any]] = []
 
 
 def setup_logging() -> None:
@@ -239,6 +244,31 @@ class SettingsResponse(BaseModel):
     paper_mode: bool
 
 
+class TradeRequest(BaseModel):
+    market_id: str
+    side: str  # "YES" | "NO"
+    amount_usdc: float = Field(gt=0)
+
+
+class TradeRow(BaseModel):
+    id: str
+    market_id: str
+    question: str
+    side: str
+    amount_usdc: float
+    entry_price: float
+    shares: float
+    current_price: float | None
+    pnl: float | None
+    pnl_pct: float | None
+    opened_at: str
+
+
+class TradesResponse(BaseModel):
+    trades: list[TradeRow]
+    total_pnl: float
+
+
 @app.get("/btc", response_model=BtcResponse)
 def get_btc() -> BtcResponse:
     with _cache_lock:
@@ -271,6 +301,97 @@ def patch_settings(body: SettingsBody) -> SettingsResponse:
     PAPER_MODE = body.paper_mode
     logging.info("PAPER_MODE -> %s", PAPER_MODE)
     return SettingsResponse(paper_mode=PAPER_MODE)
+
+
+def _market_current_price(market_id: str, side: str) -> float | None:
+    """Returns current mark price for the given side from cache."""
+    with _cache_lock:
+        for m in _cache["markets"]:
+            if m["id"] == market_id:
+                if side == "YES":
+                    return m.get("bid")  # exit price for YES = bid
+                else:
+                    ask = m.get("ask")
+                    return (1.0 - ask) if ask is not None else None
+    return None
+
+
+@app.post("/trade", response_model=TradeRow)
+def post_trade(body: TradeRequest) -> TradeRow:
+    side = body.side.upper()
+    if side not in ("YES", "NO"):
+        raise HTTPException(status_code=400, detail="side must be YES or NO")
+
+    with _cache_lock:
+        market = next((m for m in _cache["markets"] if m["id"] == body.market_id), None)
+
+    if market is None:
+        raise HTTPException(status_code=404, detail="market not found")
+
+    if side == "YES":
+        entry = market.get("ask")
+    else:
+        bid = market.get("bid")
+        entry = (1.0 - bid) if bid is not None else None
+
+    if entry is None or entry <= 0:
+        raise HTTPException(status_code=422, detail="entry price unavailable")
+
+    shares = body.amount_usdc / entry
+    trade: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "market_id": body.market_id,
+        "question": market["question"],
+        "side": side,
+        "amount_usdc": body.amount_usdc,
+        "entry_price": entry,
+        "shares": shares,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _trades_lock:
+        _paper_trades.append(trade)
+
+    logging.info(
+        "PAPER TRADE | %s | %s | %.2f USDC @ %.4f | shares=%.4f",
+        trade["question"][:50],
+        side,
+        body.amount_usdc,
+        entry,
+        shares,
+    )
+
+    current_price = _market_current_price(body.market_id, side)
+    pnl = (shares * current_price - body.amount_usdc) if current_price is not None else None
+    pnl_pct = ((current_price / entry) - 1) * 100 if current_price is not None else None
+    return TradeRow(**trade, current_price=current_price, pnl=pnl, pnl_pct=pnl_pct)
+
+
+@app.get("/trades", response_model=TradesResponse)
+def get_trades() -> TradesResponse:
+    with _trades_lock:
+        snapshot = list(_paper_trades)
+
+    rows: list[TradeRow] = []
+    total_pnl = 0.0
+    for t in snapshot:
+        current_price = _market_current_price(t["market_id"], t["side"])
+        pnl = (t["shares"] * current_price - t["amount_usdc"]) if current_price is not None else None
+        pnl_pct = ((current_price / t["entry_price"]) - 1) * 100 if current_price is not None else None
+        rows.append(TradeRow(**t, current_price=current_price, pnl=pnl, pnl_pct=pnl_pct))
+        if pnl is not None:
+            total_pnl += pnl
+
+    return TradesResponse(trades=rows, total_pnl=total_pnl)
+
+
+@app.delete("/trades/{trade_id}")
+def delete_trade(trade_id: str) -> dict[str, str]:
+    with _trades_lock:
+        idx = next((i for i, t in enumerate(_paper_trades) if t["id"] == trade_id), None)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="trade not found")
+        _paper_trades.pop(idx)
+    return {"deleted": trade_id}
 
 
 def run_scan(session: requests.Session) -> None:

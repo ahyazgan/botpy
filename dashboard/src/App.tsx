@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 const POLL_MS = 30_000;
@@ -29,6 +29,9 @@ type BtcPayload = {
   error: string | null;
 };
 
+type SortKey = "question" | "bid" | "ask" | "spread" | "volume24h";
+type SortDir = "asc" | "desc";
+
 function fmtNum(n: number | null | undefined, decimals = 4): string {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return n.toFixed(decimals);
@@ -44,6 +47,14 @@ function fmtBtc(n: number | null | undefined): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
+function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
+  return (
+    <span className={`ml-1 inline-block text-xs ${active ? "text-emerald-400" : "text-zinc-600"}`}>
+      {active ? (dir === "asc" ? "▲" : "▼") : "⇅"}
+    </span>
+  );
+}
+
 export default function App() {
   const [markets, setMarkets] = useState<MarketRow[]>([]);
   const [btc, setBtc] = useState<number | null>(null);
@@ -57,6 +68,12 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [settingsLoading, setSettingsLoading] = useState(false);
+
+  const [search, setSearch] = useState("");
+  const [minVol, setMinVol] = useState<number>(0);
+  const [minVolInput, setMinVolInput] = useState("0");
+  const [sortKey, setSortKey] = useState<SortKey>("volume24h");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
 
   const load = useCallback(async () => {
     setErr(null);
@@ -111,6 +128,58 @@ export default function App() {
       setSettingsLoading(false);
     }
   };
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "question" ? "asc" : "desc");
+    }
+  };
+
+  const handleMinVolBlur = () => {
+    const parsed = parseFloat(minVolInput.replace(/,/g, ""));
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      setMinVol(parsed);
+    } else {
+      setMinVolInput(String(minVol));
+    }
+  };
+
+  const displayedMarkets = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let rows = markets.filter((m) => {
+      const volOk = (m.volume24h ?? 0) >= minVol;
+      const searchOk = q === "" || m.question.toLowerCase().includes(q);
+      return volOk && searchOk;
+    });
+
+    rows = [...rows].sort((a, b) => {
+      let va: number | string | null;
+      let vb: number | string | null;
+      if (sortKey === "question") {
+        va = a.question;
+        vb = b.question;
+      } else {
+        va = a[sortKey];
+        vb = b[sortKey];
+      }
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      if (typeof va === "string" && typeof vb === "string") {
+        return sortDir === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+      }
+      return sortDir === "asc"
+        ? (va as number) - (vb as number)
+        : (vb as number) - (va as number);
+    });
+
+    return rows;
+  }, [markets, search, minVol, sortKey, sortDir]);
+
+  const thClass = "px-4 py-3 font-semibold text-zinc-400 cursor-pointer select-none hover:text-zinc-200 transition whitespace-nowrap";
 
   return (
     <div className="min-h-screen px-4 pb-16 pt-10 sm:px-8">
@@ -179,8 +248,13 @@ export default function App() {
           </span>
           <span className="text-zinc-700">|</span>
           <span>
-            Filtre (vol24h &gt; {meta.min_volume_24hr.toLocaleString()}):{" "}
+            API filtresi (vol24h &gt; {meta.min_volume_24hr.toLocaleString()}):{" "}
             <strong className="text-zinc-300">{meta.filtered_count}</strong>
+          </span>
+          <span className="text-zinc-700">|</span>
+          <span>
+            Goruntulenen:{" "}
+            <strong className="text-zinc-300">{displayedMarkets.length}</strong>
           </span>
           {meta.updated_at && (
             <>
@@ -203,46 +277,69 @@ export default function App() {
             {err}
           </div>
         )}
+
+        {/* Arama ve filtre araçları */}
+        <div className="mt-6 flex flex-wrap gap-3">
+          <input
+            type="text"
+            placeholder="Market ara..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="h-10 min-w-[220px] flex-1 rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 text-sm text-zinc-200 placeholder-zinc-600 outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/30"
+          />
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-zinc-500 whitespace-nowrap">Min. Vol 24h</label>
+            <input
+              type="text"
+              inputMode="numeric"
+              value={minVolInput}
+              onChange={(e) => setMinVolInput(e.target.value)}
+              onBlur={handleMinVolBlur}
+              onKeyDown={(e) => e.key === "Enter" && handleMinVolBlur()}
+              className="h-10 w-32 rounded-xl border border-zinc-700 bg-zinc-800/80 px-3 text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/30"
+            />
+          </div>
+        </div>
       </header>
 
-      <main className="mx-auto mt-10 max-w-7xl">
+      <main className="mx-auto mt-6 max-w-7xl">
         <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[900px] text-left text-sm">
               <thead>
                 <tr className="border-b border-white/10 bg-zinc-900/90">
-                  <th className="px-4 py-3 font-semibold text-zinc-400">
-                    Question
+                  <th className={thClass} onClick={() => handleSort("question")}>
+                    Question <SortIcon active={sortKey === "question"} dir={sortDir} />
                   </th>
-                  <th className="px-4 py-3 font-semibold text-zinc-400">Bid</th>
-                  <th className="px-4 py-3 font-semibold text-zinc-400">Ask</th>
-                  <th className="px-4 py-3 font-semibold text-zinc-400">Spread</th>
-                  <th className="px-4 py-3 text-right font-semibold text-zinc-400">
-                    Vol 24h
+                  <th className={thClass} onClick={() => handleSort("bid")}>
+                    Bid <SortIcon active={sortKey === "bid"} dir={sortDir} />
+                  </th>
+                  <th className={thClass} onClick={() => handleSort("ask")}>
+                    Ask <SortIcon active={sortKey === "ask"} dir={sortDir} />
+                  </th>
+                  <th className={thClass} onClick={() => handleSort("spread")}>
+                    Spread <SortIcon active={sortKey === "spread"} dir={sortDir} />
+                  </th>
+                  <th className={`${thClass} text-right`} onClick={() => handleSort("volume24h")}>
+                    Vol 24h <SortIcon active={sortKey === "volume24h"} dir={sortDir} />
                   </th>
                 </tr>
               </thead>
               <tbody>
                 {loading && markets.length === 0 ? (
                   <tr>
-                    <td
-                      colSpan={5}
-                      className="px-4 py-12 text-center text-zinc-500"
-                    >
+                    <td colSpan={5} className="px-4 py-12 text-center text-zinc-500">
                       Yukleniyor…
                     </td>
                   </tr>
-                ) : markets.length === 0 ? (
+                ) : displayedMarkets.length === 0 ? (
                   <tr>
-                    <td
-                      colSpan={5}
-                      className="px-4 py-12 text-center text-zinc-500"
-                    >
+                    <td colSpan={5} className="px-4 py-12 text-center text-zinc-500">
                       Veri yok veya filtre sonucu bos.
                     </td>
                   </tr>
                 ) : (
-                  markets.map((row, i) => (
+                  displayedMarkets.map((row, i) => (
                     <tr
                       key={row.id || `${i}-${row.question.slice(0, 24)}`}
                       className="border-b border-white/5 transition hover:bg-white/[0.03]"

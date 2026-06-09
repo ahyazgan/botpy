@@ -430,10 +430,14 @@
         <button id="optRun" class="bt-btn" style="margin-left: 8px;">
           Parametre optimize et
         </button>
+        <button id="wfRun" class="bt-btn" style="margin-left: 8px;">
+          Walk-forward doğrula
+        </button>
         <div id="btResult" style="margin-top: 10px; color: var(--muted); font-size: 0.85rem;">
           Kayıtlı geçmiş veri üzerinde stratejiyi test eder.
         </div>
         <div id="optResult" style="margin-top: 8px; color: var(--muted); font-size: 0.85rem;"></div>
+        <div id="wfResult" style="margin-top: 8px; color: var(--muted); font-size: 0.85rem;"></div>
       </div>
 
       <footer id="foot"></footer>
@@ -922,6 +926,56 @@
             });
         }
 
+        function renderWalkForward(d) {
+          var out = $("wfResult");
+          if (!d || d.ok === false) {
+            out.textContent = (d && d.reason) || "Walk-forward başarısız.";
+            return;
+          }
+          var is = d.in_sample || {};
+          var oos = d.out_of_sample || {};
+          var p = d.params || {};
+          var deg =
+            d.degradation === null || d.degradation === undefined
+              ? "—"
+              : (d.degradation * 100).toFixed(0) + "%";
+          out.innerHTML =
+            "<strong>Walk-forward (TP=" +
+            p.take_profit_pct +
+            " SL=" +
+            p.stop_loss_pct +
+            "):</strong> In-sample beklenti " +
+            fmtSigned(is.expectancy || 0) +
+            " (" +
+            (is.count || 0) +
+            " işlem) → Out-of-sample beklenti " +
+            fmtSigned(oos.expectancy || 0) +
+            " (" +
+            (oos.count || 0) +
+            " işlem) · zayıflama " +
+            deg +
+            " · <strong>" +
+            escapeHtml(d.verdict || "") +
+            "</strong>";
+        }
+
+        function runWalkForward() {
+          var btn = $("wfRun");
+          var out = $("wfResult");
+          btn.disabled = true;
+          out.textContent = "Doğrulanıyor…";
+          fetchJson(API_BASE + "/walkforward?min_trades=3")
+            .then(function (d) {
+              renderWalkForward(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
         function closePosition(id, price, btn) {
           if (btn) {
             btn.disabled = true;
@@ -1063,6 +1117,7 @@
 
         $("btRun").addEventListener("click", runBacktest);
         $("optRun").addEventListener("click", runOptimize);
+        $("wfRun").addEventListener("click", runWalkForward);
 
         $("openRows").addEventListener("click", function (ev) {
           var btn =

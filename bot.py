@@ -732,6 +732,24 @@ def run_optimize_endpoint(
     return {"objective": objective, "markets": len(series), "results": results}
 
 
+@app.get("/walkforward")
+def run_walkforward_endpoint(
+    train_frac: float = 0.7, objective: str = "total_pnl", min_trades: int = 3,
+) -> dict[str, Any]:
+    """Walk-forward doğrulama: in-sample optimize, out-of-sample test."""
+    from optimize import DEFAULT_GRID  # lazy
+    from walkforward import walk_forward
+
+    series = state.store.history_series(5000)
+    if not series:
+        return {"ok": False, "reason": "geçmiş veri yok — record_history açın"}
+    frac = min(0.9, max(0.1, train_frac))
+    return walk_forward(
+        series, DEFAULT_GRID,
+        train_frac=frac, objective=objective, min_trades=max(1, min_trades),
+    )
+
+
 @app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)
 def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     """Açık pozisyonu güncel fiyattan kapat (realize PnL ile kaydet)."""

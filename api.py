@@ -172,6 +172,24 @@ def run_optimize_endpoint(
     return {"objective": objective, "markets": len(series), "results": results}
 
 
+@app.get("/walkforward")
+def run_walkforward_endpoint(
+    train_frac: float = 0.7, objective: str = "total_pnl", min_trades: int = 3,
+) -> dict:
+    """Walk-forward doğrulama: in-sample optimize, out-of-sample test."""
+    from optimize import DEFAULT_GRID
+    from walkforward import walk_forward
+
+    series = _store.history_series(5000)
+    if not series:
+        return {"ok": False, "reason": "geçmiş veri yok"}
+    frac = min(0.9, max(0.1, train_frac))
+    return walk_forward(
+        series, DEFAULT_GRID,
+        train_frac=frac, objective=objective, min_trades=max(1, min_trades),
+    )
+
+
 class CloseBody(BaseModel):
     close_price: float = Field(gt=0, lt=1)
 

@@ -347,6 +347,37 @@ def build_clob_client(config: Config):
     )
 
 
+# ── Gerçek bakiye kontrolü (CLOB) ────────────────────────────────────────
+def _usdc_balance_sync(client: Any) -> float | None:
+    """CLOB'dan kullanılabilir USDC (collateral) bakiyesini sorgula.
+
+    py_clob_client base-unit (6 ondalık) string döndürür → USDC'ye çevrilir.
+    Hata durumunda None döner (çağıran tarafta güvenli ele alınır).
+    """
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+        resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+    except Exception:
+        log.exception("Bakiye sorgusu başarısız")
+        return None
+
+    raw = resp.get("balance") if isinstance(resp, dict) else None
+    val = _f(raw)
+    if val is None:
+        return None
+    return val / 1_000_000  # 6 ondalık USDC
+
+
+async def fetch_usdc_balance(
+    client: Any, loop: asyncio.AbstractEventLoop,
+) -> float | None:
+    """Senkron bakiye sorgusunu executor'da çalıştır (event loop'u bloklamaz)."""
+    return await loop.run_in_executor(None, _usdc_balance_sync, client)
+
+
 # ── HTTP (retry + backoff) ───────────────────────────────────────────────
 async def _get_json(
     session: aiohttp.ClientSession,
@@ -511,6 +542,7 @@ async def execute_arb(
     *,
     budget: Budget,
     dry_run: bool = False,
+    available_usdc: float | None = None,
 ) -> None:
     m = opp.market
     yes_size = round(MAX_TRADE_USDC / opp.yes_price, 2)
@@ -521,6 +553,15 @@ async def execute_arb(
         log.warning(
             "Bütçe tavanı doldu (harcanan=%.0f / tavan=%.0f USDC) — %s atlandı.",
             budget.spent, budget.max_total, m.question[:40],
+        )
+        return
+
+    # Gerçek on-chain bakiye guard'ı (sorgu başarısızsa available_usdc=None
+    # gelir; o durumda engellemeyiz, oturum bütçesi yine de koruma sağlar).
+    if available_usdc is not None and available_usdc < notional:
+        log.warning(
+            "Yetersiz USDC bakiyesi (%.2f < %.2f gerekli) — %s atlandı.",
+            available_usdc, notional, m.question[:40],
         )
         return
 
@@ -613,9 +654,14 @@ async def main_loop(client: Any, *, dry_run: bool = False) -> None:
                                 continue
                             guard.mark_start(opp.market.id)
                             try:
+                                available = (
+                                    None if dry_run or client is None
+                                    else await fetch_usdc_balance(client, loop)
+                                )
                                 await execute_arb(
                                     client, opp, loop,
                                     budget=budget, dry_run=dry_run,
+                                    available_usdc=available,
                                 )
                             finally:
                                 guard.mark_done(opp.market.id)

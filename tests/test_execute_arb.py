@@ -102,3 +102,49 @@ async def test_budget_cap_blocks_execution(monkeypatch):
         budget=budget, dry_run=False,
     )
     assert budget.spent == 0.0
+
+
+@pytest.mark.asyncio
+async def test_insufficient_balance_blocks_execution(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("yetersiz bakiye, emir gönderilmemeli")
+
+    monkeypatch.setattr(ab, "_place_order_sync", _boom)
+    budget = ab.Budget(1000.0)
+
+    # available_usdc (10) < notional (100) → engellenir
+    await ab.execute_arb(
+        client=None, opp=_make_opp(), loop=asyncio.get_event_loop(),
+        budget=budget, dry_run=False, available_usdc=10.0,
+    )
+    assert budget.spent == 0.0
+
+
+@pytest.mark.asyncio
+async def test_sufficient_balance_allows_execution(monkeypatch):
+    rec = _Recorder({})  # tümü varsayılan: matched
+    monkeypatch.setattr(ab, "_place_order_sync", rec)
+    budget = ab.Budget(1000.0)
+
+    await ab.execute_arb(
+        client=None, opp=_make_opp(), loop=asyncio.get_event_loop(),
+        budget=budget, dry_run=False, available_usdc=500.0,
+    )
+    assert len(rec.calls) == 2
+    assert budget.spent == pytest.approx(ab.MAX_TRADE_USDC * 2)
+
+
+def test_usdc_balance_sync_parses_base_units():
+    class _Client:
+        def get_balance_allowance(self, params):
+            return {"balance": "1500000"}  # 1.5 USDC (6 ondalık)
+
+    assert ab._usdc_balance_sync(_Client()) == pytest.approx(1.5)
+
+
+def test_usdc_balance_sync_handles_error():
+    class _Client:
+        def get_balance_allowance(self, params):
+            raise RuntimeError("network down")
+
+    assert ab._usdc_balance_sync(_Client()) is None

@@ -1,6 +1,9 @@
 """
 Polymarket market tarayici: Gamma API + Binance BTC spot.
-FastAPI: /markets, /btc, /settings (PAPER_MODE), /trade, /trades.
+FastAPI: /markets, /btc, /settings (paper_mode), /trade, /trades, /health.
+
+Durum yonetimi: global mutable degiskenler yerine tek bir thread-safe
+AppState ornegi kullanilir.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-PAPER_MODE: bool = True
+DEFAULT_PAPER_MODE: bool = True
 SCAN_INTERVAL_SEC: int = 30
 MIN_VOLUME_24HR: float = 10_000.0
 
@@ -30,20 +33,6 @@ REQUEST_TIMEOUT = 30
 PAGE_LIMIT = 500
 HTTP_RETRIES = 3
 HTTP_BACKOFF_BASE = 0.5  # saniye — exponential backoff tabanı
-
-_cache_lock = threading.Lock()
-_cache: dict[str, Any] = {
-    "markets": [],
-    "btc_price": None,
-    "total_active": 0,
-    "filtered_count": 0,
-    "error": None,
-    "updated_at": None,
-}
-
-# In-memory paper trade store
-_trades_lock = threading.Lock()
-_paper_trades: list[dict[str, Any]] = []
 
 
 def setup_logging() -> None:
@@ -55,6 +44,20 @@ def setup_logging() -> None:
     )
 
 
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.setdefault(
+        "User-Agent",
+        "polymarket-scanner/1.0 (+https://polymarket.com)",
+    )
+    return session
+
+
+# ── Saf yardımcılar (durumsuz) ───────────────────────────────────────────
 def to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -153,71 +156,145 @@ def build_rows(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def refresh_snapshot(session: requests.Session) -> None:
-    err: str | None = None
+# ── Uygulama durumu (thread-safe, kapsüllenmiş) ──────────────────────────
+class AppState:
+    """Tarayıcı önbelleği + paper trade defteri + tarayıcı thread'i.
+
+    Eski dağınık global'lerin (PAPER_MODE, _cache, _paper_trades, thread)
+    yerini alan tek, kilitli durum nesnesi.
+    """
+
+    def __init__(self, paper_mode: bool = DEFAULT_PAPER_MODE) -> None:
+        self.paper_mode: bool = paper_mode
+        self._cache_lock = threading.Lock()
+        self._cache: dict[str, Any] = {
+            "markets": [],
+            "btc_price": None,
+            "total_active": 0,
+            "filtered_count": 0,
+            "error": None,
+            "updated_at": None,
+        }
+        self._trades_lock = threading.Lock()
+        self._paper_trades: list[dict[str, Any]] = []
+        self._stop_event = threading.Event()
+        self._bg_thread: threading.Thread | None = None
+
+    # ── Snapshot / önbellek ──
+    def update_snapshot(
+        self, btc: float | None, rows: list[dict[str, Any]], total_active: int,
+    ) -> None:
+        with self._cache_lock:
+            self._cache.update(
+                btc_price=btc,
+                markets=rows,
+                total_active=total_active,
+                filtered_count=len(rows),
+                error=None,
+                updated_at=_utcnow(),
+            )
+
+    def set_error(self, err: str) -> None:
+        with self._cache_lock:
+            self._cache["error"] = err
+            self._cache["updated_at"] = _utcnow()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._cache_lock:
+            snap = dict(self._cache)
+        snap["markets"] = list(snap["markets"])
+        return snap
+
+    def find_market(self, market_id: str) -> dict[str, Any] | None:
+        with self._cache_lock:
+            return next(
+                (m for m in self._cache["markets"] if m["id"] == market_id), None,
+            )
+
+    def current_price(self, market_id: str, side: str) -> float | None:
+        """Verilen taraf için cache'teki güncel mark fiyatı."""
+        with self._cache_lock:
+            for m in self._cache["markets"]:
+                if m["id"] == market_id:
+                    if side == "YES":
+                        return m.get("bid")  # YES çıkış fiyatı = bid
+                    ask = m.get("ask")
+                    return (1.0 - ask) if ask is not None else None
+        return None
+
+    # ── Paper trade defteri ──
+    def add_trade(self, trade: dict[str, Any]) -> None:
+        with self._trades_lock:
+            self._paper_trades.append(trade)
+
+    def list_trades(self) -> list[dict[str, Any]]:
+        with self._trades_lock:
+            return list(self._paper_trades)
+
+    def remove_trade(self, trade_id: str) -> bool:
+        with self._trades_lock:
+            idx = next(
+                (i for i, t in enumerate(self._paper_trades) if t["id"] == trade_id),
+                None,
+            )
+            if idx is None:
+                return False
+            self._paper_trades.pop(idx)
+            return True
+
+    # ── Tarayıcı yaşam döngüsü ──
+    def start_scanner(self) -> None:
+        self._stop_event.clear()
+        self._bg_thread = threading.Thread(target=self._background_loop, daemon=True)
+        self._bg_thread.start()
+
+    def stop_scanner(self) -> None:
+        self._stop_event.set()
+        if self._bg_thread:
+            self._bg_thread.join(timeout=5)
+
+    def scanner_alive(self) -> bool:
+        return self._bg_thread is not None and self._bg_thread.is_alive()
+
+    def _background_loop(self) -> None:
+        session = _make_session()
+        while not self._stop_event.is_set():
+            refresh_snapshot(session, self)
+            if self._stop_event.wait(SCAN_INTERVAL_SEC):
+                break
+
+
+def refresh_snapshot(session: requests.Session, state: AppState) -> None:
     try:
         btc = fetch_btc_spot_usdt(session)
         raw = fetch_active_markets(session)
         rows = build_rows(raw)
-        with _cache_lock:
-            _cache["btc_price"] = btc
-            _cache["markets"] = rows
-            _cache["total_active"] = len(raw)
-            _cache["filtered_count"] = len(rows)
-            _cache["error"] = None
-            _cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state.update_snapshot(btc, rows, len(raw))
         logging.info(
-            "Snapshot | BTC=%s | aktif=%d | filtre=%d | PAPER_MODE=%s",
+            "Snapshot | BTC=%s | aktif=%d | filtre=%d | paper_mode=%s",
             f"{btc:,.2f}" if btc is not None else "n/a",
             len(raw),
             len(rows),
-            PAPER_MODE,
+            state.paper_mode,
         )
     except requests.RequestException as e:
-        err = str(e)
         logging.exception("HTTP hatasi: %s", e)
-        with _cache_lock:
-            _cache["error"] = err
-            _cache["updated_at"] = datetime.now(timezone.utc).isoformat()
-    except Exception as e:
-        err = str(e)
+        state.set_error(str(e))
+    except Exception as e:  # noqa: BLE001 — döngü canlı kalmalı
         logging.exception("Snapshot hatasi: %s", e)
-        with _cache_lock:
-            _cache["error"] = err
-            _cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state.set_error(str(e))
 
 
-def _background_loop(stop: threading.Event) -> None:
-    session = requests.Session()
-    session.headers.setdefault(
-        "User-Agent",
-        "polymarket-scanner/1.0 (+https://polymarket.com)",
-    )
-    while not stop.is_set():
-        refresh_snapshot(session)
-        if stop.wait(SCAN_INTERVAL_SEC):
-            break
-
-
-_stop_event = threading.Event()
-_bg_thread: threading.Thread | None = None
+# Tek uygulama durumu örneği
+state = AppState()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _bg_thread
     setup_logging()
-    _stop_event.clear()
-    _bg_thread = threading.Thread(
-        target=_background_loop,
-        args=(_stop_event,),
-        daemon=True,
-    )
-    _bg_thread.start()
+    state.start_scanner()
     yield
-    _stop_event.set()
-    if _bg_thread:
-        _bg_thread.join(timeout=5)
+    state.stop_scanner()
 
 
 app = FastAPI(title="Polymarket Scanner", lifespan=lifespan)
@@ -297,65 +374,48 @@ class TradesResponse(BaseModel):
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Servis sağlığı: arka plan tarayıcı çalışıyor mu, son güncelleme ne zaman."""
-    with _cache_lock:
-        updated_at = _cache["updated_at"]
-        error = _cache["error"]
-    alive = _bg_thread is not None and _bg_thread.is_alive()
-    healthy = alive and error is None and updated_at is not None
+    snap = state.snapshot()
+    alive = state.scanner_alive()
+    healthy = alive and snap["error"] is None and snap["updated_at"] is not None
     return {
         "status": "ok" if healthy else "degraded",
         "scanner_alive": alive,
-        "updated_at": updated_at,
-        "error": error,
-        "paper_mode": PAPER_MODE,
+        "updated_at": snap["updated_at"],
+        "error": snap["error"],
+        "paper_mode": state.paper_mode,
     }
 
 
 @app.get("/btc", response_model=BtcResponse)
 def get_btc() -> BtcResponse:
-    with _cache_lock:
-        return BtcResponse(
-            price=_cache["btc_price"],
-            updated_at=_cache["updated_at"],
-            error=_cache["error"],
-        )
+    snap = state.snapshot()
+    return BtcResponse(
+        price=snap["btc_price"],
+        updated_at=snap["updated_at"],
+        error=snap["error"],
+    )
 
 
 @app.get("/markets", response_model=MarketsResponse)
 def get_markets() -> MarketsResponse:
-    global PAPER_MODE
-    with _cache_lock:
-        rows = [MarketRow(**r) for r in _cache["markets"]]
-        return MarketsResponse(
-            markets=rows,
-            paper_mode=PAPER_MODE,
-            total_active=_cache["total_active"],
-            filtered_count=_cache["filtered_count"],
-            min_volume_24hr=MIN_VOLUME_24HR,
-            updated_at=_cache["updated_at"],
-            error=_cache["error"],
-        )
+    snap = state.snapshot()
+    rows = [MarketRow(**r) for r in snap["markets"]]
+    return MarketsResponse(
+        markets=rows,
+        paper_mode=state.paper_mode,
+        total_active=snap["total_active"],
+        filtered_count=snap["filtered_count"],
+        min_volume_24hr=MIN_VOLUME_24HR,
+        updated_at=snap["updated_at"],
+        error=snap["error"],
+    )
 
 
 @app.patch("/settings", response_model=SettingsResponse)
 def patch_settings(body: SettingsBody) -> SettingsResponse:
-    global PAPER_MODE
-    PAPER_MODE = body.paper_mode
-    logging.info("PAPER_MODE -> %s", PAPER_MODE)
-    return SettingsResponse(paper_mode=PAPER_MODE)
-
-
-def _market_current_price(market_id: str, side: str) -> float | None:
-    """Returns current mark price for the given side from cache."""
-    with _cache_lock:
-        for m in _cache["markets"]:
-            if m["id"] == market_id:
-                if side == "YES":
-                    return m.get("bid")  # exit price for YES = bid
-                else:
-                    ask = m.get("ask")
-                    return (1.0 - ask) if ask is not None else None
-    return None
+    state.paper_mode = body.paper_mode
+    logging.info("paper_mode -> %s", state.paper_mode)
+    return SettingsResponse(paper_mode=state.paper_mode)
 
 
 @app.post("/trade", response_model=TradeRow)
@@ -364,9 +424,7 @@ def post_trade(body: TradeRequest) -> TradeRow:
     if side not in ("YES", "NO"):
         raise HTTPException(status_code=400, detail="side must be YES or NO")
 
-    with _cache_lock:
-        market = next((m for m in _cache["markets"] if m["id"] == body.market_id), None)
-
+    market = state.find_market(body.market_id)
     if market is None:
         raise HTTPException(status_code=404, detail="market not found")
 
@@ -388,10 +446,9 @@ def post_trade(body: TradeRequest) -> TradeRow:
         "amount_usdc": body.amount_usdc,
         "entry_price": entry,
         "shares": shares,
-        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "opened_at": _utcnow(),
     }
-    with _trades_lock:
-        _paper_trades.append(trade)
+    state.add_trade(trade)
 
     logging.info(
         "PAPER TRADE | %s | %s | %.2f USDC @ %.4f | shares=%.4f",
@@ -402,7 +459,7 @@ def post_trade(body: TradeRequest) -> TradeRow:
         shares,
     )
 
-    current_price = _market_current_price(body.market_id, side)
+    current_price = state.current_price(body.market_id, side)
     pnl = (shares * current_price - body.amount_usdc) if current_price is not None else None
     pnl_pct = ((current_price / entry) - 1) * 100 if current_price is not None else None
     return TradeRow(**trade, current_price=current_price, pnl=pnl, pnl_pct=pnl_pct)
@@ -410,13 +467,12 @@ def post_trade(body: TradeRequest) -> TradeRow:
 
 @app.get("/trades", response_model=TradesResponse)
 def get_trades() -> TradesResponse:
-    with _trades_lock:
-        snapshot = list(_paper_trades)
+    snapshot = state.list_trades()
 
     rows: list[TradeRow] = []
     total_pnl = 0.0
     for t in snapshot:
-        current_price = _market_current_price(t["market_id"], t["side"])
+        current_price = state.current_price(t["market_id"], t["side"])
         pnl = (t["shares"] * current_price - t["amount_usdc"]) if current_price is not None else None
         pnl_pct = ((current_price / t["entry_price"]) - 1) * 100 if current_price is not None else None
         rows.append(TradeRow(**t, current_price=current_price, pnl=pnl, pnl_pct=pnl_pct))
@@ -428,37 +484,30 @@ def get_trades() -> TradesResponse:
 
 @app.delete("/trades/{trade_id}")
 def delete_trade(trade_id: str) -> dict[str, str]:
-    with _trades_lock:
-        idx = next((i for i, t in enumerate(_paper_trades) if t["id"] == trade_id), None)
-        if idx is None:
-            raise HTTPException(status_code=404, detail="trade not found")
-        _paper_trades.pop(idx)
+    if not state.remove_trade(trade_id):
+        raise HTTPException(status_code=404, detail="trade not found")
     return {"deleted": trade_id}
 
 
-def run_scan(session: requests.Session) -> None:
+def run_scan(session: requests.Session, state: AppState) -> None:
     """CLI dongusu icin (eski davranis)."""
-    refresh_snapshot(session)
-    if PAPER_MODE:
-        logging.info("PAPER_MODE: islem acilmadi.")
+    refresh_snapshot(session, state)
+    if state.paper_mode:
+        logging.info("paper_mode: islem acilmadi.")
 
 
 def main_cli() -> None:
     setup_logging()
     logging.info(
-        "Basladi (CLI) | PAPER_MODE=%s | dongu=%ds | min_vol24h=%.0f",
-        PAPER_MODE,
+        "Basladi (CLI) | paper_mode=%s | dongu=%ds | min_vol24h=%.0f",
+        state.paper_mode,
         SCAN_INTERVAL_SEC,
         MIN_VOLUME_24HR,
     )
-    session = requests.Session()
-    session.headers.setdefault(
-        "User-Agent",
-        "polymarket-scanner/1.0 (+https://polymarket.com)",
-    )
+    session = _make_session()
     while True:
         try:
-            run_scan(session)
+            run_scan(session, state)
         except requests.RequestException:
             logging.exception("HTTP istegi basarisiz")
         except Exception:

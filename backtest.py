@@ -16,6 +16,9 @@ from typing import Any
 
 from metrics import compute_stats
 from strategy import (
+    AUTO_MAX_PRICE,
+    AUTO_MAX_SPREAD,
+    AUTO_MIN_PRICE,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     entry_price,
@@ -39,9 +42,13 @@ def run_backtest(
     amount: float = 10.0,
     take_profit_pct: float = TAKE_PROFIT_PCT,
     stop_loss_pct: float = STOP_LOSS_PCT,
+    max_spread: float = AUTO_MAX_SPREAD,
+    min_price: float = AUTO_MIN_PRICE,
+    max_price: float = AUTO_MAX_PRICE,
 ) -> dict[str, Any]:
     """Her market için en fazla bir açık pozisyon; sinyal→aç, TP/SL→kapat.
 
+    Sinyal ve çıkış eşikleri parametrik (grid-search optimizasyonu için).
     Dönen: {"pnls": [...], "trades": [...], "stats": {...}}.
     """
     pnls: list[float] = []
@@ -51,7 +58,10 @@ def run_backtest(
         open_pos: tuple[str, float, float] | None = None  # (side, entry, shares)
         for snap in snaps:
             if open_pos is None:
-                side = evaluate_signal(snap)
+                side = evaluate_signal(
+                    snap, max_spread=max_spread,
+                    min_price=min_price, max_price=max_price,
+                )
                 if side is None:
                     continue
                 entry = entry_price(snap, side)

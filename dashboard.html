@@ -427,9 +427,13 @@
       </h2>
       <div class="chart-shell">
         <button id="btRun" class="bt-btn">Backtest çalıştır</button>
+        <button id="optRun" class="bt-btn" style="margin-left: 8px;">
+          Parametre optimize et
+        </button>
         <div id="btResult" style="margin-top: 10px; color: var(--muted); font-size: 0.85rem;">
           Kayıtlı geçmiş veri üzerinde stratejiyi test eder.
         </div>
+        <div id="optResult" style="margin-top: 8px; color: var(--muted); font-size: 0.85rem;"></div>
       </div>
 
       <footer id="foot"></footer>
@@ -869,6 +873,55 @@
             });
         }
 
+        function renderOptimize(d) {
+          var out = $("optResult");
+          if (!d || d.error) {
+            out.textContent = (d && d.error) || "Optimizasyon başarısız.";
+            return;
+          }
+          var rows = d.results || [];
+          if (!rows.length) {
+            out.textContent = "Yeterli işlem yok (min_trades).";
+            return;
+          }
+          var best = rows[0];
+          var p = best.params || {};
+          var s = best.stats || {};
+          out.innerHTML =
+            "<strong>En iyi (" +
+            escapeHtml(d.objective) +
+            "):</strong> TP=" +
+            p.take_profit_pct +
+            "% SL=" +
+            p.stop_loss_pct +
+            "% → toplam " +
+            fmtSigned(s.total_pnl || 0) +
+            " · win-rate " +
+            (s.win_rate || 0).toFixed(1) +
+            "% · " +
+            (s.count || 0) +
+            " işlem · " +
+            rows.length +
+            " kombinasyon denendi";
+        }
+
+        function runOptimize() {
+          var btn = $("optRun");
+          var out = $("optResult");
+          btn.disabled = true;
+          out.textContent = "Optimize ediliyor…";
+          fetchJson(API_BASE + "/optimize?min_trades=3&top=10")
+            .then(function (d) {
+              renderOptimize(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
         function closePosition(id, price, btn) {
           if (btn) {
             btn.disabled = true;
@@ -1009,6 +1062,7 @@
         }
 
         $("btRun").addEventListener("click", runBacktest);
+        $("optRun").addEventListener("click", runOptimize);
 
         $("openRows").addEventListener("click", function (ev) {
           var btn =

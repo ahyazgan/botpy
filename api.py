@@ -155,6 +155,23 @@ def run_backtest_endpoint(limit_per_market: int = 1000, amount: float = 10.0) ->
     }
 
 
+@app.get("/optimize")
+def run_optimize_endpoint(
+    objective: str = "total_pnl", min_trades: int = 3, top: int = 10,
+) -> dict:
+    """Geçmiş veride TP/SL ızgarasını tarayıp en iyi parametreleri bul."""
+    from optimize import DEFAULT_GRID, grid_search
+
+    series = _store.history_series(5000)
+    if not series:
+        return {"error": "geçmiş veri yok", "results": []}
+    results = grid_search(
+        series, DEFAULT_GRID,
+        objective=objective, min_trades=max(1, min_trades), top=max(1, min(top, 50)),
+    )
+    return {"objective": objective, "markets": len(series), "results": results}
+
+
 class CloseBody(BaseModel):
     close_price: float = Field(gt=0, lt=1)
 

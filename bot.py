@@ -715,6 +715,23 @@ def run_backtest_endpoint(limit_per_market: int = 1000, amount: float = 10.0) ->
     }
 
 
+@app.get("/optimize")
+def run_optimize_endpoint(
+    objective: str = "total_pnl", min_trades: int = 3, top: int = 10,
+) -> dict[str, Any]:
+    """Geçmiş veride TP/SL ızgarasını tarayıp en iyi parametreleri bul."""
+    from optimize import DEFAULT_GRID, grid_search  # lazy
+
+    series = state.store.history_series(5000)
+    if not series:
+        return {"error": "geçmiş veri yok — record_history açın", "results": []}
+    results = grid_search(
+        series, DEFAULT_GRID,
+        objective=objective, min_trades=max(1, min_trades), top=max(1, min(top, 50)),
+    )
+    return {"objective": objective, "markets": len(series), "results": results}
+
+
 @app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)
 def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     """Açık pozisyonu güncel fiyattan kapat (realize PnL ile kaydet)."""

@@ -683,6 +683,24 @@ def get_closed_trades(limit: int = 200) -> ClosedTradesResponse:
     return ClosedTradesResponse(trades=rows, realized_pnl=state.realized_pnl_total())
 
 
+@app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)
+def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
+    """Açık pozisyonu güncel fiyattan kapat (realize PnL ile kaydet)."""
+    trade = next((t for t in state.list_trades() if t["id"] == trade_id), None)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="trade not found")
+    current = state.current_price(trade["market_id"], trade["side"])
+    if current is None:
+        raise HTTPException(status_code=422, detail="current price unavailable")
+    row = closed_row(trade, float(current), "manual")
+    state.close_trade(row)
+    logging.info(
+        "MANUAL CLOSE | %s | %s | pnl=%.2f USDC",
+        trade["question"][:40], trade["side"], row["pnl"],
+    )
+    return ClosedTradeRow(**row)
+
+
 @app.delete("/trades/{trade_id}")
 def delete_trade(trade_id: str) -> dict[str, str]:
     if not state.remove_trade(trade_id):

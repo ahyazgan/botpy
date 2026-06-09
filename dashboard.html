@@ -178,6 +178,39 @@
       .spread {
         color: var(--accent);
       }
+      .pnl-summary {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      .pnl-card {
+        flex: 1 1 160px;
+        border: 1px solid var(--border);
+        border-radius: 0.9rem;
+        padding: 0.8rem 1rem;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .pnl-card label {
+        display: block;
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-bottom: 0.3rem;
+      }
+      .pnl-val {
+        font-size: 1.35rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      .pos {
+        color: var(--accent);
+      }
+      .neg {
+        color: var(--danger);
+      }
       .loading td {
         text-align: center;
         color: var(--muted);
@@ -256,6 +289,60 @@
               <tr class="loading">
                 <td colspan="6">Henüz arb fırsatı kaydedilmedi.</td>
               </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <h2 style="margin: 28px 0 8px; font-size: 18px;">Pozisyonlar &amp; PnL</h2>
+      <div class="pnl-summary" id="pnlSummary">
+        <div class="pnl-card">
+          <label>Açık pozisyon</label>
+          <div class="pnl-val" id="openCount">—</div>
+        </div>
+        <div class="pnl-card">
+          <label>Gerçekleşmemiş PnL</label>
+          <div class="pnl-val" id="unrealPnl">—</div>
+        </div>
+        <div class="pnl-card">
+          <label>Gerçekleşen PnL</label>
+          <div class="pnl-val" id="realPnl">—</div>
+        </div>
+      </div>
+      <div class="table-shell">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Açık Pozisyon</th>
+                <th>Yön</th>
+                <th>Tutar</th>
+                <th>Giriş</th>
+                <th>Güncel</th>
+                <th>PnL</th>
+              </tr>
+            </thead>
+            <tbody id="openRows">
+              <tr class="loading"><td colspan="6">Açık pozisyon yok.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="table-shell" style="margin-top: 12px;">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Kapanan İşlem</th>
+                <th>Yön</th>
+                <th>Sebep</th>
+                <th>Giriş→Kapanış</th>
+                <th>PnL</th>
+                <th>Zaman</th>
+              </tr>
+            </thead>
+            <tbody id="closedRows">
+              <tr class="loading"><td colspan="6">Kapanan işlem yok.</td></tr>
             </tbody>
           </table>
         </div>
@@ -397,15 +484,150 @@
           return toNum(m.spread);
         }
 
+        function fetchTrades() {
+          return fetchJson(API_BASE + "/trades")
+            .then(function (d) {
+              return d && Array.isArray(d.trades) ? d.trades : [];
+            })
+            .catch(function () {
+              return [];
+            });
+        }
+
+        function fetchClosed() {
+          return fetchJson(API_BASE + "/trades/closed?limit=100")
+            .then(function (d) {
+              return d && Array.isArray(d.trades)
+                ? d
+                : { trades: [], realized_pnl: 0 };
+            })
+            .catch(function () {
+              return { trades: [], realized_pnl: 0 };
+            });
+        }
+
+        function currentPriceForTrade(t, market) {
+          if (!market) return null;
+          var bid = toNum(market.bestBid);
+          var ask = toNum(market.bestAsk);
+          if (String(t.side).toUpperCase() === "YES") return bid;
+          return ask !== null ? 1 - ask : null;
+        }
+
+        function pnlClass(n) {
+          return n > 0 ? "pos" : n < 0 ? "neg" : "";
+        }
+
+        function fmtSigned(n, d) {
+          if (n === null || n === undefined) return "—";
+          return (n >= 0 ? "+" : "") + n.toFixed(d !== undefined ? d : 2);
+        }
+
+        function renderPositions(openTrades, closed, marketsById) {
+          var openBody = $("openRows");
+          openBody.innerHTML = "";
+          var unreal = 0;
+
+          if (!openTrades.length) {
+            openBody.innerHTML =
+              '<tr class="loading"><td colspan="6">Açık pozisyon yok.</td></tr>';
+          } else {
+            for (var i = 0; i < openTrades.length; i++) {
+              var t = openTrades[i];
+              var mk = marketsById[String(t.market_id)];
+              var cur = currentPriceForTrade(t, mk);
+              var amt = toNum(t.amount_usdc) || 0;
+              var sh = toNum(t.shares) || 0;
+              var pnl = cur !== null ? sh * cur - amt : null;
+              if (pnl !== null) unreal += pnl;
+              var tr = document.createElement("tr");
+              tr.innerHTML =
+                '<td class="q">' +
+                escapeHtml(t.question || t.market_id) +
+                "</td><td>" +
+                escapeHtml(String(t.side).toUpperCase()) +
+                '</td><td class="num">' +
+                fmtPrice(amt, 2) +
+                '</td><td class="num">' +
+                fmtPrice(toNum(t.entry_price)) +
+                '</td><td class="num">' +
+                fmtPrice(cur) +
+                '</td><td class="num ' +
+                (pnl === null ? "" : pnlClass(pnl)) +
+                '">' +
+                (pnl === null ? "—" : fmtSigned(pnl)) +
+                "</td>";
+              openBody.appendChild(tr);
+            }
+          }
+
+          var closedBody = $("closedRows");
+          closedBody.innerHTML = "";
+          var closedRows = closed.trades || [];
+          if (!closedRows.length) {
+            closedBody.innerHTML =
+              '<tr class="loading"><td colspan="6">Kapanan işlem yok.</td></tr>';
+          } else {
+            for (var j = 0; j < closedRows.length; j++) {
+              var c = closedRows[j];
+              var cpnl = toNum(c.pnl);
+              var when = c.closed_at
+                ? new Date(c.closed_at).toLocaleString()
+                : "—";
+              var tr2 = document.createElement("tr");
+              tr2.innerHTML =
+                '<td class="q">' +
+                escapeHtml(c.question || c.market_id) +
+                "</td><td>" +
+                escapeHtml(String(c.side).toUpperCase()) +
+                "</td><td>" +
+                escapeHtml(c.reason || "") +
+                '</td><td class="num">' +
+                fmtPrice(toNum(c.entry_price)) +
+                " → " +
+                fmtPrice(toNum(c.close_price)) +
+                '</td><td class="num ' +
+                (cpnl === null ? "" : pnlClass(cpnl)) +
+                '">' +
+                fmtSigned(cpnl) +
+                '</td><td class="num">' +
+                escapeHtml(when) +
+                "</td>";
+              closedBody.appendChild(tr2);
+            }
+          }
+
+          $("openCount").textContent = String(openTrades.length);
+          var realized = toNum(closed.realized_pnl) || 0;
+          var ue = $("unrealPnl");
+          ue.textContent = fmtSigned(unreal);
+          ue.className = "pnl-val " + pnlClass(unreal);
+          var re = $("realPnl");
+          re.textContent = fmtSigned(realized);
+          re.className = "pnl-val " + pnlClass(realized);
+        }
+
         function refresh() {
           showAlert("");
 
-          Promise.all([fetchBtc(), fetchAllActiveMarkets(), fetchArb()])
+          Promise.all([
+            fetchBtc(),
+            fetchAllActiveMarkets(),
+            fetchArb(),
+            fetchTrades(),
+            fetchClosed(),
+          ])
             .then(function (pair) {
               var btc = pair[0];
               var raw = pair[1];
 
               renderArb(pair[2]);
+
+              var marketsById = {};
+              for (var k = 0; k < raw.length; k++) {
+                marketsById[String(raw[k].id)] = raw[k];
+              }
+              renderPositions(pair[3], pair[4], marketsById);
 
               $("btcPrice").textContent =
                 btc !== null

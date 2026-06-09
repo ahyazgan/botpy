@@ -86,3 +86,18 @@ def get_arb(limit: int = 100) -> dict:
     limit = max(1, min(limit, 500))
     rows = _store.list_opportunities(limit)
     return {"opportunities": rows, "count": len(rows)}
+
+
+@app.get("/trades")
+def get_open_trades() -> dict:
+    """Açık paper pozisyonlar (read-only). Canlı PnL istemci tarafında hesaplanır."""
+    rows = _store.list_trades()
+    return {"trades": rows, "count": len(rows)}
+
+
+@app.get("/trades/closed")
+def get_closed_trades(limit: int = 200) -> dict:
+    """Kapanan (realize) paper işlemler ve toplam gerçekleşen PnL."""
+    limit = max(1, min(limit, 1000))
+    rows = _store.list_closed_trades(limit)
+    return {"trades": rows, "realized_pnl": _store.realized_pnl_total()}

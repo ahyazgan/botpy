@@ -23,6 +23,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from storage import Store
+
 DEFAULT_PAPER_MODE: bool = True
 SCAN_INTERVAL_SEC: int = 30
 MIN_VOLUME_24HR: float = 10_000.0
@@ -164,8 +166,11 @@ class AppState:
     yerini alan tek, kilitli durum nesnesi.
     """
 
-    def __init__(self, paper_mode: bool = DEFAULT_PAPER_MODE) -> None:
+    def __init__(
+        self, paper_mode: bool = DEFAULT_PAPER_MODE, store: Store | None = None,
+    ) -> None:
         self.paper_mode: bool = paper_mode
+        self.store: Store = store if store is not None else Store()
         self._cache_lock = threading.Lock()
         self._cache: dict[str, Any] = {
             "markets": [],
@@ -175,8 +180,6 @@ class AppState:
             "error": None,
             "updated_at": None,
         }
-        self._trades_lock = threading.Lock()
-        self._paper_trades: list[dict[str, Any]] = []
         self._stop_event = threading.Event()
         self._bg_thread: threading.Thread | None = None
 
@@ -222,25 +225,15 @@ class AppState:
                     return (1.0 - ask) if ask is not None else None
         return None
 
-    # ── Paper trade defteri ──
+    # ── Paper trade defteri (SQLite ile kalıcı) ──
     def add_trade(self, trade: dict[str, Any]) -> None:
-        with self._trades_lock:
-            self._paper_trades.append(trade)
+        self.store.add_trade(trade)
 
     def list_trades(self) -> list[dict[str, Any]]:
-        with self._trades_lock:
-            return list(self._paper_trades)
+        return self.store.list_trades()
 
     def remove_trade(self, trade_id: str) -> bool:
-        with self._trades_lock:
-            idx = next(
-                (i for i, t in enumerate(self._paper_trades) if t["id"] == trade_id),
-                None,
-            )
-            if idx is None:
-                return False
-            self._paper_trades.pop(idx)
-            return True
+        return self.store.remove_trade(trade_id)
 
     # ── Tarayıcı yaşam döngüsü ──
     def start_scanner(self) -> None:

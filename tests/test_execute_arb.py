@@ -134,6 +134,28 @@ async def test_sufficient_balance_allows_execution(monkeypatch):
     assert budget.spent == pytest.approx(ab.MAX_TRADE_USDC * 2)
 
 
+@pytest.mark.asyncio
+async def test_invalid_constraints_blocks_execution(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("kısıt ihlali, emir gönderilmemeli")
+
+    monkeypatch.setattr(ab, "_place_order_sync", _boom)
+    budget = ab.Budget(1000.0)
+
+    # 0.498+0.498 → tick'e yuvarlanınca 1.00 → kâr yok → emir yok
+    m = ab.Market(
+        id="m1", question="Test?", yes_token_id="YT", no_token_id="NT",
+        yes_bid=0.4, yes_ask=0.45, no_bid=0.4, no_ask=0.45, volume24h=1.0,
+    )
+    opp = ab.ArbOpportunity(m, "buy", 0.4, 0.498, 0.498)
+
+    await ab.execute_arb(
+        client=None, opp=opp, loop=asyncio.get_event_loop(),
+        budget=budget, dry_run=False,
+    )
+    assert budget.spent == 0.0
+
+
 def test_usdc_balance_sync_parses_base_units():
     class _Client:
         def get_balance_allowance(self, params):

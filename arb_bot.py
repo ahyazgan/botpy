@@ -57,6 +57,12 @@ HTTP_BACKOFF_BASE = 0.5   # exponential backoff taban süresi (saniye)
 CLOB_CONCURRENCY = 10     # CLOB orderbook'a aynı anda en fazla istek
 REQUEST_TIMEOUT = 15      # saniye
 
+# CLOB emir kısıtları
+TICK_SIZE = 0.01          # fiyat adımı (çoğu market 0.01; bazıları 0.001)
+MIN_SHARES = 5.0          # minimum emir büyüklüğü (shares)
+PRICE_MIN = 0.01          # geçerli fiyat alt sınırı
+PRICE_MAX = 0.99          # geçerli fiyat üst sınırı
+
 # FOK emir cevabında "dolu" sayılan durumlar (heuristik)
 _FILLED_STATUSES = {"matched", "filled"}
 
@@ -326,6 +332,59 @@ def order_filled(res: Any) -> bool:
     return bool(res.get("success"))
 
 
+# ── Emir hazırlama / CLOB kısıt doğrulaması (saf) ────────────────────────
+@dataclass
+class PreparedOrder:
+    yes_price: float
+    yes_size: float
+    no_price: float
+    no_size: float
+
+
+def quantize_price(price: float, tick: float = TICK_SIZE) -> float:
+    """Fiyatı en yakın tick'e yuvarla (kayan nokta artıklarını da temizler)."""
+    return round(round(price / tick) * tick, 10)
+
+
+def prepare_arb_orders(
+    opp: ArbOpportunity,
+    *,
+    tick: float = TICK_SIZE,
+    min_shares: float = MIN_SHARES,
+    max_trade: float = MAX_TRADE_USDC,
+) -> PreparedOrder | None:
+    """Arb fırsatını CLOB kısıtlarına göre emirlere çevir.
+
+    Fiyatları tick'e yuvarlar, aralık ve minimum büyüklük kontrolü yapar,
+    yuvarlamadan sonra arbın hâlâ kârlı (net pozitif) olduğunu doğrular.
+    Herhangi bir bacak geçersizse None döner → tek bacak gönderilmez
+    (bacak riski önlenir).
+    """
+    yp = quantize_price(opp.yes_price, tick)
+    npr = quantize_price(opp.no_price, tick)
+
+    for p in (yp, npr):
+        if not (PRICE_MIN <= p <= PRICE_MAX):
+            return None
+
+    # Yuvarlama arbı bozmuş olabilir → net pozitiflik hâlâ geçerli mi?
+    if opp.direction == "buy":
+        if (yp + npr) >= 1.0:
+            return None
+    elif opp.direction == "sell":
+        if (yp + npr) <= 1.0:
+            return None
+    else:
+        return None
+
+    yes_size = round(max_trade / yp, 2)
+    no_size = round(max_trade / npr, 2)
+    if yes_size < min_shares or no_size < min_shares:
+        return None
+
+    return PreparedOrder(yes_price=yp, yes_size=yes_size, no_price=npr, no_size=no_size)
+
+
 # ── CLOB Client (lazy import) ────────────────────────────────────────────
 def build_clob_client(config: Config):
     """py_clob_client yalnızca gerçek işlem yapılırken import edilir."""
@@ -545,8 +604,17 @@ async def execute_arb(
     available_usdc: float | None = None,
 ) -> None:
     m = opp.market
-    yes_size = round(MAX_TRADE_USDC / opp.yes_price, 2)
-    no_size = round(MAX_TRADE_USDC / opp.no_price, 2)
+
+    # CLOB kısıt doğrulaması: tick'e yuvarla, aralık/min büyüklük kontrolü.
+    prepared = prepare_arb_orders(opp)
+    if prepared is None:
+        log.warning(
+            "Emir kısıtları sağlanmadı (tick/min-size/aralık) — %s atlandı.",
+            m.question[:40],
+        )
+        return
+    yes_price, no_price = prepared.yes_price, prepared.no_price
+    yes_size, no_size = prepared.yes_size, prepared.no_size
     notional = MAX_TRADE_USDC * 2
 
     if not budget.can_afford(notional):
@@ -580,8 +648,8 @@ async def execute_arb(
 
     # YES ve NO emirlerini AYNI ANDA gönder (maksimum hız)
     yes_res, no_res = await asyncio.gather(
-        _send_order(client, loop, m.yes_token_id, yes_side, opp.yes_price, yes_size),
-        _send_order(client, loop, m.no_token_id, no_side, opp.no_price, no_size),
+        _send_order(client, loop, m.yes_token_id, yes_side, yes_price, yes_size),
+        _send_order(client, loop, m.no_token_id, no_side, no_price, no_size),
         return_exceptions=True,
     )
     log.info("YES sonuç: %s", yes_res)
@@ -596,10 +664,10 @@ async def execute_arb(
         log.info("Hiçbir bacak dolmadı (FOK iptal) — pozisyon yok, güvenli.")
     elif yes_ok and not no_ok:
         # YES doldu, NO iptal → açık YES pozisyonunu kapat
-        await _unwind_leg(client, loop, m.yes_token_id, yes_side, opp.yes_price, yes_size)
+        await _unwind_leg(client, loop, m.yes_token_id, yes_side, yes_price, yes_size)
     else:
         # NO doldu, YES iptal → açık NO pozisyonunu kapat
-        await _unwind_leg(client, loop, m.no_token_id, no_side, opp.no_price, no_size)
+        await _unwind_leg(client, loop, m.no_token_id, no_side, no_price, no_size)
 
 
 # ── Ana döngü ────────────────────────────────────────────────────────────

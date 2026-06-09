@@ -124,6 +124,49 @@ def test_quick_screen_catches_marginal():
     assert ab.detect_arb(m.yes_bid, m.yes_ask, m.no_bid, m.no_ask) is None
 
 
+# ── quantize_price / prepare_arb_orders ──────────────────────────────────
+def test_quantize_price_rounds_to_tick():
+    assert ab.quantize_price(0.456) == pytest.approx(0.46)
+    assert ab.quantize_price(0.454) == pytest.approx(0.45)
+    assert ab.quantize_price(0.45) == pytest.approx(0.45)
+
+
+def _opp(direction: str, yes: float, no: float) -> ab.ArbOpportunity:
+    m = ab.Market(
+        id="1", question="q", yes_token_id="y", no_token_id="n",
+        yes_bid=0.0, yes_ask=0.0, no_bid=0.0, no_ask=0.0, volume24h=1.0,
+    )
+    return ab.ArbOpportunity(m, direction, 5.0, yes, no)
+
+
+def test_prepare_arb_orders_valid_buy():
+    p = ab.prepare_arb_orders(_opp("buy", 0.45, 0.45))
+    assert p is not None
+    assert p.yes_price == pytest.approx(0.45)
+    assert p.yes_size == pytest.approx(round(ab.MAX_TRADE_USDC / 0.45, 2))
+
+
+def test_prepare_arb_orders_valid_sell():
+    p = ab.prepare_arb_orders(_opp("sell", 0.60, 0.60))
+    assert p is not None
+    assert p.no_size == pytest.approx(round(ab.MAX_TRADE_USDC / 0.60, 2))
+
+
+def test_prepare_arb_orders_price_out_of_range():
+    # 0.005 → tick'e yuvarlanınca 0.0 → aralık dışı → None
+    assert ab.prepare_arb_orders(_opp("buy", 0.005, 0.45)) is None
+
+
+def test_prepare_arb_orders_quantization_kills_edge():
+    # 0.498 + 0.498 → yuvarlanınca 0.50 + 0.50 = 1.00 → kâr yok → None
+    assert ab.prepare_arb_orders(_opp("buy", 0.498, 0.498)) is None
+
+
+def test_prepare_arb_orders_below_min_shares():
+    # max_trade küçük → size < MIN_SHARES → None
+    assert ab.prepare_arb_orders(_opp("buy", 0.45, 0.45), max_trade=1.0) is None
+
+
 # ── order_filled ──────────────────────────────────────────────────────────
 def test_order_filled_matched():
     assert ab.order_filled({"success": True, "status": "matched"}) is True

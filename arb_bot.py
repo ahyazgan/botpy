@@ -35,6 +35,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -51,6 +52,7 @@ PAGE_LIMIT = 500
 
 # Güvenlik
 COOLDOWN_SEC = 60.0       # aynı market için iki işlem arası min süre
+RECORD_COOLDOWN = 60.0    # aynı fırsatı DB'ye tekrar yazma aralığı (radar)
 MAX_SESSION_USDC = 1_000.0  # bir oturumda riske atılabilecek toplam USDC
 HTTP_RETRIES = 3          # geçici HTTP hataları için deneme sayısı
 HTTP_BACKOFF_BASE = 0.5   # exponential backoff taban süresi (saniye)
@@ -385,6 +387,40 @@ def prepare_arb_orders(
     return PreparedOrder(yes_price=yp, yes_size=yes_size, no_price=npr, no_size=no_size)
 
 
+# ── Fırsat kaydı (radar) ─────────────────────────────────────────────────
+def opp_to_row(opp: ArbOpportunity) -> dict[str, Any]:
+    """ArbOpportunity'yi storage satırına çevir."""
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "market_id": opp.market.id,
+        "question": opp.market.question,
+        "direction": opp.direction,
+        "profit_pct": opp.profit_pct,
+        "yes_price": opp.yes_price,
+        "no_price": opp.no_price,
+    }
+
+
+def maybe_record(store: Any, opp: ArbOpportunity, guard: ExecutionGuard) -> bool:
+    """Fırsatı DB'ye yaz — aynı market için cooldown içinde tekrar yazma.
+
+    store None ise (radar kapalı) sessizce atlar. Kayıt yapıldıysa True.
+    """
+    if store is None or not guard.can_execute(opp.market.id):
+        return False
+    store.record_opportunity(opp_to_row(opp))
+    guard.mark_done(opp.market.id)
+    return True
+
+
+def format_opp(opp: ArbOpportunity) -> str:
+    """Bildirim metni."""
+    return (
+        f"🎯 ARB {opp.direction.upper()} | {opp.market.question[:60]}\n"
+        f"kâr={opp.profit_pct:.2f}% | YES={opp.yes_price:.3f} NO={opp.no_price:.3f}"
+    )
+
+
 # ── CLOB Client (lazy import) ────────────────────────────────────────────
 def build_clob_client(config: Config):
     """py_clob_client yalnızca gerçek işlem yapılırken import edilir."""
@@ -671,9 +707,12 @@ async def execute_arb(
 
 
 # ── Ana döngü ────────────────────────────────────────────────────────────
-async def main_loop(client: Any, *, dry_run: bool = False) -> None:
+async def main_loop(
+    client: Any, *, dry_run: bool = False, store: Any = None, notifier: Any = None,
+) -> None:
     loop = asyncio.get_event_loop()
     guard = ExecutionGuard(COOLDOWN_SEC)
+    record_guard = ExecutionGuard(RECORD_COOLDOWN)
     budget = Budget(MAX_SESSION_USDC)
     sem = asyncio.Semaphore(CLOB_CONCURRENCY)
 
@@ -718,6 +757,13 @@ async def main_loop(client: Any, *, dry_run: bool = False) -> None:
                     if opps:
                         log.info("%d gerçek ARB fırsatı bulundu!", len(opps))
                         for opp in opps:
+                            # Radar: fırsatı geçmişe yaz (işlem açılsa da açılmasa da)
+                            recorded = maybe_record(store, opp, record_guard)
+                            # Yeni kayıtta bildir (dedup record_guard ile aynı)
+                            if recorded and notifier is not None and notifier.enabled:
+                                await loop.run_in_executor(
+                                    None, notifier.send, format_opp(opp),
+                                )
                             if not guard.can_execute(opp.market.id):
                                 continue
                             guard.mark_start(opp.market.id)
@@ -752,10 +798,27 @@ def main() -> None:
     client = None if config.dry_run else build_clob_client(config)
     if config.dry_run:
         log.warning("ARB_DRY_RUN aktif — gerçek emir GÖNDERİLMEYECEK (simülasyon).")
+
+    # Radar: bulunan fırsatları paylaşılan SQLite'a yaz (dashboard /arb okur).
+    from storage import Store
+
+    from notify import Notifier
+
+    store = Store()
+    notifier = Notifier.from_env()
+    if notifier.enabled:
+        log.info(
+            "Bildirim aktif (telegram=%s, discord=%s)",
+            notifier.telegram_enabled, notifier.discord_enabled,
+        )
     try:
-        asyncio.run(main_loop(client, dry_run=config.dry_run))
+        asyncio.run(main_loop(
+            client, dry_run=config.dry_run, store=store, notifier=notifier,
+        ))
     except KeyboardInterrupt:
         log.info("Bot durduruldu.")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

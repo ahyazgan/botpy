@@ -666,6 +666,14 @@ def get_closed_trades(limit: int = 200) -> ClosedTradesResponse:
     return ClosedTradesResponse(trades=rows, realized_pnl=state.realized_pnl_total())
 
 
+@app.get("/pnl/curve")
+def get_pnl_curve(limit: int = 1000) -> dict[str, Any]:
+    """Kapanan işlemlerden kümülatif (equity) PnL eğrisi."""
+    limit = max(1, min(limit, 5000))
+    points = state.store.equity_curve(limit)
+    return {"points": points, "realized_pnl": state.realized_pnl_total()}
+
+
 @app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)
 def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     """Açık pozisyonu güncel fiyattan kapat (realize PnL ile kaydet)."""

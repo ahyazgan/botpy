@@ -187,6 +187,27 @@ class Store:
             ).fetchone()
         return float(row["total"]) if row else 0.0
 
+    def equity_curve(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """Kapanan işlemlerden kronolojik kümülatif PnL eğrisi.
+
+        [{closed_at, pnl, cumulative}, ...] — en eskiden en yeniye.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT closed_at, pnl FROM closed_trades "
+                "ORDER BY closed_at ASC, id ASC LIMIT ?", (limit,),
+            ).fetchall()
+        curve: list[dict[str, Any]] = []
+        cumulative = 0.0
+        for r in rows:
+            cumulative += float(r["pnl"])
+            curve.append({
+                "closed_at": r["closed_at"],
+                "pnl": float(r["pnl"]),
+                "cumulative": cumulative,
+            })
+        return curve
+
     # ── Arb fırsat geçmişi ────────────────────────────────────────────────
     def record_opportunity(self, opp: dict[str, Any]) -> int:
         row = {k: opp[k] for k in _OPP_COLUMNS}

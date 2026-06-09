@@ -42,6 +42,22 @@ def test_api_close_unknown_404():
     assert resp.status_code == 404
 
 
+def test_api_pnl_curve():
+    api._store.add_closed_trade({
+        "id": "curveX", "market_id": "mX", "question": "Q", "side": "YES",
+        "amount_usdc": 10.0, "entry_price": 0.5, "shares": 20.0,
+        "opened_at": "2026-01-01T00:00:00+00:00",
+        "closed_at": "2030-01-01T00:00:00+00:00",  # en yeni
+        "close_price": 0.7, "pnl": 4.0, "reason": "manual",
+    })
+    client = TestClient(api.app)
+    d = client.get("/pnl/curve").json()
+    assert "points" in d and "realized_pnl" in d
+    assert d["points"]  # en az bir nokta
+    # son nokta kümülatifi = toplam realize
+    assert d["points"][-1]["cumulative"] == pytest.approx(d["realized_pnl"])
+
+
 def test_api_closed_trades_and_realized():
     api._store.add_closed_trade({
         "id": "apiC", "market_id": "mB", "question": "Q2", "side": "YES",

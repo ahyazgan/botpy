@@ -227,6 +227,28 @@
         opacity: 0.4;
         cursor: not-allowed;
       }
+      .chart-shell {
+        position: relative;
+        border: 1px solid var(--border);
+        border-radius: 0.9rem;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.02);
+        margin-bottom: 12px;
+      }
+      .chart-shell svg {
+        display: block;
+        width: 100%;
+        height: 160px;
+      }
+      .chart-empty {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
       .loading td {
         text-align: center;
         color: var(--muted);
@@ -311,6 +333,14 @@
       </div>
 
       <h2 style="margin: 28px 0 8px; font-size: 18px;">Pozisyonlar &amp; PnL</h2>
+      <div class="chart-shell">
+        <svg
+          id="equityChart"
+          viewBox="0 0 600 160"
+          preserveAspectRatio="none"
+        ></svg>
+        <div class="chart-empty" id="equityEmpty">Henüz kapanan işlem yok.</div>
+      </div>
       <div class="pnl-summary" id="pnlSummary">
         <div class="pnl-card">
           <label>Açık pozisyon</label>
@@ -632,6 +662,84 @@
           re.className = "pnl-val " + pnlClass(realized);
         }
 
+        function fetchCurve() {
+          return fetchJson(API_BASE + "/pnl/curve")
+            .then(function (d) {
+              return d && Array.isArray(d.points) ? d.points : [];
+            })
+            .catch(function () {
+              return [];
+            });
+        }
+
+        function renderEquityChart(points) {
+          var svg = $("equityChart");
+          var empty = $("equityEmpty");
+          var W = 600,
+            H = 160,
+            pad = 10;
+
+          if (!points.length) {
+            svg.innerHTML = "";
+            empty.style.display = "flex";
+            return;
+          }
+          empty.style.display = "none";
+
+          var vals = points.map(function (p) {
+            return toNum(p.cumulative) || 0;
+          });
+          var min = Math.min(0, Math.min.apply(null, vals));
+          var max = Math.max(0, Math.max.apply(null, vals));
+          var range = max - min || 1;
+          var n = vals.length;
+
+          function xAt(i) {
+            return pad + (n === 1 ? 0 : (i / (n - 1)) * (W - 2 * pad));
+          }
+          function yAt(v) {
+            return H - pad - ((v - min) / range) * (H - 2 * pad);
+          }
+
+          var pts = vals
+            .map(function (v, i) {
+              return xAt(i).toFixed(1) + "," + yAt(v).toFixed(1);
+            })
+            .join(" ");
+
+          var last = vals[n - 1];
+          var stroke = last >= 0 ? "var(--accent)" : "var(--danger)";
+          var zeroY = yAt(0).toFixed(1);
+
+          var svgNs = "";
+          svgNs +=
+            '<line x1="' +
+            pad +
+            '" y1="' +
+            zeroY +
+            '" x2="' +
+            (W - pad) +
+            '" y2="' +
+            zeroY +
+            '" stroke="#3f3f46" stroke-width="1" stroke-dasharray="4 4" />';
+          svgNs +=
+            '<polyline fill="none" stroke="' +
+            stroke +
+            '" stroke-width="2" points="' +
+            pts +
+            '" />';
+          // son nokta işaretçisi
+          svgNs +=
+            '<circle cx="' +
+            xAt(n - 1).toFixed(1) +
+            '" cy="' +
+            yAt(last).toFixed(1) +
+            '" r="3" fill="' +
+            stroke +
+            '" />';
+          svg.innerHTML = svgNs;
+        }
+
         function closePosition(id, price, btn) {
           if (btn) {
             btn.disabled = true;
@@ -672,6 +780,7 @@
             fetchArb(),
             fetchTrades(),
             fetchClosed(),
+            fetchCurve(),
           ])
             .then(function (pair) {
               var btc = pair[0];
@@ -684,6 +793,7 @@
                 marketsById[String(raw[k].id)] = raw[k];
               }
               renderPositions(pair[3], pair[4], marketsById);
+              renderEquityChart(pair[5]);
 
               $("btcPrice").textContent =
                 btc !== null

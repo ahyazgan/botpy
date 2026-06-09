@@ -104,6 +104,16 @@ def get_closed_trades(limit: int = 200) -> dict:
     return {"trades": rows, "realized_pnl": _store.realized_pnl_total()}
 
 
+@app.get("/pnl/curve")
+def get_pnl_curve(limit: int = 1000) -> dict:
+    """Kapanan işlemlerden kümülatif (equity) PnL eğrisi."""
+    limit = max(1, min(limit, 5000))
+    return {
+        "points": _store.equity_curve(limit),
+        "realized_pnl": _store.realized_pnl_total(),
+    }
+
+
 class CloseBody(BaseModel):
     close_price: float = Field(gt=0, lt=1)
 

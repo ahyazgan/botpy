@@ -34,6 +34,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -104,6 +105,15 @@ _REQUIRED_ENV = (
 
 def _is_truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def mask_secret(value: str | None, keep: int = 4) -> str:
+    """Gizli değeri loglarken maskele (anahtar sızıntısını önle)."""
+    if not value:
+        return ""
+    if len(value) <= keep:
+        return "*" * len(value)
+    return value[:keep] + "…" + ("*" * 4)
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:
@@ -737,6 +747,7 @@ async def execute_arb(
     budget: Budget,
     dry_run: bool = False,
     available_usdc: float | None = None,
+    store: Any = None,
 ) -> None:
     m = opp.market
 
@@ -781,6 +792,15 @@ async def execute_arb(
     yes_side, no_side = ("BUY", "BUY") if opp.direction == "buy" else ("SELL", "SELL")
     budget.charge(notional)
 
+    # Crash-recovery: emir göndermeden önce niyeti journal'a yaz (audit izi)
+    intent_id = str(uuid.uuid4())
+    if store is not None:
+        store.open_intent(intent_id, m.id, opp.direction, detail=m.question[:80])
+        store.log_event(
+            "order_send", market_id=m.id, side=opp.direction,
+            price=opp.profit_pct, size=notional, detail=intent_id,
+        )
+
     # YES ve NO emirlerini AYNI ANDA gönder (maksimum hız)
     yes_res, no_res = await asyncio.gather(
         _send_order(client, loop, m.yes_token_id, yes_side, yes_price, yes_size),
@@ -792,6 +812,7 @@ async def execute_arb(
 
     yes_ok = order_filled(yes_res)
     no_ok = order_filled(no_res)
+    outcome = f"yes={'fill' if yes_ok else 'kill'} no={'fill' if no_ok else 'kill'}"
 
     if yes_ok and no_ok:
         log.info("✓ ARB tamamlandı (her iki bacak dolu).")
@@ -799,10 +820,19 @@ async def execute_arb(
         log.info("Hiçbir bacak dolmadı (FOK iptal) — pozisyon yok, güvenli.")
     elif yes_ok and not no_ok:
         # YES doldu, NO iptal → açık YES pozisyonunu kapat
+        outcome += " | unwind=yes"
         await _unwind_leg(client, loop, m.yes_token_id, yes_side, yes_price, yes_size)
     else:
         # NO doldu, YES iptal → açık NO pozisyonunu kapat
+        outcome += " | unwind=no"
         await _unwind_leg(client, loop, m.no_token_id, no_side, no_price, no_size)
+
+    if store is not None:
+        store.log_event(
+            "order_result", market_id=m.id, side=opp.direction,
+            status=outcome, detail=intent_id,
+        )
+        store.close_intent(intent_id, outcome)
 
 
 # ── Ana döngü ────────────────────────────────────────────────────────────
@@ -874,7 +904,7 @@ async def main_loop(
                                 await execute_arb(
                                     client, opp, loop,
                                     budget=budget, dry_run=dry_run,
-                                    available_usdc=available,
+                                    available_usdc=available, store=store,
                                 )
                             finally:
                                 guard.mark_done(opp.market.id)
@@ -910,6 +940,21 @@ def main() -> None:
             "Bildirim aktif (telegram=%s, discord=%s)",
             notifier.telegram_enabled, notifier.discord_enabled,
         )
+
+    # Güvenlik: gizli anahtar asla loglanmaz; funder maskeli gösterilir.
+    if not config.dry_run:
+        log.info("Funder: %s", mask_secret(config.funder_address))
+
+    # Crash recovery: önceki koşudan tamamlanmamış emir niyeti var mı?
+    orphans = store.list_open_intents()
+    if orphans:
+        log.critical(
+            "CRASH RECOVERY | %d tamamlanmamış emir niyeti — MANUEL KONTROL ÖNERİLİR: %s",
+            len(orphans), [o["id"] for o in orphans],
+        )
+        store.log_event("startup_orphans", status=str(len(orphans)))
+    store.log_event("bot_start", status="dry_run" if config.dry_run else "live")
+
     try:
         asyncio.run(main_loop(
             client, dry_run=config.dry_run, store=store, notifier=notifier,

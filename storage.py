@@ -80,6 +80,33 @@ CREATE TABLE IF NOT EXISTS closed_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_trades(closed_at);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    event      TEXT NOT NULL,
+    market_id  TEXT,
+    side       TEXT,
+    price      REAL,
+    size       REAL,
+    status     TEXT,
+    detail     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS order_intents (
+    id         TEXT PRIMARY KEY,
+    ts         TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    direction  TEXT NOT NULL,
+    detail     TEXT,
+    status     TEXT NOT NULL,        -- 'open' | 'done'
+    result     TEXT,
+    closed_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_status ON order_intents(status);
 """
 
 _TRADE_COLUMNS = (
@@ -224,5 +251,63 @@ class Store:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM arb_opportunities ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Audit log (değişmez emir/olay kaydı) ──────────────────────────────
+    def log_event(
+        self,
+        event: str,
+        *,
+        market_id: str | None = None,
+        side: str | None = None,
+        price: float | None = None,
+        size: float | None = None,
+        status: str | None = None,
+        detail: str | None = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO audit_log (ts, event, market_id, side, price, size, "
+                "status, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (_utcnow(), event, market_id, side, price, size, status, detail),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_audit(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Emir niyet günlüğü (crash recovery) ───────────────────────────────
+    def open_intent(
+        self, intent_id: str, market_id: str, direction: str, detail: str | None = None,
+    ) -> str:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO order_intents (id, ts, market_id, direction, detail, "
+                "status) VALUES (?, ?, ?, ?, ?, 'open')",
+                (intent_id, _utcnow(), market_id, direction, detail),
+            )
+            self._conn.commit()
+        return intent_id
+
+    def close_intent(self, intent_id: str, result: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE order_intents SET status='done', result=?, closed_at=? "
+                "WHERE id=? AND status='open'",
+                (result, _utcnow(), intent_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def list_open_intents(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM order_intents WHERE status='open' ORDER BY ts",
             ).fetchall()
         return [dict(r) for r in rows]

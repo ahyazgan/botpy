@@ -722,6 +722,16 @@ def get_pnl_stats() -> dict[str, Any]:
     return compute_stats(pnls)
 
 
+@app.get("/audit")
+def get_audit(limit: int = 200) -> dict[str, Any]:
+    """Audit log (arb_bot emir/olay kayıtları) + bekleyen emir niyetleri."""
+    limit = max(1, min(limit, 1000))
+    return {
+        "events": state.store.list_audit(limit),
+        "open_intents": state.store.list_open_intents(),
+    }
+
+
 @app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)
 def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     """Açık pozisyonu güncel fiyattan kapat (realize PnL ile kaydet)."""

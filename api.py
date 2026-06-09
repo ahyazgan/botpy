@@ -122,6 +122,16 @@ def get_pnl_stats() -> dict:
     return compute_stats(pnls)
 
 
+@app.get("/audit")
+def get_audit(limit: int = 200) -> dict:
+    """Audit log + bekleyen emir niyetleri (crash recovery görünürlüğü)."""
+    limit = max(1, min(limit, 1000))
+    return {
+        "events": _store.list_audit(limit),
+        "open_intents": _store.list_open_intents(),
+    }
+
+
 class CloseBody(BaseModel):
     close_price: float = Field(gt=0, lt=1)
 

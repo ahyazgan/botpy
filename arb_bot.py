@@ -46,9 +46,14 @@ GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
 SCAN_INTERVAL = 5         # saniye — her kaç saniyede tarasın
 MIN_VOLUME_24H = 50_000   # USDC — düşük hacimli marketleri atla
-MIN_PROFIT = 0.02         # %2 minimum net kâr (gas + slippage payı)
+MIN_PROFIT = 0.02         # %2 minimum brüt kâr (ön eleme)
 MAX_TRADE_USDC = 50.0     # her leg için maksimum USDC
 PAGE_LIMIT = 500
+
+# Yürütme gerçekçiliği — slippage + maliyet
+FEE_PCT = 0.0               # Polymarket işlem ücreti (şu an 0; modellenebilir)
+GAS_COST_USDC = 0.05        # leg başına tahmini Polygon gas (USDC eşdeğeri)
+MIN_NET_PROFIT_USDC = 0.5   # fee+gas+slippage sonrası min net kâr (USDC)
 
 # Güvenlik
 COOLDOWN_SEC = 60.0       # aynı market için iki işlem arası min süre
@@ -304,6 +309,62 @@ def detect_arb(
     return None
 
 
+# ── Order book derinliği / slippage (saf) ────────────────────────────────
+def book_levels(side_levels: Any) -> list[tuple[float, float]]:
+    """CLOB book tarafını [(price, size), ...] listesine çevir (geçersizleri at)."""
+    out: list[tuple[float, float]] = []
+    for lvl in side_levels or []:
+        p = _f(lvl.get("price"))
+        s = _f(lvl.get("size"))
+        if p is not None and s is not None and s > 0:
+            out.append((p, s))
+    return out
+
+
+def vwap_for_size(
+    levels: list[tuple[float, float]], size: float,
+) -> tuple[float | None, float]:
+    """Verilen büyüklük için hacim-ağırlıklı ortalama fiyat (slippage dahil).
+
+    `levels` tüketim sırasında olmalı (en iyi fiyat önce).
+    (vwap, filled) döner; filled < size → yeterli derinlik yok.
+    """
+    remaining = size
+    cost = 0.0
+    filled = 0.0
+    for price, avail in levels:
+        take = min(remaining, avail)
+        cost += take * price
+        filled += take
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if filled <= 0:
+        return None, 0.0
+    return cost / filled, filled
+
+
+def net_arb_profit(
+    direction: str,
+    yes_price: float,
+    no_price: float,
+    size: float,
+    *,
+    fee_pct: float = FEE_PCT,
+    gas_usdc: float = GAS_COST_USDC,
+) -> float:
+    """size adet çift için fee + gas sonrası net kâr (USDC).
+
+    buy:  her çift `1 - (yes+no)` kazandırır (biri 1'e çözülür).
+    sell: her çift `(yes+no) - 1` kazandırır.
+    """
+    pair = yes_price + no_price
+    gross = size * ((1.0 - pair) if direction == "buy" else (pair - 1.0))
+    fees = fee_pct * size * pair
+    gas = gas_usdc * 2  # iki bacak
+    return gross - fees - gas
+
+
 def quick_screen(market: Market, min_profit: float = MIN_PROFIT) -> bool:
     """Gamma fiyatlarıyla hızlı ön eleme — yanlış pozitif olabilir, OK.
 
@@ -530,23 +591,26 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
     return markets
 
 
-# ── CLOB orderbook doğrulaması ───────────────────────────────────────────
-async def fetch_best_prices(
+# ── CLOB orderbook doğrulaması (derinlik + maliyet) ──────────────────────
+async def fetch_book(
     session: aiohttp.ClientSession,
     token_id: str,
     sem: asyncio.Semaphore | None = None,
-) -> tuple[float | None, float | None]:
-    """CLOB'dan token için gerçek bid/ask çek (rate-limit korumalı)."""
-    async def _do() -> tuple[float | None, float | None]:
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """CLOB'dan tam orderbook çek; (bids, asks) tüketim sırasında döner.
+
+    bids: en yüksek alış önce; asks: en düşük satış önce.
+    """
+    async def _do() -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
         try:
             data = await _get_json(session, f"{CLOB_HOST}/book", params={"token_id": token_id})
         except aiohttp.ClientError:
-            return None, None
-        bids: list[dict] = data.get("bids") or []
-        asks: list[dict] = data.get("asks") or []
-        best_bid = max((_f(b.get("price")) for b in bids if b.get("price")), default=None)
-        best_ask = min((_f(a.get("price")) for a in asks if a.get("price")), default=None)
-        return best_bid, best_ask
+            return [], []
+        bids = book_levels(data.get("bids"))
+        asks = book_levels(data.get("asks"))
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+        return bids, asks
 
     if sem is None:
         return await _do()
@@ -554,17 +618,52 @@ async def fetch_best_prices(
         return await _do()
 
 
+def evaluate_book_arb(
+    yes_bids: list[tuple[float, float]],
+    yes_asks: list[tuple[float, float]],
+    no_bids: list[tuple[float, float]],
+    no_asks: list[tuple[float, float]],
+    *,
+    max_trade: float = MAX_TRADE_USDC,
+    min_net_usdc: float = MIN_NET_PROFIT_USDC,
+) -> tuple[str, float, float, float] | None:
+    """Derinlik + maliyet farkındalıklı arb kararı (saf).
+
+    VWAP ile gerçek dolum fiyatını ve fee+gas sonrası net kârı hesaplar.
+    (direction, profit_pct, yes_vwap, no_vwap) ya da None.
+    """
+    # BUY arb: YES ask + NO ask < 1
+    if yes_asks and no_asks and (yes_asks[0][0] + no_asks[0][0]) < 1.0:
+        size = round(max_trade / max(yes_asks[0][0], no_asks[0][0]), 2)
+        ya, yf = vwap_for_size(yes_asks, size)
+        na, nf = vwap_for_size(no_asks, size)
+        if ya is not None and na is not None and yf >= size and nf >= size:
+            if net_arb_profit("buy", ya, na, size) >= min_net_usdc:
+                return "buy", (1.0 - (ya + na)) * 100, ya, na
+
+    # SELL arb: YES bid + NO bid > 1
+    if yes_bids and no_bids and (yes_bids[0][0] + no_bids[0][0]) > 1.0:
+        size = round(max_trade / max(yes_bids[0][0], no_bids[0][0]), 2)
+        yb, yf = vwap_for_size(yes_bids, size)
+        nb, nf = vwap_for_size(no_bids, size)
+        if yb is not None and nb is not None and yf >= size and nf >= size:
+            if net_arb_profit("sell", yb, nb, size) >= min_net_usdc:
+                return "sell", ((yb + nb) - 1.0) * 100, yb, nb
+
+    return None
+
+
 async def verify_opportunity(
     session: aiohttp.ClientSession,
     market: Market,
     sem: asyncio.Semaphore | None = None,
 ) -> ArbOpportunity | None:
-    """CLOB orderbook'undan gerçek fiyatları alıp arb hesapla."""
-    (yes_bid, yes_ask), (no_bid, no_ask) = await asyncio.gather(
-        fetch_best_prices(session, market.yes_token_id, sem),
-        fetch_best_prices(session, market.no_token_id, sem),
+    """CLOB orderbook derinliğinden VWAP + maliyet sonrası net arb hesapla."""
+    (yes_bids, yes_asks), (no_bids, no_asks) = await asyncio.gather(
+        fetch_book(session, market.yes_token_id, sem),
+        fetch_book(session, market.no_token_id, sem),
     )
-    found = detect_arb(yes_bid, yes_ask, no_bid, no_ask)
+    found = evaluate_book_arb(yes_bids, yes_asks, no_bids, no_asks)
     if found is None:
         return None
     direction, profit_pct, yes_price, no_price = found

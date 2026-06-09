@@ -1,0 +1,530 @@
+"""
+Binance işlem modülü — profesyonel haber-trade için.
+
+Modlar:
+  • PAPER (varsayılan): gerçek emir GÖNDERMEZ, fiyatı çekip simüle eder. Risksiz.
+  • CANLI: CCXT ile Binance'e gerçek emir. .env'de BINANCE_API_KEY/SECRET gerekir.
+
+Profesyonel özellikler:
+  - Kalıcılık: pozisyon/işlem/ayarlar JSON dosyada; restart'ı atlatır.
+  - Stop-loss / take-profit / trailing stop: otomatik çıkış (monitor_positions).
+  - Risk limitleri: günlük zarar freni (circuit breaker), toplam + coin maruziyet sınırı.
+  - Emir kalitesi: orderbook derinlik + slippage tahmini, market/limit seçimi.
+  - Performans: işlem günlüğü + kazanma oranı / P&L istatistikleri.
+
+GÜVENLİK: Kod borsada "para çekme" iznini denetleyemez — KULLANICI para-çekme-KAPALI
+bir API anahtarı oluşturmalıdır.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+import requests
+
+log = logging.getLogger(__name__)
+
+BINANCE_API = "https://api.binance.com/api/v3"
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_state.json")
+
+
+# ── Ayarlar (çalışırken /settings ile değişir, dosyaya kaydedilir) ───────
+class Settings:
+    paper_trading: bool = True       # True = simülasyon
+    auto_trade: bool = False         # otomatik işlem
+    market: str = "spot"             # "spot" | "futures"
+    trade_usdt: float = 100.0        # pozisyon başına USDT
+    leverage: int = 1                # yalnızca futures
+    max_positions: int = 20
+    auto_min_impact: int = 8
+    auto_require_confirm: bool = True
+    cooldown_sec: int = 1800
+    # Otomatik çıkış
+    use_sl_tp: bool = True
+    stop_loss_pct: float = 3.0       # -%3'te zarar durdur
+    take_profit_pct: float = 6.0     # +%6'da kâr al
+    trailing_stop_pct: float = 0.0   # 0 = kapalı; >0 ise kârı takip eden stop
+    # Risk limitleri
+    daily_loss_limit_usdt: float = 200.0   # günlük gerçekleşen zarar bu USDT'yi geçerse dur (0=kapalı)
+    max_total_exposure_usdt: float = 2000.0  # toplam açık pozisyon USDT tavanı (0=kapalı)
+    max_per_coin_usdt: float = 500.0       # tek coin için açık pozisyon tavanı (0=kapalı)
+    # Emir kalitesi
+    order_type: str = "market"       # "market" | "limit"
+    slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
+    min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
+
+
+S = Settings()
+
+_lock = threading.Lock()
+_positions: list[dict[str, Any]] = []
+_closed: list[dict[str, Any]] = []
+_last_trade: dict[str, float] = {}
+_daily: dict[str, Any] = {"date": "", "realized": 0.0}
+_exchange: Any = None
+
+_PERSIST_KEYS = (
+    "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
+    "max_positions", "auto_min_impact", "auto_require_confirm", "cooldown_sec",
+    "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+    "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
+    "order_type", "slippage_guard_pct", "min_orderbook_usd",
+)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ── Kalıcılık ────────────────────────────────────────────────────────────
+def _save_state() -> None:
+    try:
+        data = {
+            "positions": _positions,
+            "closed": _closed[-500:],   # son 500 işlem yeter
+            "daily": _daily,
+            "settings": {k: getattr(S, k) for k in _PERSIST_KEYS},
+        }
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.warning("Durum kaydedilemedi: %s", e)
+
+
+def load_state() -> None:
+    global _positions, _closed, _daily
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        with _lock:
+            _positions = data.get("positions", [])
+            _closed = data.get("closed", [])
+            _daily = data.get("daily", {"date": "", "realized": 0.0})
+            for k, v in (data.get("settings") or {}).items():
+                if k in _PERSIST_KEYS and v is not None:
+                    setattr(S, k, v)
+        log.info("Durum yüklendi: %d açık pozisyon, %d kapanmış işlem", len(_positions), len(_closed))
+    except Exception as e:
+        log.warning("Durum yüklenemedi: %s", e)
+
+
+# ── Yardımcılar ──────────────────────────────────────────────────────────
+def has_live_keys() -> bool:
+    return bool(os.environ.get("BINANCE_API_KEY") and os.environ.get("BINANCE_SECRET"))
+
+
+def get_price(symbol: str) -> float | None:
+    try:
+        r = requests.get(f"{BINANCE_API}/ticker/price", params={"symbol": symbol}, timeout=10)
+        if r.status_code == 200:
+            return float(r.json()["price"])
+    except Exception:
+        pass
+    return None
+
+
+def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | None:
+    """Orderbook'tan bu büyüklükteki emrin ortalama dolum fiyatı + slippage + likidite."""
+    try:
+        r = requests.get(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": 50}, timeout=10)
+        if r.status_code != 200:
+            return None
+        book = r.json()
+    except Exception:
+        return None
+    levels = book.get("asks") if is_long else book.get("bids")
+    if not levels:
+        return None
+    best = float(levels[0][0])
+    avail = sum(float(p) * float(q) for p, q in levels)
+    remaining, cost, qty = usdt, 0.0, 0.0
+    for p, q in levels:
+        p = float(p); q = float(q)
+        take = min(remaining, p * q)
+        if p > 0:
+            qty += take / p
+        cost += take
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0 or qty <= 0:
+        return {"avg": None, "slippage": None, "avail": avail, "enough": False, "best": best}
+    avg = cost / qty
+    slippage = abs(avg - best) / best * 100
+    return {"avg": avg, "slippage": slippage, "avail": avail, "enough": True, "best": best}
+
+
+def _ccxt_symbol(symbol: str) -> str:
+    return symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
+
+
+def _get_exchange() -> Any:
+    global _exchange
+    if _exchange is None:
+        import ccxt
+        key = os.environ.get("BINANCE_API_KEY")
+        sec = os.environ.get("BINANCE_SECRET")
+        if not key or not sec:
+            raise RuntimeError("Canlı işlem için .env'de BINANCE_API_KEY ve BINANCE_SECRET gerekli")
+        ex = ccxt.binance({"apiKey": key, "secret": sec, "enableRateLimit": True})
+        if S.market == "futures":
+            ex.options["defaultType"] = "future"
+        _exchange = ex
+    return _exchange
+
+
+def _pnl(pos: dict[str, Any], cur: float | None) -> tuple[float | None, float | None]:
+    if cur is None:
+        return None, None
+    diff = (cur - pos["entry_price"]) / pos["entry_price"]
+    if pos["side"] == "short":
+        diff = -diff
+    lev = pos.get("leverage", 1) or 1
+    return round(pos["usdt"] * diff * lev, 2), round(diff * lev * 100, 2)
+
+
+# ── Risk kontrolleri ─────────────────────────────────────────────────────
+def _reset_daily_if_needed() -> None:
+    if _daily.get("date") != _today():
+        _daily["date"] = _today()
+        _daily["realized"] = 0.0
+
+
+def _exposure() -> tuple[float, dict[str, float]]:
+    total = 0.0
+    per_coin: dict[str, float] = {}
+    for p in _positions:
+        total += p["usdt"]
+        per_coin[p["symbol"]] = per_coin.get(p["symbol"], 0.0) + p["usdt"]
+    return total, per_coin
+
+
+def _check_risk(symbol: str, usdt: float) -> None:
+    """Risk limitlerini ihlal eden işlemde RuntimeError fırlatır."""
+    _reset_daily_if_needed()
+    if S.daily_loss_limit_usdt > 0 and _daily["realized"] <= -abs(S.daily_loss_limit_usdt):
+        raise RuntimeError(f"Günlük zarar limiti aşıldı ({_daily['realized']:.2f} USDT) — bugün işlem durduruldu")
+    total, per_coin = _exposure()
+    if S.max_total_exposure_usdt > 0 and total + usdt > S.max_total_exposure_usdt:
+        raise RuntimeError(f"Toplam maruziyet tavanı ({S.max_total_exposure_usdt:.0f} USDT) aşılır")
+    if S.max_per_coin_usdt > 0 and per_coin.get(symbol, 0.0) + usdt > S.max_per_coin_usdt:
+        raise RuntimeError(f"{symbol} için coin maruziyet tavanı ({S.max_per_coin_usdt:.0f} USDT) aşılır")
+
+
+# ── İşlem açma ───────────────────────────────────────────────────────────
+def place_trade(symbol: str, side: str, usdt: float | None = None,
+                source: str = "manual", reason: str = "") -> dict[str, Any]:
+    side = side.lower()
+    is_long = side in ("long", "buy")
+    if S.market == "spot" and not is_long:
+        raise RuntimeError("Spot'ta açığa satış yok — short yalnızca futures'ta")
+
+    usdt = usdt or S.trade_usdt
+
+    with _lock:
+        if len(_positions) >= S.max_positions:
+            raise RuntimeError(f"Maksimum açık pozisyon ({S.max_positions}) doldu")
+        _check_risk(symbol, usdt)
+
+    # Emir kalitesi: orderbook derinlik + slippage tahmini
+    est = _estimate_fill(symbol, is_long, usdt)
+    if est is not None:
+        if S.min_orderbook_usd > 0 and est["avail"] < S.min_orderbook_usd:
+            raise RuntimeError(f"Yetersiz likidite (orderbook ${est['avail']:,.0f} < ${S.min_orderbook_usd:,.0f})")
+        if not est["enough"]:
+            raise RuntimeError("Orderbook bu büyüklüğü karşılayamıyor (çok düşük likidite)")
+        if S.slippage_guard_pct > 0 and est["slippage"] is not None and est["slippage"] > S.slippage_guard_pct:
+            raise RuntimeError(f"Slippage çok yüksek (%{est['slippage']:.2f} > %{S.slippage_guard_pct}) — giriş iptal")
+
+    price = (est["avg"] if est and est.get("avg") else None) or get_price(symbol)
+    if not price:
+        raise RuntimeError(f"{symbol} fiyatı alınamadı")
+    amount = round(usdt / price, 6)
+    mode = "paper" if S.paper_trading else "live"
+
+    if not S.paper_trading:
+        ex = _get_exchange()
+        csym = _ccxt_symbol(symbol)
+        ex_side = "buy" if is_long else "sell"
+        if S.market == "futures" and S.leverage > 1:
+            try:
+                ex.set_leverage(S.leverage, csym)
+            except Exception as e:
+                log.warning("Kaldıraç ayarlanamadı (%s): %s", csym, e)
+        if S.order_type == "limit":
+            order = ex.create_order(csym, "limit", ex_side, amount, price)
+        else:
+            order = ex.create_order(csym, "market", ex_side, amount)
+        if order.get("average"):
+            price = float(order["average"])
+        if order.get("filled"):
+            amount = float(order["filled"]) or amount
+
+    # SL/TP fiyatları
+    sl_price = tp_price = None
+    if S.use_sl_tp:
+        if is_long:
+            if S.stop_loss_pct > 0:
+                sl_price = round(price * (1 - S.stop_loss_pct / 100), 8)
+            if S.take_profit_pct > 0:
+                tp_price = round(price * (1 + S.take_profit_pct / 100), 8)
+        else:
+            if S.stop_loss_pct > 0:
+                sl_price = round(price * (1 + S.stop_loss_pct / 100), 8)
+            if S.take_profit_pct > 0:
+                tp_price = round(price * (1 - S.take_profit_pct / 100), 8)
+
+    pos = {
+        "id": str(uuid.uuid4())[:8],
+        "symbol": symbol,
+        "side": "long" if is_long else "short",
+        "market": S.market,
+        "mode": mode,
+        "usdt": usdt,
+        "entry_price": price,
+        "amount": amount,
+        "leverage": S.leverage if S.market == "futures" else 1,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "trailing_pct": S.trailing_stop_pct,
+        "high_water": price,
+        "opened_at": _now(),
+        "source": source,
+        "reason": reason,
+    }
+    with _lock:
+        _positions.append(pos)
+        _last_trade[symbol] = time.monotonic()
+        _save_state()
+    log.info("%s AÇ | %s %s | %.2f USDT @ %.6f | SL=%s TP=%s | %s",
+             mode.upper(), pos["side"], symbol, usdt, price, sl_price, tp_price, source)
+    return pos
+
+
+def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
+    with _lock:
+        idx = next((i for i, p in enumerate(_positions) if p["id"] == pid), None)
+        if idx is None:
+            raise RuntimeError("Pozisyon bulunamadı")
+        pos = _positions.pop(idx)
+
+    cur = get_price(pos["symbol"])
+    if pos["mode"] == "live":
+        try:
+            ex = _get_exchange()
+            csym = _ccxt_symbol(pos["symbol"])
+            ex_side = "sell" if pos["side"] == "long" else "buy"
+            params = {"reduceOnly": True} if pos["market"] == "futures" else {}
+            ex.create_order(csym, "market", ex_side, pos["amount"], None, params)
+        except Exception as e:
+            log.warning("Canlı kapatma hatası (%s): %s", pos["symbol"], e)
+
+    pnl, pct = _pnl(pos, cur)
+    pos["closed_at"] = _now()
+    pos["close_price"] = cur
+    pos["pnl"] = pnl
+    pos["pnl_pct"] = pct
+    pos["close_reason"] = reason
+    with _lock:
+        _closed.append(pos)
+        _reset_daily_if_needed()
+        if pnl is not None:
+            _daily["realized"] = round(_daily["realized"] + pnl, 2)
+        _save_state()
+    log.info("%s KAPAT | %s %s | P&L=%s USDT | sebep=%s",
+             pos["mode"].upper(), pos["side"], pos["symbol"], pnl, reason)
+    return pos
+
+
+def get_positions() -> tuple[list[dict[str, Any]], float]:
+    with _lock:
+        snap = list(_positions)
+    out: list[dict[str, Any]] = []
+    total = 0.0
+    for p in snap:
+        cur = get_price(p["symbol"])
+        pnl, pct = _pnl(p, cur)
+        row = dict(p)
+        row["current_price"] = cur
+        row["pnl"] = pnl
+        row["pnl_pct"] = pct
+        out.append(row)
+        if pnl is not None:
+            total += pnl
+    return out, round(total, 2)
+
+
+# ── Otomatik çıkış (SL/TP/trailing) ──────────────────────────────────────
+def monitor_positions() -> None:
+    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat."""
+    with _lock:
+        snap = list(_positions)
+    for p in snap:
+        if not (p.get("sl_price") or p.get("tp_price")):
+            continue
+        cur = get_price(p["symbol"])
+        if cur is None:
+            continue
+        is_long = p["side"] == "long"
+
+        # Trailing stop: kâr yönünde ilerledikçe stop'u çek
+        tr = p.get("trailing_pct", 0) or 0
+        if tr > 0:
+            changed = False
+            if is_long and cur > p.get("high_water", cur):
+                p["high_water"] = cur
+                new_sl = round(cur * (1 - tr / 100), 8)
+                if p.get("sl_price") is None or new_sl > p["sl_price"]:
+                    p["sl_price"] = new_sl; changed = True
+            elif not is_long and cur < p.get("high_water", cur):
+                p["high_water"] = cur
+                new_sl = round(cur * (1 + tr / 100), 8)
+                if p.get("sl_price") is None or new_sl < p["sl_price"]:
+                    p["sl_price"] = new_sl; changed = True
+            if changed:
+                with _lock:
+                    _save_state()
+
+        hit = None
+        sl, tp = p.get("sl_price"), p.get("tp_price")
+        if is_long:
+            if sl and cur <= sl:
+                hit = "stop-loss"
+            elif tp and cur >= tp:
+                hit = "take-profit"
+        else:
+            if sl and cur >= sl:
+                hit = "stop-loss"
+            elif tp and cur <= tp:
+                hit = "take-profit"
+        if hit:
+            try:
+                close_position(p["id"], reason=hit)
+            except Exception as e:
+                log.warning("Otomatik kapatma hatası (%s): %s", p["symbol"], e)
+
+
+# ── Otomatik işlem ───────────────────────────────────────────────────────
+def _can_auto_trade(symbol: str) -> bool:
+    with _lock:
+        if time.monotonic() - _last_trade.get(symbol, 0.0) < S.cooldown_sec:
+            return False
+        if len(_positions) >= S.max_positions:
+            return False
+        if any(p["symbol"] == symbol for p in _positions):
+            return False
+    return True
+
+
+def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
+    if not S.auto_trade:
+        return None
+    if item.impact < S.auto_min_impact:
+        return None
+    if S.auto_require_confirm and not getattr(item, "confirmed", False):
+        return None
+    symbol = getattr(item, "symbol", None)
+    if not symbol:
+        return None
+    if item.direction == "bullish":
+        side = "long"
+    elif item.direction == "bearish":
+        side = "short"
+    else:
+        return None
+    if S.market == "spot" and side == "short":
+        return None
+    if not _can_auto_trade(symbol):
+        return None
+    try:
+        return place_trade(symbol, side, source="auto", reason=getattr(item, "reason", ""))
+    except Exception as e:
+        log.warning("Otomatik işlem açılamadı (%s): %s", symbol, e)
+        return None
+
+
+# ── Performans ───────────────────────────────────────────────────────────
+def get_performance() -> dict[str, Any]:
+    with _lock:
+        closed = list(_closed)
+        realized_today = _daily.get("realized", 0.0)
+    scored = [c for c in closed if c.get("pnl") is not None]
+    wins = [c for c in scored if c["pnl"] > 0]
+    losses = [c for c in scored if c["pnl"] < 0]
+    total = round(sum(c["pnl"] for c in scored), 2)
+
+    def _agg(key: str) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for c in scored:
+            k = str(c.get(key) or "?")
+            d = out.setdefault(k, {"count": 0, "pnl": 0.0, "wins": 0})
+            d["count"] += 1
+            d["pnl"] = round(d["pnl"] + c["pnl"], 2)
+            if c["pnl"] > 0:
+                d["wins"] += 1
+        return out
+
+    return {
+        "total_trades": len(scored),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(len(wins) / len(scored) * 100, 1) if scored else 0.0,
+        "total_pnl": total,
+        "avg_pnl": round(total / len(scored), 2) if scored else 0.0,
+        "best": round(max((c["pnl"] for c in scored), default=0.0), 2),
+        "worst": round(min((c["pnl"] for c in scored), default=0.0), 2),
+        "realized_today": realized_today,
+        "by_source": _agg("source"),
+        "by_symbol": _agg("symbol"),
+        "by_reason": _agg("close_reason"),
+        "recent": list(reversed(closed[-30:])),
+    }
+
+
+# ── Ayarlar ──────────────────────────────────────────────────────────────
+def get_settings() -> dict[str, Any]:
+    _reset_daily_if_needed()
+    total, _ = _exposure()
+    return {k: getattr(S, k) for k in _PERSIST_KEYS} | {
+        "has_live_keys": has_live_keys(),
+        "open_exposure_usdt": round(total, 2),
+        "realized_today": _daily.get("realized", 0.0),
+    }
+
+
+def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    global _exchange
+    market_changed = "market" in patch and patch["market"] != S.market
+    for k in _PERSIST_KEYS:
+        if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
+            setattr(S, k, patch[k])
+    if "paper_trading" in patch and patch["paper_trading"] is not None:
+        S.paper_trading = bool(patch["paper_trading"])
+    if "auto_trade" in patch and patch["auto_trade"] is not None:
+        if patch["auto_trade"] and not S.paper_trading and not has_live_keys():
+            raise RuntimeError("Canlı otomatik işlem için .env'de Binance anahtarları gerekli")
+        S.auto_trade = bool(patch["auto_trade"])
+    if market_changed:
+        _exchange = None
+    with _lock:
+        _save_state()
+    return get_settings()
+
+
+# Modül yüklenince kayıtlı durumu geri yükle
+load_state()

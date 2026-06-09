@@ -35,6 +35,10 @@ AUTO_MAX_SPREAD: float = 0.03     # bu spread üstündekileri atla
 AUTO_MIN_PRICE: float = 0.10      # fiyat bandı alt sınırı (ask)
 AUTO_MAX_PRICE: float = 0.90      # fiyat bandı üst sınırı (ask)
 
+# Otomatik pozisyon kapatma (paper) — take-profit / stop-loss
+TAKE_PROFIT_PCT: float = 20.0     # +%20 kârda kapat
+STOP_LOSS_PCT: float = 15.0       # -%15 zararda kapat
+
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
 REQUEST_TIMEOUT = 30
@@ -207,6 +211,46 @@ def evaluate_signal(
     return None
 
 
+def should_close(
+    entry: float,
+    current: float | None,
+    *,
+    take_profit_pct: float = TAKE_PROFIT_PCT,
+    stop_loss_pct: float = STOP_LOSS_PCT,
+) -> str | None:
+    """Açık pozisyon kapatılmalı mı? "take_profit" / "stop_loss" / None.
+
+    PnL% = (current/entry - 1) * 100.
+    """
+    if current is None or entry <= 0:
+        return None
+    pnl_pct = (current / entry - 1.0) * 100.0
+    if pnl_pct >= take_profit_pct:
+        return "take_profit"
+    if pnl_pct <= -stop_loss_pct:
+        return "stop_loss"
+    return None
+
+
+def closed_row(trade: dict[str, Any], close_price: float, reason: str) -> dict[str, Any]:
+    """Açık trade'i kapanan-işlem satırına çevir (realize PnL ile)."""
+    pnl = trade["shares"] * close_price - trade["amount_usdc"]
+    return {
+        "id": trade["id"],
+        "market_id": trade["market_id"],
+        "question": trade["question"],
+        "side": trade["side"],
+        "amount_usdc": trade["amount_usdc"],
+        "entry_price": trade["entry_price"],
+        "shares": trade["shares"],
+        "opened_at": trade["opened_at"],
+        "closed_at": _utcnow(),
+        "close_price": close_price,
+        "pnl": pnl,
+        "reason": reason,
+    }
+
+
 def auto_trade_step(
     state: AppState, rows: list[dict[str, Any]], *, amount: float = AUTO_TRADE_AMOUNT,
 ) -> int:
@@ -230,6 +274,25 @@ def auto_trade_step(
         open_market_ids.add(mid)
         opened += 1
     return opened
+
+
+def auto_close_step(state: AppState) -> int:
+    """Açık pozisyonları take-profit/stop-loss'a göre kapat. Kapanan sayısı döner."""
+    closed = 0
+    for trade in state.list_trades():
+        current = state.current_price(trade["market_id"], trade["side"])
+        reason = should_close(trade["entry_price"], current)
+        if reason is None:
+            continue
+        # current None değil (should_close None döndürürdü)
+        row = closed_row(trade, float(current), reason)
+        state.close_trade(row)
+        logging.info(
+            "AUTO CLOSE | %s | %s | pnl=%.2f USDC",
+            trade["question"][:40], reason, row["pnl"],
+        )
+        closed += 1
+    return closed
 
 
 # ── Uygulama durumu (thread-safe, kapsüllenmiş) ──────────────────────────
@@ -310,6 +373,17 @@ class AppState:
     def remove_trade(self, trade_id: str) -> bool:
         return self.store.remove_trade(trade_id)
 
+    def close_trade(self, closed: dict[str, Any]) -> None:
+        """Açık pozisyonu kapat: kapanan defterine yaz + açıktan kaldır."""
+        self.store.add_closed_trade(closed)
+        self.store.remove_trade(closed["id"])
+
+    def list_closed_trades(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.store.list_closed_trades(limit)
+
+    def realized_pnl_total(self) -> float:
+        return self.store.realized_pnl_total()
+
     # ── Tarayıcı yaşam döngüsü ──
     def start_scanner(self) -> None:
         self._stop_event.clear()
@@ -339,6 +413,10 @@ def refresh_snapshot(session: requests.Session, state: AppState) -> None:
         rows = build_rows(raw)
         state.update_snapshot(btc, rows, len(raw))
         if state.auto_trade:
+            # Önce mevcut pozisyonları TP/SL ile kapat, sonra yeni sinyalleri aç
+            closed = auto_close_step(state)
+            if closed:
+                logging.info("Auto-close: %d pozisyon kapatıldı (TP/SL)", closed)
             opened = auto_trade_step(state, rows)
             if opened:
                 logging.info("Auto-trade: %d yeni paper işlem açıldı", opened)
@@ -444,6 +522,26 @@ class TradeRow(BaseModel):
 class TradesResponse(BaseModel):
     trades: list[TradeRow]
     total_pnl: float
+
+
+class ClosedTradeRow(BaseModel):
+    id: str
+    market_id: str
+    question: str
+    side: str
+    amount_usdc: float
+    entry_price: float
+    shares: float
+    opened_at: str
+    closed_at: str
+    close_price: float
+    pnl: float
+    reason: str
+
+
+class ClosedTradesResponse(BaseModel):
+    trades: list[ClosedTradeRow]
+    realized_pnl: float
 
 
 class ArbOppRow(BaseModel):
@@ -575,6 +673,14 @@ def get_trades() -> TradesResponse:
             total_pnl += pnl
 
     return TradesResponse(trades=rows, total_pnl=total_pnl)
+
+
+@app.get("/trades/closed", response_model=ClosedTradesResponse)
+def get_closed_trades(limit: int = 200) -> ClosedTradesResponse:
+    """Kapanan (realize) paper işlemler ve toplam gerçekleşen PnL."""
+    limit = max(1, min(limit, 1000))
+    rows = [ClosedTradeRow(**t) for t in state.list_closed_trades(limit)]
+    return ClosedTradesResponse(trades=rows, realized_pnl=state.realized_pnl_total())
 
 
 @app.delete("/trades/{trade_id}")

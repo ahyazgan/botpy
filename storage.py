@@ -39,6 +39,23 @@ CREATE TABLE IF NOT EXISTS arb_opportunities (
 );
 
 CREATE INDEX IF NOT EXISTS idx_arb_ts ON arb_opportunities(ts);
+
+CREATE TABLE IF NOT EXISTS closed_trades (
+    id          TEXT PRIMARY KEY,
+    market_id   TEXT NOT NULL,
+    question    TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    amount_usdc REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    shares      REAL NOT NULL,
+    opened_at   TEXT NOT NULL,
+    closed_at   TEXT NOT NULL,
+    close_price REAL NOT NULL,
+    pnl         REAL NOT NULL,
+    reason      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_trades(closed_at);
 """
 
 _TRADE_COLUMNS = (
@@ -48,6 +65,10 @@ _TRADE_COLUMNS = (
 _OPP_COLUMNS = (
     "ts", "market_id", "question", "direction",
     "profit_pct", "yes_price", "no_price",
+)
+_CLOSED_COLUMNS = (
+    "id", "market_id", "question", "side", "amount_usdc", "entry_price",
+    "shares", "opened_at", "closed_at", "close_price", "pnl", "reason",
 )
 
 
@@ -92,6 +113,31 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # ── Kapanan işlemler (realize PnL geçmişi) ────────────────────────────
+    def add_closed_trade(self, trade: dict[str, Any]) -> None:
+        row = {k: trade[k] for k in _CLOSED_COLUMNS}
+        cols = ", ".join(_CLOSED_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _CLOSED_COLUMNS)
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})", row,
+            )
+            self._conn.commit()
+
+    def list_closed_trades(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM closed_trades ORDER BY closed_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def realized_pnl_total(self) -> float:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) AS total FROM closed_trades",
+            ).fetchone()
+        return float(row["total"]) if row else 0.0
 
     # ── Arb fırsat geçmişi ────────────────────────────────────────────────
     def record_opportunity(self, opp: dict[str, Any]) -> int:

@@ -227,6 +227,45 @@
         opacity: 0.4;
         cursor: not-allowed;
       }
+      .bt-btn {
+        border: 1px solid var(--border);
+        background: rgba(52, 211, 153, 0.12);
+        color: var(--accent);
+        border-radius: 0.6rem;
+        padding: 0.5rem 1rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .bt-btn:hover {
+        background: rgba(52, 211, 153, 0.22);
+      }
+      .bt-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .chart-shell {
+        position: relative;
+        border: 1px solid var(--border);
+        border-radius: 0.9rem;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.02);
+        margin-bottom: 12px;
+      }
+      .chart-shell svg {
+        display: block;
+        width: 100%;
+        height: 160px;
+      }
+      .chart-empty {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
       .loading td {
         text-align: center;
         color: var(--muted);
@@ -311,6 +350,23 @@
       </div>
 
       <h2 style="margin: 28px 0 8px; font-size: 18px;">Pozisyonlar &amp; PnL</h2>
+      <div class="chart-shell">
+        <svg
+          id="equityChart"
+          viewBox="0 0 600 160"
+          preserveAspectRatio="none"
+        ></svg>
+        <div class="chart-empty" id="equityEmpty">Henüz kapanan işlem yok.</div>
+      </div>
+      <div
+        id="statsLine"
+        style="
+          color: var(--muted);
+          font-size: 0.82rem;
+          margin: 0 2px 12px;
+          font-variant-numeric: tabular-nums;
+        "
+      ></div>
       <div class="pnl-summary" id="pnlSummary">
         <div class="pnl-card">
           <label>Açık pozisyon</label>
@@ -363,6 +419,25 @@
             </tbody>
           </table>
         </div>
+      </div>
+
+      <h2 style="margin: 28px 0 8px; font-size: 18px;">
+        Backtest
+        <span id="histMeta" style="font-weight: 400; color: var(--muted); font-size: 13px;"></span>
+      </h2>
+      <div class="chart-shell">
+        <button id="btRun" class="bt-btn">Backtest çalıştır</button>
+        <button id="optRun" class="bt-btn" style="margin-left: 8px;">
+          Parametre optimize et
+        </button>
+        <button id="wfRun" class="bt-btn" style="margin-left: 8px;">
+          Walk-forward doğrula
+        </button>
+        <div id="btResult" style="margin-top: 10px; color: var(--muted); font-size: 0.85rem;">
+          Kayıtlı geçmiş veri üzerinde stratejiyi test eder.
+        </div>
+        <div id="optResult" style="margin-top: 8px; color: var(--muted); font-size: 0.85rem;"></div>
+        <div id="wfResult" style="margin-top: 8px; color: var(--muted); font-size: 0.85rem;"></div>
       </div>
 
       <footer id="foot"></footer>
@@ -632,6 +707,290 @@
           re.className = "pnl-val " + pnlClass(realized);
         }
 
+        function fetchCurve() {
+          return fetchJson(API_BASE + "/pnl/curve")
+            .then(function (d) {
+              return d && Array.isArray(d.points) ? d.points : [];
+            })
+            .catch(function () {
+              return [];
+            });
+        }
+
+        function renderEquityChart(points) {
+          var svg = $("equityChart");
+          var empty = $("equityEmpty");
+          var W = 600,
+            H = 160,
+            pad = 10;
+
+          if (!points.length) {
+            svg.innerHTML = "";
+            empty.style.display = "flex";
+            return;
+          }
+          empty.style.display = "none";
+
+          var vals = points.map(function (p) {
+            return toNum(p.cumulative) || 0;
+          });
+          var min = Math.min(0, Math.min.apply(null, vals));
+          var max = Math.max(0, Math.max.apply(null, vals));
+          var range = max - min || 1;
+          var n = vals.length;
+
+          function xAt(i) {
+            return pad + (n === 1 ? 0 : (i / (n - 1)) * (W - 2 * pad));
+          }
+          function yAt(v) {
+            return H - pad - ((v - min) / range) * (H - 2 * pad);
+          }
+
+          var pts = vals
+            .map(function (v, i) {
+              return xAt(i).toFixed(1) + "," + yAt(v).toFixed(1);
+            })
+            .join(" ");
+
+          var last = vals[n - 1];
+          var stroke = last >= 0 ? "var(--accent)" : "var(--danger)";
+          var zeroY = yAt(0).toFixed(1);
+
+          var svgNs = "";
+          svgNs +=
+            '<line x1="' +
+            pad +
+            '" y1="' +
+            zeroY +
+            '" x2="' +
+            (W - pad) +
+            '" y2="' +
+            zeroY +
+            '" stroke="#3f3f46" stroke-width="1" stroke-dasharray="4 4" />';
+          svgNs +=
+            '<polyline fill="none" stroke="' +
+            stroke +
+            '" stroke-width="2" points="' +
+            pts +
+            '" />';
+          // son nokta işaretçisi
+          svgNs +=
+            '<circle cx="' +
+            xAt(n - 1).toFixed(1) +
+            '" cy="' +
+            yAt(last).toFixed(1) +
+            '" r="3" fill="' +
+            stroke +
+            '" />';
+          svg.innerHTML = svgNs;
+        }
+
+        function fetchStats() {
+          return fetchJson(API_BASE + "/pnl/stats").catch(function () {
+            return null;
+          });
+        }
+
+        function renderStats(s) {
+          var el = $("statsLine");
+          if (!s || !s.count) {
+            el.textContent = "İstatistik için kapanan işlem yok.";
+            return;
+          }
+          var pf =
+            s.profit_factor === null || s.profit_factor === undefined
+              ? "∞"
+              : s.profit_factor.toFixed(2);
+          el.innerHTML =
+            "İşlem: <strong>" +
+            s.count +
+            "</strong> · Win-rate: <strong>" +
+            s.win_rate.toFixed(1) +
+            "%</strong> · Profit factor: <strong>" +
+            pf +
+            "</strong> · Beklenti: <strong>" +
+            fmtSigned(s.expectancy) +
+            "</strong> · Sharpe: <strong>" +
+            s.sharpe.toFixed(2) +
+            "</strong> · Max DD: <strong>" +
+            s.max_drawdown.toFixed(2) +
+            "</strong>";
+        }
+
+        function fetchHistory() {
+          return fetchJson(API_BASE + "/history").catch(function () {
+            return null;
+          });
+        }
+
+        function renderHistMeta(h) {
+          var el = $("histMeta");
+          if (!h || typeof h.count !== "number" || !h.count) {
+            el.textContent = "· geçmiş veri yok (record_history kapalı?)";
+            return;
+          }
+          var span = "";
+          if (h.first_ts && h.last_ts) {
+            span =
+              ", " +
+              new Date(h.first_ts).toLocaleDateString() +
+              "–" +
+              new Date(h.last_ts).toLocaleDateString();
+          }
+          el.textContent =
+            "· " +
+            h.count.toLocaleString() +
+            " snapshot / " +
+            (h.markets || 0) +
+            " market" +
+            span;
+        }
+
+        function renderBacktest(d) {
+          var out = $("btResult");
+          if (!d || d.error) {
+            out.textContent = (d && d.error) || "Backtest başarısız.";
+            return;
+          }
+          var s = d.stats || {};
+          var pf =
+            s.profit_factor === null || s.profit_factor === undefined
+              ? "∞"
+              : s.profit_factor.toFixed(2);
+          out.innerHTML =
+            "Market: <strong>" +
+            d.markets +
+            "</strong> · İşlem: <strong>" +
+            d.trade_count +
+            "</strong> · Win-rate: <strong>" +
+            (s.win_rate || 0).toFixed(1) +
+            "%</strong> · Toplam: <strong>" +
+            fmtSigned(s.total_pnl || 0) +
+            "</strong> · PF: <strong>" +
+            pf +
+            "</strong> · Sharpe: <strong>" +
+            (s.sharpe || 0).toFixed(2) +
+            "</strong> · Max DD: <strong>" +
+            (s.max_drawdown || 0).toFixed(2) +
+            "</strong>";
+        }
+
+        function runBacktest() {
+          var btn = $("btRun");
+          var out = $("btResult");
+          btn.disabled = true;
+          out.textContent = "Çalışıyor…";
+          fetchJson(API_BASE + "/backtest")
+            .then(function (d) {
+              renderBacktest(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
+        function renderOptimize(d) {
+          var out = $("optResult");
+          if (!d || d.error) {
+            out.textContent = (d && d.error) || "Optimizasyon başarısız.";
+            return;
+          }
+          var rows = d.results || [];
+          if (!rows.length) {
+            out.textContent = "Yeterli işlem yok (min_trades).";
+            return;
+          }
+          var best = rows[0];
+          var p = best.params || {};
+          var s = best.stats || {};
+          out.innerHTML =
+            "<strong>En iyi (" +
+            escapeHtml(d.objective) +
+            "):</strong> TP=" +
+            p.take_profit_pct +
+            "% SL=" +
+            p.stop_loss_pct +
+            "% → toplam " +
+            fmtSigned(s.total_pnl || 0) +
+            " · win-rate " +
+            (s.win_rate || 0).toFixed(1) +
+            "% · " +
+            (s.count || 0) +
+            " işlem · " +
+            rows.length +
+            " kombinasyon denendi";
+        }
+
+        function runOptimize() {
+          var btn = $("optRun");
+          var out = $("optResult");
+          btn.disabled = true;
+          out.textContent = "Optimize ediliyor…";
+          fetchJson(API_BASE + "/optimize?min_trades=3&top=10")
+            .then(function (d) {
+              renderOptimize(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
+        function renderWalkForward(d) {
+          var out = $("wfResult");
+          if (!d || d.ok === false) {
+            out.textContent = (d && d.reason) || "Walk-forward başarısız.";
+            return;
+          }
+          var is = d.in_sample || {};
+          var oos = d.out_of_sample || {};
+          var p = d.params || {};
+          var deg =
+            d.degradation === null || d.degradation === undefined
+              ? "—"
+              : (d.degradation * 100).toFixed(0) + "%";
+          out.innerHTML =
+            "<strong>Walk-forward (TP=" +
+            p.take_profit_pct +
+            " SL=" +
+            p.stop_loss_pct +
+            "):</strong> In-sample beklenti " +
+            fmtSigned(is.expectancy || 0) +
+            " (" +
+            (is.count || 0) +
+            " işlem) → Out-of-sample beklenti " +
+            fmtSigned(oos.expectancy || 0) +
+            " (" +
+            (oos.count || 0) +
+            " işlem) · zayıflama " +
+            deg +
+            " · <strong>" +
+            escapeHtml(d.verdict || "") +
+            "</strong>";
+        }
+
+        function runWalkForward() {
+          var btn = $("wfRun");
+          var out = $("wfResult");
+          btn.disabled = true;
+          out.textContent = "Doğrulanıyor…";
+          fetchJson(API_BASE + "/walkforward?min_trades=3")
+            .then(function (d) {
+              renderWalkForward(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
         function closePosition(id, price, btn) {
           if (btn) {
             btn.disabled = true;
@@ -672,6 +1031,9 @@
             fetchArb(),
             fetchTrades(),
             fetchClosed(),
+            fetchCurve(),
+            fetchStats(),
+            fetchHistory(),
           ])
             .then(function (pair) {
               var btc = pair[0];
@@ -684,6 +1046,9 @@
                 marketsById[String(raw[k].id)] = raw[k];
               }
               renderPositions(pair[3], pair[4], marketsById);
+              renderEquityChart(pair[5]);
+              renderStats(pair[6]);
+              renderHistMeta(pair[7]);
 
               $("btcPrice").textContent =
                 btc !== null
@@ -764,6 +1129,10 @@
               );
             });
         }
+
+        $("btRun").addEventListener("click", runBacktest);
+        $("optRun").addEventListener("click", runOptimize);
+        $("wfRun").addEventListener("click", runWalkForward);
 
         $("openRows").addEventListener("click", function (ev) {
           var btn =

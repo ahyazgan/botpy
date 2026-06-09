@@ -65,6 +65,31 @@ def test_close_trade_unknown_returns_none(store):
     assert store.close_trade("nope", 0.5, "manual") is None
 
 
+def _closed(tid, closed_at, pnl):
+    return {
+        "id": tid, "market_id": "m", "question": "Q", "side": "YES",
+        "amount_usdc": 10.0, "entry_price": 0.5, "shares": 20.0,
+        "opened_at": "2026-01-01T00:00:00+00:00", "closed_at": closed_at,
+        "close_price": 0.6, "pnl": pnl, "reason": "manual",
+    }
+
+
+def test_equity_curve_cumulative_and_order(store):
+    # Kronolojik olmayan sırada ekle; eğri closed_at'e göre artan olmalı
+    store.add_closed_trade(_closed("c2", "2026-01-02T00:00:00+00:00", -1.0))
+    store.add_closed_trade(_closed("c1", "2026-01-01T00:00:00+00:00", 3.0))
+    store.add_closed_trade(_closed("c3", "2026-01-03T00:00:00+00:00", 2.5))
+
+    curve = store.equity_curve()
+    assert [p["pnl"] for p in curve] == pytest.approx([3.0, -1.0, 2.5])
+    # kümülatif: 3.0, 2.0, 4.5
+    assert [p["cumulative"] for p in curve] == pytest.approx([3.0, 2.0, 4.5])
+
+
+def test_equity_curve_empty(store):
+    assert store.equity_curve() == []
+
+
 def test_record_and_list_opportunity(store):
     oid = store.record_opportunity({
         "ts": "2026-01-01T00:00:00+00:00", "market_id": "m1", "question": "Q?",

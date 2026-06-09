@@ -107,6 +107,17 @@ CREATE TABLE IF NOT EXISTS order_intents (
 );
 
 CREATE INDEX IF NOT EXISTS idx_intent_status ON order_intents(status);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    market_id  TEXT NOT NULL,
+    bid        REAL,
+    ask        REAL,
+    spread     REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snap_mkt_ts ON market_snapshots(market_id, ts);
 """
 
 _TRADE_COLUMNS = (
@@ -311,3 +322,60 @@ class Store:
                 "SELECT * FROM order_intents WHERE status='open' ORDER BY ts",
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Market snapshot geçmişi (gerçek-veri backtest için) ───────────────
+    def record_snapshots(self, ts: str, rows: list[dict[str, Any]]) -> int:
+        """Bir taramadaki market satırlarını geçmişe yaz. Eklenen sayıyı döner."""
+        data = [
+            (ts, str(r.get("id", "")), r.get("bid"), r.get("ask"), r.get("spread"))
+            for r in rows if r.get("id")
+        ]
+        if not data:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO market_snapshots (ts, market_id, bid, ask, spread) "
+                "VALUES (?, ?, ?, ?, ?)", data,
+            )
+            self._conn.commit()
+        return len(data)
+
+    def count_snapshots(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM market_snapshots",
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def history_series(
+        self, limit_per_market: int = 1000, markets: list[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Backtest için {market_id: [{bid,ask,spread} kronolojik], ...}."""
+        query = (
+            "SELECT market_id, bid, ask, spread FROM market_snapshots"
+            + (" WHERE market_id IN ({})".format(",".join("?" * len(markets)))
+               if markets else "")
+            + " ORDER BY market_id, ts ASC, id ASC"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, markets or ()).fetchall()
+        series: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            series.setdefault(r["market_id"], []).append(
+                {"bid": r["bid"], "ask": r["ask"], "spread": r["spread"]},
+            )
+        # market başına en yeni limit_per_market örneği tut
+        if limit_per_market > 0:
+            for mid in series:
+                series[mid] = series[mid][-limit_per_market:]
+        return series
+
+    def prune_snapshots(self, keep: int) -> int:
+        """En yeni `keep` snapshot dışındakileri sil. Silinen sayıyı döner."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM market_snapshots WHERE id NOT IN "
+                "(SELECT id FROM market_snapshots ORDER BY id DESC LIMIT ?)", (keep,),
+            )
+            self._conn.commit()
+            return cur.rowcount

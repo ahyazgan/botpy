@@ -26,23 +26,26 @@ from pydantic import BaseModel, Field
 from metrics import compute_stats
 from risk import RiskLimits, RiskManager
 from storage import Store
+from strategy import (
+    entry_price,
+    evaluate_signal,
+    should_close,
+    to_float,
+)
 
 DEFAULT_PAPER_MODE: bool = True
 SCAN_INTERVAL_SEC: int = 30
 MIN_VOLUME_24HR: float = 10_000.0
 
-# Otomatik strateji (paper) — likit + dar spread + makul fiyat bandı
+# Otomatik strateji pozisyon büyüklüğü (eşikler strategy.py'de)
 AUTO_TRADE_AMOUNT: float = 10.0   # her otomatik işlem için USDC
-AUTO_MAX_SPREAD: float = 0.03     # bu spread üstündekileri atla
-AUTO_MIN_PRICE: float = 0.10      # fiyat bandı alt sınırı (ask)
-AUTO_MAX_PRICE: float = 0.90      # fiyat bandı üst sınırı (ask)
-
-# Otomatik pozisyon kapatma (paper) — take-profit / stop-loss
-TAKE_PROFIT_PCT: float = 20.0     # +%20 kârda kapat
-STOP_LOSS_PCT: float = 15.0       # -%15 zararda kapat
 
 # Risk yönetimi (paper)
 PAPER_BANKROLL: float = 1_000.0   # nominal başlangıç sermayesi
+
+# Geçmiş kaydı (gerçek-veri backtest)
+HISTORY_MAX_MARKETS: int = 150    # her taramada kaydedilecek en fazla market
+HISTORY_MAX_ROWS: int = 500_000   # snapshot tablosu üst sınırı (prune)
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
@@ -79,15 +82,6 @@ def _make_session() -> requests.Session:
 
 
 # ── Saf yardımcılar (durumsuz) ───────────────────────────────────────────
-def to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _get_with_retry(
     session: requests.Session,
     url: str,
@@ -178,14 +172,6 @@ def build_rows(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 # ── Trade yardımcıları (saf) ─────────────────────────────────────────────
-def entry_price(market: dict[str, Any], side: str) -> float | None:
-    """Verilen taraf için giriş fiyatı (YES=ask, NO=1-bid)."""
-    if side == "YES":
-        return to_float(market.get("ask"))
-    bid = to_float(market.get("bid"))
-    return (1.0 - bid) if bid is not None else None
-
-
 def new_trade(market: dict[str, Any], side: str, amount: float, entry: float) -> dict[str, Any]:
     return {
         "id": str(uuid.uuid4()),
@@ -199,48 +185,7 @@ def new_trade(market: dict[str, Any], side: str, amount: float, entry: float) ->
     }
 
 
-# ── Otomatik strateji (saf karar + adım) ─────────────────────────────────
-def evaluate_signal(
-    row: dict[str, Any],
-    *,
-    max_spread: float = AUTO_MAX_SPREAD,
-    min_price: float = AUTO_MIN_PRICE,
-    max_price: float = AUTO_MAX_PRICE,
-) -> str | None:
-    """Likidite-alıcı sinyal: dar spread + makul fiyat bandı → YES, yoksa None.
-
-    (Hacim filtresi build_rows'ta zaten uygulanır.)
-    """
-    ask = to_float(row.get("ask"))
-    spread = to_float(row.get("spread"))
-    if ask is None or spread is None:
-        return None
-    if 0.0 <= spread <= max_spread and min_price <= ask <= max_price:
-        return "YES"
-    return None
-
-
-def should_close(
-    entry: float,
-    current: float | None,
-    *,
-    take_profit_pct: float = TAKE_PROFIT_PCT,
-    stop_loss_pct: float = STOP_LOSS_PCT,
-) -> str | None:
-    """Açık pozisyon kapatılmalı mı? "take_profit" / "stop_loss" / None.
-
-    PnL% = (current/entry - 1) * 100.
-    """
-    if current is None or entry <= 0:
-        return None
-    pnl_pct = (current / entry - 1.0) * 100.0
-    if pnl_pct >= take_profit_pct:
-        return "take_profit"
-    if pnl_pct <= -stop_loss_pct:
-        return "stop_loss"
-    return None
-
-
+# ── Otomatik strateji adımı (saf karar strategy.py'de) ───────────────────
 def auto_trade_step(
     state: AppState, rows: list[dict[str, Any]], *, amount: float = AUTO_TRADE_AMOUNT,
 ) -> int:
@@ -311,6 +256,7 @@ class AppState:
     ) -> None:
         self.paper_mode: bool = paper_mode
         self.auto_trade: bool = False
+        self.record_history: bool = False
         self.store: Store = store if store is not None else Store()
         # Risk yöneticisi — realize PnL DB'den seed edilir (restart'a dayanıklı)
         self.risk = RiskManager(RiskLimits(), starting_equity=PAPER_BANKROLL)
@@ -420,6 +366,9 @@ def refresh_snapshot(session: requests.Session, state: AppState) -> None:
         raw = fetch_active_markets(session)
         rows = build_rows(raw)
         state.update_snapshot(btc, rows, len(raw))
+        if state.record_history and rows:
+            state.store.record_snapshots(_utcnow(), rows[:HISTORY_MAX_MARKETS])
+            state.store.prune_snapshots(HISTORY_MAX_ROWS)
         if state.auto_trade:
             # Önce mevcut pozisyonları TP/SL ile kapat, sonra yeni sinyalleri aç
             closed = auto_close_step(state)
@@ -501,12 +450,14 @@ class SettingsBody(BaseModel):
     paper_mode: bool | None = None
     auto_trade: bool | None = None
     reset_halt: bool | None = None
+    record_history: bool | None = None
 
 
 class SettingsResponse(BaseModel):
     paper_mode: bool
     auto_trade: bool
     risk_halted: bool
+    record_history: bool
 
 
 class TradeRequest(BaseModel):
@@ -640,10 +591,14 @@ def patch_settings(body: SettingsBody) -> SettingsResponse:
     if body.reset_halt:
         state.risk.reset_halt()
         logging.info("risk halt sıfırlandı")
+    if body.record_history is not None:
+        state.record_history = body.record_history
+        logging.info("record_history -> %s", state.record_history)
     return SettingsResponse(
         paper_mode=state.paper_mode,
         auto_trade=state.auto_trade,
         risk_halted=state.risk.halted,
+        record_history=state.record_history,
     )
 
 
@@ -729,6 +684,34 @@ def get_audit(limit: int = 200) -> dict[str, Any]:
     return {
         "events": state.store.list_audit(limit),
         "open_intents": state.store.list_open_intents(),
+    }
+
+
+@app.get("/history")
+def get_history_info() -> dict[str, Any]:
+    """Geçmiş snapshot kaydı durumu (gerçek-veri backtest için)."""
+    return {
+        "record_history": state.record_history,
+        "snapshots": state.store.count_snapshots(),
+    }
+
+
+@app.get("/backtest")
+def run_backtest_endpoint(limit_per_market: int = 1000, amount: float = 10.0) -> dict[str, Any]:
+    """Kaydedilmiş gerçek geçmiş veri üzerinde stratejiyi backtest et."""
+    from backtest import run_backtest  # lazy: döngüsel import'tan kaçın
+
+    series = state.store.history_series(max(1, min(limit_per_market, 5000)))
+    if not series:
+        return {
+            "error": "geçmiş veri yok — /settings record_history=true ile kaydı açın",
+            "markets": 0, "trade_count": 0, "stats": compute_stats([]),
+        }
+    res = run_backtest(series, amount=amount)
+    return {
+        "markets": len(series),
+        "trade_count": len(res["trades"]),
+        "stats": res["stats"],
     }
 
 

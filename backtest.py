@@ -14,14 +14,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot import (
+from metrics import compute_stats
+from strategy import (
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     entry_price,
     evaluate_signal,
     should_close,
 )
-from metrics import compute_stats
 
 
 def _current_price(snap: dict[str, Any], side: str) -> float | None:

@@ -132,6 +132,29 @@ def get_audit(limit: int = 200) -> dict:
     }
 
 
+@app.get("/history")
+def get_history_info() -> dict:
+    """Geçmiş snapshot kaydı durumu."""
+    return {"snapshots": _store.count_snapshots()}
+
+
+@app.get("/backtest")
+def run_backtest_endpoint(limit_per_market: int = 1000, amount: float = 10.0) -> dict:
+    """Kaydedilmiş gerçek geçmiş veri üzerinde stratejiyi backtest et."""
+    from backtest import run_backtest
+
+    series = _store.history_series(max(1, min(limit_per_market, 5000)))
+    if not series:
+        return {"error": "geçmiş veri yok", "markets": 0,
+                "trade_count": 0, "stats": compute_stats([])}
+    res = run_backtest(series, amount=amount)
+    return {
+        "markets": len(series),
+        "trade_count": len(res["trades"]),
+        "stats": res["stats"],
+    }
+
+
 class CloseBody(BaseModel):
     close_price: float = Field(gt=0, lt=1)
 

@@ -227,6 +227,23 @@
         opacity: 0.4;
         cursor: not-allowed;
       }
+      .bt-btn {
+        border: 1px solid var(--border);
+        background: rgba(52, 211, 153, 0.12);
+        color: var(--accent);
+        border-radius: 0.6rem;
+        padding: 0.5rem 1rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .bt-btn:hover {
+        background: rgba(52, 211, 153, 0.22);
+      }
+      .bt-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
       .chart-shell {
         position: relative;
         border: 1px solid var(--border);
@@ -401,6 +418,17 @@
               <tr class="loading"><td colspan="6">Kapanan işlem yok.</td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <h2 style="margin: 28px 0 8px; font-size: 18px;">
+        Backtest
+        <span id="histMeta" style="font-weight: 400; color: var(--muted); font-size: 13px;"></span>
+      </h2>
+      <div class="chart-shell">
+        <button id="btRun" class="bt-btn">Backtest çalıştır</button>
+        <div id="btResult" style="margin-top: 10px; color: var(--muted); font-size: 0.85rem;">
+          Kayıtlı geçmiş veri üzerinde stratejiyi test eder.
         </div>
       </div>
 
@@ -781,6 +809,66 @@
             "</strong>";
         }
 
+        function fetchHistory() {
+          return fetchJson(API_BASE + "/history").catch(function () {
+            return null;
+          });
+        }
+
+        function renderHistMeta(h) {
+          var el = $("histMeta");
+          el.textContent =
+            h && typeof h.snapshots === "number"
+              ? "· " + h.snapshots.toLocaleString() + " snapshot kayıtlı"
+              : "";
+        }
+
+        function renderBacktest(d) {
+          var out = $("btResult");
+          if (!d || d.error) {
+            out.textContent = (d && d.error) || "Backtest başarısız.";
+            return;
+          }
+          var s = d.stats || {};
+          var pf =
+            s.profit_factor === null || s.profit_factor === undefined
+              ? "∞"
+              : s.profit_factor.toFixed(2);
+          out.innerHTML =
+            "Market: <strong>" +
+            d.markets +
+            "</strong> · İşlem: <strong>" +
+            d.trade_count +
+            "</strong> · Win-rate: <strong>" +
+            (s.win_rate || 0).toFixed(1) +
+            "%</strong> · Toplam: <strong>" +
+            fmtSigned(s.total_pnl || 0) +
+            "</strong> · PF: <strong>" +
+            pf +
+            "</strong> · Sharpe: <strong>" +
+            (s.sharpe || 0).toFixed(2) +
+            "</strong> · Max DD: <strong>" +
+            (s.max_drawdown || 0).toFixed(2) +
+            "</strong>";
+        }
+
+        function runBacktest() {
+          var btn = $("btRun");
+          var out = $("btResult");
+          btn.disabled = true;
+          out.textContent = "Çalışıyor…";
+          fetchJson(API_BASE + "/backtest")
+            .then(function (d) {
+              renderBacktest(d);
+            })
+            .catch(function (e) {
+              out.textContent = "Hata: " + (e && e.message ? e.message : e);
+            })
+            .then(function () {
+              btn.disabled = false;
+            });
+        }
+
         function closePosition(id, price, btn) {
           if (btn) {
             btn.disabled = true;
@@ -823,6 +911,7 @@
             fetchClosed(),
             fetchCurve(),
             fetchStats(),
+            fetchHistory(),
           ])
             .then(function (pair) {
               var btc = pair[0];
@@ -837,6 +926,7 @@
               renderPositions(pair[3], pair[4], marketsById);
               renderEquityChart(pair[5]);
               renderStats(pair[6]);
+              renderHistMeta(pair[7]);
 
               $("btcPrice").textContent =
                 btc !== null
@@ -917,6 +1007,8 @@
               );
             });
         }
+
+        $("btRun").addEventListener("click", runBacktest);
 
         $("openRows").addEventListener("click", function (ev) {
           var btn =

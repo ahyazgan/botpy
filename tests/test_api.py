@@ -42,6 +42,28 @@ def test_api_close_unknown_404():
     assert resp.status_code == 404
 
 
+def test_api_backtest_empty_when_no_history():
+    client = TestClient(api.app)
+    d = client.get("/backtest?limit_per_market=10").json()
+    # Geçmiş yoksa açık hata + boş stats
+    assert "stats" in d
+    assert d.get("trade_count", 0) == 0 or "error" in d
+
+
+def test_api_history_and_backtest_with_data():
+    api._store.record_snapshots(
+        "2030-01-01T00:00:01+00:00",
+        [{"id": "btM", "question": "Q", "bid": 0.44, "ask": 0.45, "spread": 0.01}])
+    api._store.record_snapshots(
+        "2030-01-01T00:00:02+00:00",
+        [{"id": "btM", "question": "Q", "bid": 0.60, "ask": 0.61, "spread": 0.01}])
+    client = TestClient(api.app)
+    assert client.get("/history").json()["snapshots"] >= 2
+    bt = client.get("/backtest").json()
+    assert bt["trade_count"] >= 1
+    assert bt["stats"]["count"] >= 1
+
+
 def test_api_pnl_curve():
     api._store.add_closed_trade({
         "id": "curveX", "market_id": "mX", "question": "Q", "side": "YES",

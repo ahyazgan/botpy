@@ -413,6 +413,14 @@ def maybe_record(store: Any, opp: ArbOpportunity, guard: ExecutionGuard) -> bool
     return True
 
 
+def format_opp(opp: ArbOpportunity) -> str:
+    """Bildirim metni."""
+    return (
+        f"🎯 ARB {opp.direction.upper()} | {opp.market.question[:60]}\n"
+        f"kâr={opp.profit_pct:.2f}% | YES={opp.yes_price:.3f} NO={opp.no_price:.3f}"
+    )
+
+
 # ── CLOB Client (lazy import) ────────────────────────────────────────────
 def build_clob_client(config: Config):
     """py_clob_client yalnızca gerçek işlem yapılırken import edilir."""
@@ -699,7 +707,9 @@ async def execute_arb(
 
 
 # ── Ana döngü ────────────────────────────────────────────────────────────
-async def main_loop(client: Any, *, dry_run: bool = False, store: Any = None) -> None:
+async def main_loop(
+    client: Any, *, dry_run: bool = False, store: Any = None, notifier: Any = None,
+) -> None:
     loop = asyncio.get_event_loop()
     guard = ExecutionGuard(COOLDOWN_SEC)
     record_guard = ExecutionGuard(RECORD_COOLDOWN)
@@ -748,7 +758,12 @@ async def main_loop(client: Any, *, dry_run: bool = False, store: Any = None) ->
                         log.info("%d gerçek ARB fırsatı bulundu!", len(opps))
                         for opp in opps:
                             # Radar: fırsatı geçmişe yaz (işlem açılsa da açılmasa da)
-                            maybe_record(store, opp, record_guard)
+                            recorded = maybe_record(store, opp, record_guard)
+                            # Yeni kayıtta bildir (dedup record_guard ile aynı)
+                            if recorded and notifier is not None and notifier.enabled:
+                                await loop.run_in_executor(
+                                    None, notifier.send, format_opp(opp),
+                                )
                             if not guard.can_execute(opp.market.id):
                                 continue
                             guard.mark_start(opp.market.id)
@@ -787,9 +802,19 @@ def main() -> None:
     # Radar: bulunan fırsatları paylaşılan SQLite'a yaz (dashboard /arb okur).
     from storage import Store
 
+    from notify import Notifier
+
     store = Store()
+    notifier = Notifier.from_env()
+    if notifier.enabled:
+        log.info(
+            "Bildirim aktif (telegram=%s, discord=%s)",
+            notifier.telegram_enabled, notifier.discord_enabled,
+        )
     try:
-        asyncio.run(main_loop(client, dry_run=config.dry_run, store=store))
+        asyncio.run(main_loop(
+            client, dry_run=config.dry_run, store=store, notifier=notifier,
+        ))
     except KeyboardInterrupt:
         log.info("Bot durduruldu.")
     finally:

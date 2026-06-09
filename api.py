@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from metrics import compute_stats
 from storage import Store
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -112,6 +113,13 @@ def get_pnl_curve(limit: int = 1000) -> dict:
         "points": _store.equity_curve(limit),
         "realized_pnl": _store.realized_pnl_total(),
     }
+
+
+@app.get("/pnl/stats")
+def get_pnl_stats() -> dict:
+    """Kapanan işlemlerden performans metrikleri."""
+    pnls = [t["pnl"] for t in _store.list_closed_trades(limit=5000)]
+    return compute_stats(pnls)
 
 
 class CloseBody(BaseModel):

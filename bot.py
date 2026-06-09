@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from metrics import compute_stats
 from risk import RiskLimits, RiskManager
 from storage import Store
 
@@ -712,6 +713,13 @@ def get_pnl_curve(limit: int = 1000) -> dict[str, Any]:
     limit = max(1, min(limit, 5000))
     points = state.store.equity_curve(limit)
     return {"points": points, "realized_pnl": state.realized_pnl_total()}
+
+
+@app.get("/pnl/stats")
+def get_pnl_stats() -> dict[str, Any]:
+    """Kapanan işlemlerden performans metrikleri (win-rate, PF, Sharpe, max DD)."""
+    pnls = [t["pnl"] for t in state.store.list_closed_trades(limit=5000)]
+    return compute_stats(pnls)
 
 
 @app.post("/trades/{trade_id}/close", response_model=ClosedTradeRow)

@@ -1,5 +1,5 @@
 """
-Polymarket async arbitraj botu — maksimum hız.
+Polymarket async arbitraj botu — hız + güvenlik.
 
 Strateji:
   YES_ask + NO_ask < (1 - MIN_PROFIT)  → ikisini AL  (buy arb)
@@ -11,11 +11,25 @@ Hız teknikleri:
   - FOK (Fill-or-Kill): dolmayan emir anında iptal
   - Kalıcı HTTP bağlantı havuzu (TCPConnector)
   - CLOB orderbook ile fiyat doğrulaması
+
+Güvenlik teknikleri (system-strengthening):
+  - Bacak riski koruması: bir emir dolup diğeri iptal olursa, dolan
+    bacak otomatik kapatılmaya çalışılır (tek taraflı açık pozisyon yok).
+  - Cooldown/dedup: aynı market kısa sürede tekrar tetiklenemez.
+  - Oturum bütçesi: toplam riske atılan USDC bir tavanla sınırlı.
+  - Zarif yapılandırma: eksik secrets program açılışında net hata verir,
+    ARB_DRY_RUN=1 ile emir göndermeden simülasyon yapılır.
+  - HTTP retry + exponential backoff ve CLOB istekleri için eşzamanlılık
+    sınırı (rate-limit koruması).
+
+Çekirdek mantık (parse / arb tespiti / guard'lar) ağ veya gizli anahtar
+gerektirmez; bu sayede birim testleriyle doğrulanabilir.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -24,29 +38,27 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
-from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.constants import POLYGON
-
-load_dotenv()
-
-# ── Zorunlu ortam değişkenleri ──────────────────────────────────────────
-PRIVATE_KEY     = os.environ["PRIVATE_KEY"]
-FUNDER_ADDRESS  = os.environ["FUNDER_ADDRESS"]
-POLY_API_KEY    = os.environ["POLY_API_KEY"]
-POLY_SECRET     = os.environ["POLY_SECRET"]
-POLY_PASSPHRASE = os.environ["POLY_PASSPHRASE"]
 
 # ── Ayarlar ─────────────────────────────────────────────────────────────
-CLOB_HOST      = "https://clob.polymarket.com"
-GAMMA_URL      = "https://gamma-api.polymarket.com/markets"
+CLOB_HOST = "https://clob.polymarket.com"
+GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
-SCAN_INTERVAL  = 5        # saniye — her kaç saniyede tarasın
+SCAN_INTERVAL = 5         # saniye — her kaç saniyede tarasın
 MIN_VOLUME_24H = 50_000   # USDC — düşük hacimli marketleri atla
-MIN_PROFIT     = 0.02     # %2 minimum net kâr (gas + slippage payı)
+MIN_PROFIT = 0.02         # %2 minimum net kâr (gas + slippage payı)
 MAX_TRADE_USDC = 50.0     # her leg için maksimum USDC
-PAGE_LIMIT     = 500
+PAGE_LIMIT = 500
+
+# Güvenlik
+COOLDOWN_SEC = 60.0       # aynı market için iki işlem arası min süre
+MAX_SESSION_USDC = 1_000.0  # bir oturumda riske atılabilecek toplam USDC
+HTTP_RETRIES = 3          # geçici HTTP hataları için deneme sayısı
+HTTP_BACKOFF_BASE = 0.5   # exponential backoff taban süresi (saniye)
+CLOB_CONCURRENCY = 10     # CLOB orderbook'a aynı anda en fazla istek
+REQUEST_TIMEOUT = 15      # saniye
+
+# FOK emir cevabında "dolu" sayılan durumlar (heuristik)
+_FILLED_STATUSES = {"matched", "filled"}
 
 # ── Loglama ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,6 +67,64 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
+
+
+# ── Yapılandırma ─────────────────────────────────────────────────────────
+@dataclass
+class Config:
+    private_key: str
+    funder_address: str
+    api_key: str
+    api_secret: str
+    api_passphrase: str
+    dry_run: bool = False
+
+
+_REQUIRED_ENV = (
+    "PRIVATE_KEY",
+    "FUNDER_ADDRESS",
+    "POLY_API_KEY",
+    "POLY_SECRET",
+    "POLY_PASSPHRASE",
+)
+
+
+def _is_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_config(env: dict[str, str] | None = None) -> Config:
+    """Ortam değişkenlerini oku ve doğrula.
+
+    Eksik secrets varsa ve DRY_RUN kapalıysa net bir hata ile çık.
+    DRY_RUN açıkken anahtarlar boş olabilir (emir gönderilmez).
+    """
+    if env is None:
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv()
+        except ImportError:
+            pass
+        env = dict(os.environ)
+
+    dry_run = _is_truthy(env.get("ARB_DRY_RUN"))
+    missing = [k for k in _REQUIRED_ENV if not env.get(k)]
+    if missing and not dry_run:
+        raise SystemExit(
+            "Eksik ortam değişkenleri: "
+            + ", ".join(missing)
+            + "\n.env dosyasını doldurun ya da ARB_DRY_RUN=1 ile simülasyon yapın."
+        )
+
+    return Config(
+        private_key=env.get("PRIVATE_KEY", ""),
+        funder_address=env.get("FUNDER_ADDRESS", ""),
+        api_key=env.get("POLY_API_KEY", ""),
+        api_secret=env.get("POLY_SECRET", ""),
+        api_passphrase=env.get("POLY_PASSPHRASE", ""),
+        dry_run=dry_run,
+    )
 
 
 # ── Veri yapıları ────────────────────────────────────────────────────────
@@ -80,47 +150,47 @@ class ArbOpportunity:
     no_price: float
 
 
-# ── CLOB Client ──────────────────────────────────────────────────────────
-def build_clob_client() -> ClobClient:
-    creds = ApiCreds(
-        api_key=POLY_API_KEY,
-        api_secret=POLY_SECRET,
-        api_passphrase=POLY_PASSPHRASE,
-    )
-    return ClobClient(
-        host=CLOB_HOST,
-        key=PRIVATE_KEY,
-        chain_id=POLYGON,
-        creds=creds,
-        funder=FUNDER_ADDRESS,
-    )
+# ── Güvenlik guard'ları (saf, test edilebilir) ──────────────────────────
+class ExecutionGuard:
+    """Aynı marketin tekrar tekrar / eşzamanlı tetiklenmesini engeller."""
+
+    def __init__(self, cooldown: float = COOLDOWN_SEC) -> None:
+        self.cooldown = cooldown
+        self._last: dict[str, float] = {}
+        self._inflight: set[str] = set()
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def can_execute(self, market_id: str) -> bool:
+        if market_id in self._inflight:
+            return False
+        last = self._last.get(market_id)
+        return last is None or (self._now() - last) >= self.cooldown
+
+    def mark_start(self, market_id: str) -> None:
+        self._inflight.add(market_id)
+
+    def mark_done(self, market_id: str) -> None:
+        self._inflight.discard(market_id)
+        self._last[market_id] = self._now()
 
 
-# ── Market tarayıcı (Gamma API) ──────────────────────────────────────────
-async def fetch_markets(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
-    markets: list[dict[str, Any]] = []
-    offset = 0
-    while True:
-        async with session.get(
-            GAMMA_URL,
-            params={
-                "active": "true",
-                "closed": "false",
-                "limit": PAGE_LIMIT,
-                "offset": offset,
-            },
-        ) as r:
-            r.raise_for_status()
-            batch: list[dict[str, Any]] = await r.json()
-        if not batch:
-            break
-        markets.extend(batch)
-        if len(batch) < PAGE_LIMIT:
-            break
-        offset += PAGE_LIMIT
-    return markets
+@dataclass
+class Budget:
+    """Oturum boyunca riske atılan toplam USDC için tavan."""
+
+    max_total: float = MAX_SESSION_USDC
+    spent: float = 0.0
+
+    def can_afford(self, amount: float) -> bool:
+        return (self.spent + amount) <= self.max_total
+
+    def charge(self, amount: float) -> None:
+        self.spent += amount
 
 
+# ── Yardımcılar ──────────────────────────────────────────────────────────
 def _f(v: Any) -> float | None:
     try:
         return float(v) if v is not None else None
@@ -128,28 +198,67 @@ def _f(v: Any) -> float | None:
         return None
 
 
+def _parse_json_list(value: Any) -> list[Any]:
+    """Gamma alanları JSON-string olabilir ('["a","b"]') ya da liste."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+    return []
+
+
+def extract_token_ids(raw: dict[str, Any]) -> tuple[str, str] | None:
+    """YES/NO CLOB token id'lerini çıkar — birden çok formatı destekler.
+
+    Gamma /markets ucu `clobTokenIds` (+ `outcomes`) döndürür; bunlar
+    JSON-string olarak gelir. CLOB ucu ise `tokens[].token_id` verir.
+    """
+    token_ids = [str(t) for t in _parse_json_list(raw.get("clobTokenIds"))]
+    outcomes = [str(o).strip().upper() for o in _parse_json_list(raw.get("outcomes"))]
+
+    # Format 1: clobTokenIds + outcomes eşleştirmesi (en güvenilir)
+    if token_ids and outcomes and len(token_ids) == len(outcomes):
+        mapping = dict(zip(outcomes, token_ids))
+        yes, no = mapping.get("YES"), mapping.get("NO")
+        if yes and no:
+            return yes, no
+
+    # Format 2: outcomes yoksa, [YES, NO] sırası varsayılır
+    if len(token_ids) == 2 and not outcomes:
+        return token_ids[0], token_ids[1]
+
+    # Format 3: CLOB tokens[] yapısı
+    tokens = raw.get("tokens") or []
+    yes_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
+    no_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"), None)
+    if yes_tok and no_tok:
+        y, n = str(yes_tok.get("token_id", "")), str(no_tok.get("token_id", ""))
+        if y and n:
+            return y, n
+
+    return None
+
+
 def parse_market(raw: dict[str, Any]) -> Market | None:
     vol = _f(raw.get("volume24hr")) or 0.0
     if vol < MIN_VOLUME_24H:
         return None
 
-    tokens: list[dict[str, Any]] = raw.get("tokens") or []
-    yes_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
-    no_tok  = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"), None)
-    if not yes_tok or not no_tok:
+    ids = extract_token_ids(raw)
+    if ids is None:
         return None
-
-    yes_token_id = yes_tok.get("token_id", "")
-    no_token_id  = no_tok.get("token_id", "")
-    if not yes_token_id or not no_token_id:
-        return None
+    yes_token_id, no_token_id = ids
 
     # Gamma API: bestBid/bestAsk YES token içindir.
     # NO token fiyatları: NO_ask = 1 - YES_bid, NO_bid = 1 - YES_ask
     yes_bid = _f(raw.get("bestBid"))
     yes_ask = _f(raw.get("bestAsk"))
-    no_bid  = (1.0 - yes_ask) if yes_ask is not None else None
-    no_ask  = (1.0 - yes_bid) if yes_bid is not None else None
+    no_bid = (1.0 - yes_ask) if yes_ask is not None else None
+    no_ask = (1.0 - yes_bid) if yes_bid is not None else None
 
     return Market(
         id=str(raw.get("id", "")),
@@ -164,150 +273,324 @@ def parse_market(raw: dict[str, Any]) -> Market | None:
     )
 
 
+def detect_arb(
+    yes_bid: float | None,
+    yes_ask: float | None,
+    no_bid: float | None,
+    no_ask: float | None,
+    min_profit: float = MIN_PROFIT,
+) -> tuple[str, float, float, float] | None:
+    """Saf arb tespiti. (direction, profit_pct, yes_price, no_price) ya da None."""
+    # BUY arb: YES al + NO al → toplam < 1.00
+    if yes_ask is not None and no_ask is not None:
+        total_cost = yes_ask + no_ask
+        if total_cost < (1.0 - min_profit):
+            return "buy", (1.0 - total_cost) * 100, yes_ask, no_ask
+
+    # SELL arb: YES sat + NO sat → toplam > 1.00
+    if yes_bid is not None and no_bid is not None:
+        total_recv = yes_bid + no_bid
+        if total_recv > (1.0 + min_profit):
+            return "sell", (total_recv - 1.0) * 100, yes_bid, no_bid
+
+    return None
+
+
+def quick_screen(market: Market, min_profit: float = MIN_PROFIT) -> bool:
+    """Gamma fiyatlarıyla hızlı ön eleme — yanlış pozitif olabilir, OK.
+
+    CLOB doğrulamasından önce gevşek eşik kullanır.
+    """
+    return detect_arb(
+        market.yes_bid,
+        market.yes_ask,
+        market.no_bid,
+        market.no_ask,
+        min_profit=min_profit / 2,
+    ) is not None
+
+
+def order_filled(res: Any) -> bool:
+    """FOK emir cevabını yorumla: dolu mu?
+
+    py_clob_client.post_order bir dict döndürür; istisna ise dolmamıştır.
+    """
+    if isinstance(res, Exception) or not isinstance(res, dict):
+        return False
+    if res.get("success") is False:
+        return False
+    status = str(res.get("status", "")).strip().lower()
+    if status:
+        return status in _FILLED_STATUSES
+    # status alanı yoksa success=True'yu dolu kabul et
+    return bool(res.get("success"))
+
+
+# ── CLOB Client (lazy import) ────────────────────────────────────────────
+def build_clob_client(config: Config):
+    """py_clob_client yalnızca gerçek işlem yapılırken import edilir."""
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds
+    from py_clob_client.constants import POLYGON
+
+    creds = ApiCreds(
+        api_key=config.api_key,
+        api_secret=config.api_secret,
+        api_passphrase=config.api_passphrase,
+    )
+    return ClobClient(
+        host=CLOB_HOST,
+        key=config.private_key,
+        chain_id=POLYGON,
+        creds=creds,
+        funder=config.funder_address,
+    )
+
+
+# ── HTTP (retry + backoff) ───────────────────────────────────────────────
+async def _get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict[str, Any] | None = None,
+    *,
+    retries: int = HTTP_RETRIES,
+) -> Any:
+    """Geçici hatalarda (429/5xx/ağ) exponential backoff ile yeniden dene."""
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params) as r:
+                if r.status == 429 or r.status >= 500:
+                    raise aiohttp.ClientResponseError(
+                        r.request_info, r.history, status=r.status,
+                        message=f"retryable status {r.status}",
+                    )
+                r.raise_for_status()
+                return await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = e
+            if attempt == retries - 1:
+                break
+            wait = HTTP_BACKOFF_BASE * (2 ** attempt)
+            log.warning(
+                "HTTP retry %d/%d (%s) — %.1fs bekle", attempt + 1, retries, e, wait,
+            )
+            await asyncio.sleep(wait)
+    assert last_err is not None
+    raise last_err
+
+
+# ── Market tarayıcı (Gamma API) ──────────────────────────────────────────
+async def fetch_markets(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
+    markets: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        batch = await _get_json(
+            session,
+            GAMMA_URL,
+            params={
+                "active": "true",
+                "closed": "false",
+                "limit": PAGE_LIMIT,
+                "offset": offset,
+            },
+        )
+        if not batch:
+            break
+        markets.extend(batch)
+        if len(batch) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+    return markets
+
+
 # ── CLOB orderbook doğrulaması ───────────────────────────────────────────
 async def fetch_best_prices(
     session: aiohttp.ClientSession,
     token_id: str,
+    sem: asyncio.Semaphore | None = None,
 ) -> tuple[float | None, float | None]:
-    """CLOB'dan token için gerçek bid/ask çek."""
-    async with session.get(
-        f"{CLOB_HOST}/book",
-        params={"token_id": token_id},
-    ) as r:
-        if r.status != 200:
+    """CLOB'dan token için gerçek bid/ask çek (rate-limit korumalı)."""
+    async def _do() -> tuple[float | None, float | None]:
+        try:
+            data = await _get_json(session, f"{CLOB_HOST}/book", params={"token_id": token_id})
+        except aiohttp.ClientError:
             return None, None
-        data = await r.json()
+        bids: list[dict] = data.get("bids") or []
+        asks: list[dict] = data.get("asks") or []
+        best_bid = max((_f(b.get("price")) for b in bids if b.get("price")), default=None)
+        best_ask = min((_f(a.get("price")) for a in asks if a.get("price")), default=None)
+        return best_bid, best_ask
 
-    bids: list[dict] = data.get("bids") or []
-    asks: list[dict] = data.get("asks") or []
-
-    best_bid = max((_f(b.get("price")) for b in bids if b.get("price")), default=None)
-    best_ask = min((_f(a.get("price")) for a in asks if a.get("price")), default=None)
-    return best_bid, best_ask
+    if sem is None:
+        return await _do()
+    async with sem:
+        return await _do()
 
 
 async def verify_opportunity(
     session: aiohttp.ClientSession,
     market: Market,
+    sem: asyncio.Semaphore | None = None,
 ) -> ArbOpportunity | None:
     """CLOB orderbook'undan gerçek fiyatları alıp arb hesapla."""
     (yes_bid, yes_ask), (no_bid, no_ask) = await asyncio.gather(
-        fetch_best_prices(session, market.yes_token_id),
-        fetch_best_prices(session, market.no_token_id),
+        fetch_best_prices(session, market.yes_token_id, sem),
+        fetch_best_prices(session, market.no_token_id, sem),
     )
-
-    # BUY arb: YES al + NO al → toplam < 1.00
-    if yes_ask is not None and no_ask is not None:
-        total_cost = yes_ask + no_ask
-        if total_cost < (1.0 - MIN_PROFIT):
-            profit_pct = (1.0 - total_cost) * 100
-            return ArbOpportunity(market, "buy", profit_pct, yes_ask, no_ask)
-
-    # SELL arb: YES sat + NO sat → toplam > 1.00
-    if yes_bid is not None and no_bid is not None:
-        total_recv = yes_bid + no_bid
-        if total_recv > (1.0 + MIN_PROFIT):
-            profit_pct = (total_recv - 1.0) * 100
-            return ArbOpportunity(market, "sell", profit_pct, yes_bid, no_bid)
-
-    return None
-
-
-# ── Hızlı ön eleme (CLOB çağırmadan) ────────────────────────────────────
-def quick_screen(market: Market) -> bool:
-    """Gamma fiyatlarıyla hızlı kontrol — yanlış pozitif olabilir, OK."""
-    ya, na = market.yes_ask, market.no_ask
-    yb, nb = market.yes_bid, market.no_bid
-
-    if ya is not None and na is not None:
-        if (ya + na) < (1.0 - MIN_PROFIT / 2):  # daha gevşek eşik
-            return True
-
-    if yb is not None and nb is not None:
-        if (yb + nb) > (1.0 + MIN_PROFIT / 2):
-            return True
-
-    return False
+    found = detect_arb(yes_bid, yes_ask, no_bid, no_ask)
+    if found is None:
+        return None
+    direction, profit_pct, yes_price, no_price = found
+    return ArbOpportunity(market, direction, profit_pct, yes_price, no_price)
 
 
 # ── Emir gönderici ───────────────────────────────────────────────────────
 def _place_order_sync(
-    client: ClobClient,
+    client: Any,
     token_id: str,
     side: str,
     price: float,
     size: float,
 ) -> dict[str, Any]:
     """Senkron emir — executor thread'de çalışır."""
-    order_args = OrderArgs(
-        token_id=token_id,
-        price=price,
-        size=size,
-        side=side,
-    )
+    from py_clob_client.clob_types import OrderArgs, OrderType
+
+    order_args = OrderArgs(token_id=token_id, price=price, size=size, side=side)
     signed = client.create_order(order_args)
     return client.post_order(signed, OrderType.FOK)
 
 
-async def execute_arb(
-    client: ClobClient,
-    opp: ArbOpportunity,
+async def _send_order(
+    client: Any,
     loop: asyncio.AbstractEventLoop,
-) -> None:
-    m = opp.market
-    log.info(
-        "ARB EXECUTE | %s | dir=%s | kâr=%.2f%% | yes=%.4f no=%.4f",
-        m.question[:55], opp.direction, opp.profit_pct, opp.yes_price, opp.no_price,
+    token_id: str,
+    side: str,
+    price: float,
+    size: float,
+) -> Any:
+    return await loop.run_in_executor(
+        None, _place_order_sync, client, token_id, side, price, size,
     )
 
-    if opp.direction == "buy":
-        yes_side, no_side = "BUY", "BUY"
-    else:
-        yes_side, no_side = "SELL", "SELL"
 
+async def _unwind_leg(
+    client: Any,
+    loop: asyncio.AbstractEventLoop,
+    token_id: str,
+    original_side: str,
+    price: float,
+    size: float,
+) -> None:
+    """Dolan tek bacağı ters emirle kapatmaya çalış (bacak riski koruması)."""
+    counter_side = "SELL" if original_side == "BUY" else "BUY"
+    log.critical(
+        "BACAK RİSKİ! Tek taraflı pozisyon — %s bacağı ters emirle (%s) kapatılıyor.",
+        original_side, counter_side,
+    )
+    try:
+        res = await _send_order(client, loop, token_id, counter_side, price, size)
+        if order_filled(res):
+            log.warning("Bacak başarıyla kapatıldı (flatten). Cevap: %s", res)
+        else:
+            log.critical(
+                "Bacak KAPATILAMADI — MANUEL MÜDAHALE GEREKLİ! token=%s cevap=%s",
+                token_id, res,
+            )
+    except Exception:
+        log.critical(
+            "Bacak kapatma emri istisna fırlattı — MANUEL MÜDAHALE GEREKLİ! token=%s",
+            token_id, exc_info=True,
+        )
+
+
+async def execute_arb(
+    client: Any,
+    opp: ArbOpportunity,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    budget: Budget,
+    dry_run: bool = False,
+) -> None:
+    m = opp.market
     yes_size = round(MAX_TRADE_USDC / opp.yes_price, 2)
-    no_size  = round(MAX_TRADE_USDC / opp.no_price, 2)
+    no_size = round(MAX_TRADE_USDC / opp.no_price, 2)
+    notional = MAX_TRADE_USDC * 2
+
+    if not budget.can_afford(notional):
+        log.warning(
+            "Bütçe tavanı doldu (harcanan=%.0f / tavan=%.0f USDC) — %s atlandı.",
+            budget.spent, budget.max_total, m.question[:40],
+        )
+        return
+
+    log.info(
+        "ARB EXECUTE%s | %s | dir=%s | kâr=%.2f%% | yes=%.4f no=%.4f",
+        " [DRY]" if dry_run else "", m.question[:50], opp.direction,
+        opp.profit_pct, opp.yes_price, opp.no_price,
+    )
+
+    if dry_run:
+        budget.charge(notional)
+        return
+
+    yes_side, no_side = ("BUY", "BUY") if opp.direction == "buy" else ("SELL", "SELL")
+    budget.charge(notional)
 
     # YES ve NO emirlerini AYNI ANDA gönder (maksimum hız)
     yes_res, no_res = await asyncio.gather(
-        loop.run_in_executor(
-            None, _place_order_sync,
-            client, m.yes_token_id, yes_side, opp.yes_price, yes_size,
-        ),
-        loop.run_in_executor(
-            None, _place_order_sync,
-            client, m.no_token_id, no_side, opp.no_price, no_size,
-        ),
+        _send_order(client, loop, m.yes_token_id, yes_side, opp.yes_price, yes_size),
+        _send_order(client, loop, m.no_token_id, no_side, opp.no_price, no_size),
         return_exceptions=True,
     )
-
     log.info("YES sonuç: %s", yes_res)
     log.info("NO  sonuç: %s", no_res)
 
+    yes_ok = order_filled(yes_res)
+    no_ok = order_filled(no_res)
+
+    if yes_ok and no_ok:
+        log.info("✓ ARB tamamlandı (her iki bacak dolu).")
+    elif not yes_ok and not no_ok:
+        log.info("Hiçbir bacak dolmadı (FOK iptal) — pozisyon yok, güvenli.")
+    elif yes_ok and not no_ok:
+        # YES doldu, NO iptal → açık YES pozisyonunu kapat
+        await _unwind_leg(client, loop, m.yes_token_id, yes_side, opp.yes_price, yes_size)
+    else:
+        # NO doldu, YES iptal → açık NO pozisyonunu kapat
+        await _unwind_leg(client, loop, m.no_token_id, no_side, opp.no_price, no_size)
+
 
 # ── Ana döngü ────────────────────────────────────────────────────────────
-async def main_loop(client: ClobClient) -> None:
+async def main_loop(client: Any, *, dry_run: bool = False) -> None:
     loop = asyncio.get_event_loop()
+    guard = ExecutionGuard(COOLDOWN_SEC)
+    budget = Budget(MAX_SESSION_USDC)
+    sem = asyncio.Semaphore(CLOB_CONCURRENCY)
 
-    # Kalıcı bağlantı havuzu — her istekte yeni TCP açma
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300, keepalive_timeout=30)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     headers = {"User-Agent": "polymarket-arb/1.0", "Accept": "application/json"}
 
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+    async with aiohttp.ClientSession(
+        connector=connector, headers=headers, timeout=timeout,
+    ) as session:
         log.info(
-            "Bot başladı | MIN_PROFIT=%.0f%% | MAX_TRADE=%.0f USDC | SCAN=%ds",
-            MIN_PROFIT * 100, MAX_TRADE_USDC, SCAN_INTERVAL,
+            "Bot başladı%s | MIN_PROFIT=%.0f%% | MAX_TRADE=%.0f | SCAN=%ds | "
+            "cooldown=%.0fs | bütçe=%.0f USDC",
+            " [DRY_RUN]" if dry_run else "", MIN_PROFIT * 100, MAX_TRADE_USDC,
+            SCAN_INTERVAL, COOLDOWN_SEC, MAX_SESSION_USDC,
         )
 
         while True:
             t0 = time.monotonic()
             try:
-                # 1. Tüm marketleri çek
                 raw_markets = await fetch_markets(session)
                 markets = [m for raw in raw_markets if (m := parse_market(raw))]
-
-                # 2. Gamma fiyatlarıyla hızlı ön eleme
-                candidates = [m for m in markets if quick_screen(m)]
+                candidates = [
+                    m for m in markets
+                    if quick_screen(m) and guard.can_execute(m.id)
+                ]
 
                 scan_ms = (time.monotonic() - t0) * 1000
                 log.info(
@@ -315,21 +598,27 @@ async def main_loop(client: ClobClient) -> None:
                     len(markets), len(candidates), scan_ms,
                 )
 
-                # 3. Adaylar için CLOB orderbook'unu paralel çek ve doğrula
                 if candidates:
-                    verify_tasks = [verify_opportunity(session, m) for m in candidates]
-                    results = await asyncio.gather(*verify_tasks, return_exceptions=True)
-
-                    opps = [
-                        r for r in results
-                        if isinstance(r, ArbOpportunity)
-                    ]
+                    results = await asyncio.gather(
+                        *(verify_opportunity(session, m, sem) for m in candidates),
+                        return_exceptions=True,
+                    )
+                    opps = [r for r in results if isinstance(r, ArbOpportunity)]
                     opps.sort(key=lambda o: o.profit_pct, reverse=True)
 
                     if opps:
                         log.info("%d gerçek ARB fırsatı bulundu!", len(opps))
                         for opp in opps:
-                            await execute_arb(client, opp, loop)
+                            if not guard.can_execute(opp.market.id):
+                                continue
+                            guard.mark_start(opp.market.id)
+                            try:
+                                await execute_arb(
+                                    client, opp, loop,
+                                    budget=budget, dry_run=dry_run,
+                                )
+                            finally:
+                                guard.mark_done(opp.market.id)
                     else:
                         log.info("Doğrulanmış ARB yok.")
 
@@ -338,7 +627,6 @@ async def main_loop(client: ClobClient) -> None:
             except Exception:
                 log.exception("Beklenmeyen hata")
 
-            # Bir sonraki taramaya kadar bekle
             elapsed = time.monotonic() - t0
             wait = max(0.0, SCAN_INTERVAL - elapsed)
             if wait > 0:
@@ -346,9 +634,12 @@ async def main_loop(client: ClobClient) -> None:
 
 
 def main() -> None:
-    client = build_clob_client()
+    config = load_config()
+    client = None if config.dry_run else build_clob_client(config)
+    if config.dry_run:
+        log.warning("ARB_DRY_RUN aktif — gerçek emir GÖNDERİLMEYECEK (simülasyon).")
     try:
-        asyncio.run(main_loop(client))
+        asyncio.run(main_loop(client, dry_run=config.dry_run))
     except KeyboardInterrupt:
         log.info("Bot durduruldu.")
 

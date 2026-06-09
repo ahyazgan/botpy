@@ -28,6 +28,8 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
 REQUEST_TIMEOUT = 30
 PAGE_LIMIT = 500
+HTTP_RETRIES = 3
+HTTP_BACKOFF_BASE = 0.5  # saniye — exponential backoff tabanı
 
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {
@@ -62,13 +64,37 @@ def to_float(value: Any) -> float | None:
         return None
 
 
+def _get_with_retry(
+    session: requests.Session,
+    url: str,
+    params: dict[str, Any],
+    *,
+    retries: int = HTTP_RETRIES,
+) -> requests.Response:
+    """Geçici hatalarda (429/5xx/ağ) exponential backoff ile yeniden dene."""
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429 or r.status_code >= 500:
+                r.raise_for_status()
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            last_err = e
+            if attempt == retries - 1:
+                break
+            wait = HTTP_BACKOFF_BASE * (2 ** attempt)
+            logging.warning(
+                "HTTP retry %d/%d (%s) — %.1fs bekle", attempt + 1, retries, e, wait,
+            )
+            time.sleep(wait)
+    assert last_err is not None
+    raise last_err
+
+
 def fetch_btc_spot_usdt(session: requests.Session) -> float | None:
-    r = session.get(
-        BINANCE_BTC_SPOT_URL,
-        params={"symbol": "BTCUSDT"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    r.raise_for_status()
+    r = _get_with_retry(session, BINANCE_BTC_SPOT_URL, {"symbol": "BTCUSDT"})
     return float(r.json()["price"])
 
 
@@ -76,17 +102,16 @@ def fetch_active_markets(session: requests.Session) -> list[dict[str, Any]]:
     markets: list[dict[str, Any]] = []
     offset = 0
     while True:
-        r = session.get(
+        r = _get_with_retry(
+            session,
             GAMMA_MARKETS_URL,
-            params={
+            {
                 "active": "true",
                 "closed": "false",
                 "limit": PAGE_LIMIT,
                 "offset": offset,
             },
-            timeout=REQUEST_TIMEOUT,
         )
-        r.raise_for_status()
         batch = r.json()
         if not batch:
             break
@@ -267,6 +292,23 @@ class TradeRow(BaseModel):
 class TradesResponse(BaseModel):
     trades: list[TradeRow]
     total_pnl: float
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """Servis sağlığı: arka plan tarayıcı çalışıyor mu, son güncelleme ne zaman."""
+    with _cache_lock:
+        updated_at = _cache["updated_at"]
+        error = _cache["error"]
+    alive = _bg_thread is not None and _bg_thread.is_alive()
+    healthy = alive and error is None and updated_at is not None
+    return {
+        "status": "ok" if healthy else "degraded",
+        "scanner_alive": alive,
+        "updated_at": updated_at,
+        "error": error,
+        "paper_mode": PAPER_MODE,
+    }
 
 
 @app.get("/btc", response_model=BtcResponse)

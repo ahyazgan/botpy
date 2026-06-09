@@ -29,6 +29,12 @@ DEFAULT_PAPER_MODE: bool = True
 SCAN_INTERVAL_SEC: int = 30
 MIN_VOLUME_24HR: float = 10_000.0
 
+# Otomatik strateji (paper) — likit + dar spread + makul fiyat bandı
+AUTO_TRADE_AMOUNT: float = 10.0   # her otomatik işlem için USDC
+AUTO_MAX_SPREAD: float = 0.03     # bu spread üstündekileri atla
+AUTO_MIN_PRICE: float = 0.10      # fiyat bandı alt sınırı (ask)
+AUTO_MAX_PRICE: float = 0.90      # fiyat bandı üst sınırı (ask)
+
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
 REQUEST_TIMEOUT = 30
@@ -158,6 +164,74 @@ def build_rows(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+# ── Trade yardımcıları (saf) ─────────────────────────────────────────────
+def entry_price(market: dict[str, Any], side: str) -> float | None:
+    """Verilen taraf için giriş fiyatı (YES=ask, NO=1-bid)."""
+    if side == "YES":
+        return to_float(market.get("ask"))
+    bid = to_float(market.get("bid"))
+    return (1.0 - bid) if bid is not None else None
+
+
+def new_trade(market: dict[str, Any], side: str, amount: float, entry: float) -> dict[str, Any]:
+    return {
+        "id": str(uuid.uuid4()),
+        "market_id": str(market.get("id", "")),
+        "question": market.get("question", "?"),
+        "side": side,
+        "amount_usdc": amount,
+        "entry_price": entry,
+        "shares": amount / entry,
+        "opened_at": _utcnow(),
+    }
+
+
+# ── Otomatik strateji (saf karar + adım) ─────────────────────────────────
+def evaluate_signal(
+    row: dict[str, Any],
+    *,
+    max_spread: float = AUTO_MAX_SPREAD,
+    min_price: float = AUTO_MIN_PRICE,
+    max_price: float = AUTO_MAX_PRICE,
+) -> str | None:
+    """Likidite-alıcı sinyal: dar spread + makul fiyat bandı → YES, yoksa None.
+
+    (Hacim filtresi build_rows'ta zaten uygulanır.)
+    """
+    ask = to_float(row.get("ask"))
+    spread = to_float(row.get("spread"))
+    if ask is None or spread is None:
+        return None
+    if 0.0 <= spread <= max_spread and min_price <= ask <= max_price:
+        return "YES"
+    return None
+
+
+def auto_trade_step(
+    state: AppState, rows: list[dict[str, Any]], *, amount: float = AUTO_TRADE_AMOUNT,
+) -> int:
+    """Sinyal veren ve henüz açık pozisyonu olmayan marketlerde paper işlem aç.
+
+    Market başına en fazla bir açık otomatik pozisyon. Açılan işlem sayısını döner.
+    """
+    open_market_ids = {t["market_id"] for t in state.list_trades()}
+    opened = 0
+    for row in rows:
+        mid = str(row.get("id", ""))
+        if not mid or mid in open_market_ids:
+            continue
+        side = evaluate_signal(row)
+        if side is None:
+            continue
+        entry = entry_price(row, side)
+        if entry is None or entry <= 0:
+            continue
+        state.add_trade(new_trade(row, side, amount, entry))
+        open_market_ids.add(mid)
+        opened += 1
+    return opened
+
+
 # ── Uygulama durumu (thread-safe, kapsüllenmiş) ──────────────────────────
 class AppState:
     """Tarayıcı önbelleği + paper trade defteri + tarayıcı thread'i.
@@ -170,6 +244,7 @@ class AppState:
         self, paper_mode: bool = DEFAULT_PAPER_MODE, store: Store | None = None,
     ) -> None:
         self.paper_mode: bool = paper_mode
+        self.auto_trade: bool = False
         self.store: Store = store if store is not None else Store()
         self._cache_lock = threading.Lock()
         self._cache: dict[str, Any] = {
@@ -263,12 +338,17 @@ def refresh_snapshot(session: requests.Session, state: AppState) -> None:
         raw = fetch_active_markets(session)
         rows = build_rows(raw)
         state.update_snapshot(btc, rows, len(raw))
+        if state.auto_trade:
+            opened = auto_trade_step(state, rows)
+            if opened:
+                logging.info("Auto-trade: %d yeni paper işlem açıldı", opened)
         logging.info(
-            "Snapshot | BTC=%s | aktif=%d | filtre=%d | paper_mode=%s",
+            "Snapshot | BTC=%s | aktif=%d | filtre=%d | paper_mode=%s | auto=%s",
             f"{btc:,.2f}" if btc is not None else "n/a",
             len(raw),
             len(rows),
             state.paper_mode,
+            state.auto_trade,
         )
     except requests.RequestException as e:
         logging.exception("HTTP hatasi: %s", e)
@@ -332,11 +412,13 @@ class MarketsResponse(BaseModel):
 
 
 class SettingsBody(BaseModel):
-    paper_mode: bool
+    paper_mode: bool | None = None
+    auto_trade: bool | None = None
 
 
 class SettingsResponse(BaseModel):
     paper_mode: bool
+    auto_trade: bool
 
 
 class TradeRequest(BaseModel):
@@ -392,6 +474,7 @@ def health() -> dict[str, Any]:
         "updated_at": snap["updated_at"],
         "error": snap["error"],
         "paper_mode": state.paper_mode,
+        "auto_trade": state.auto_trade,
     }
 
 
@@ -433,9 +516,13 @@ def get_markets() -> MarketsResponse:
 
 @app.patch("/settings", response_model=SettingsResponse)
 def patch_settings(body: SettingsBody) -> SettingsResponse:
-    state.paper_mode = body.paper_mode
-    logging.info("paper_mode -> %s", state.paper_mode)
-    return SettingsResponse(paper_mode=state.paper_mode)
+    if body.paper_mode is not None:
+        state.paper_mode = body.paper_mode
+        logging.info("paper_mode -> %s", state.paper_mode)
+    if body.auto_trade is not None:
+        state.auto_trade = body.auto_trade
+        logging.info("auto_trade -> %s", state.auto_trade)
+    return SettingsResponse(paper_mode=state.paper_mode, auto_trade=state.auto_trade)
 
 
 @app.post("/trade", response_model=TradeRow)
@@ -448,26 +535,11 @@ def post_trade(body: TradeRequest) -> TradeRow:
     if market is None:
         raise HTTPException(status_code=404, detail="market not found")
 
-    if side == "YES":
-        entry = market.get("ask")
-    else:
-        bid = market.get("bid")
-        entry = (1.0 - bid) if bid is not None else None
-
+    entry = entry_price(market, side)
     if entry is None or entry <= 0:
         raise HTTPException(status_code=422, detail="entry price unavailable")
 
-    shares = body.amount_usdc / entry
-    trade: dict[str, Any] = {
-        "id": str(uuid.uuid4()),
-        "market_id": body.market_id,
-        "question": market["question"],
-        "side": side,
-        "amount_usdc": body.amount_usdc,
-        "entry_price": entry,
-        "shares": shares,
-        "opened_at": _utcnow(),
-    }
+    trade = new_trade(market, side, body.amount_usdc, entry)
     state.add_trade(trade)
 
     logging.info(
@@ -476,11 +548,14 @@ def post_trade(body: TradeRequest) -> TradeRow:
         side,
         body.amount_usdc,
         entry,
-        shares,
+        trade["shares"],
     )
 
     current_price = state.current_price(body.market_id, side)
-    pnl = (shares * current_price - body.amount_usdc) if current_price is not None else None
+    pnl = (
+        trade["shares"] * current_price - body.amount_usdc
+        if current_price is not None else None
+    )
     pnl_pct = ((current_price / entry) - 1) * 100 if current_price is not None else None
     return TradeRow(**trade, current_price=current_price, pnl=pnl, pnl_pct=pnl_pct)
 

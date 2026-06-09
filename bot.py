@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from risk import RiskLimits, RiskManager
 from storage import Store
 
 DEFAULT_PAPER_MODE: bool = True
@@ -38,6 +39,9 @@ AUTO_MAX_PRICE: float = 0.90      # fiyat bandı üst sınırı (ask)
 # Otomatik pozisyon kapatma (paper) — take-profit / stop-loss
 TAKE_PROFIT_PCT: float = 20.0     # +%20 kârda kapat
 STOP_LOSS_PCT: float = 15.0       # -%15 zararda kapat
+
+# Risk yönetimi (paper)
+PAPER_BANKROLL: float = 1_000.0   # nominal başlangıç sermayesi
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
@@ -58,6 +62,10 @@ def setup_logging() -> None:
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utctoday() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _make_session() -> requests.Session:
@@ -239,7 +247,11 @@ def auto_trade_step(
 
     Market başına en fazla bir açık otomatik pozisyon. Açılan işlem sayısını döner.
     """
-    open_market_ids = {t["market_id"] for t in state.list_trades()}
+    open_trades = state.list_trades()
+    open_market_ids = {t["market_id"] for t in open_trades}
+    exposure = sum(to_float(t["amount_usdc"]) or 0.0 for t in open_trades)
+    open_count = len(open_trades)
+    today = _utctoday()
     opened = 0
     for row in rows:
         mid = str(row.get("id", ""))
@@ -248,11 +260,17 @@ def auto_trade_step(
         side = evaluate_signal(row)
         if side is None:
             continue
+        decision = state.risk.check_open(amount, open_count, exposure, today=today)
+        if not decision.allowed:
+            logging.info("Risk: yeni işlem engellendi (%s)", decision.reason)
+            break  # limit/halt → bu turda daha fazla açma
         entry = entry_price(row, side)
         if entry is None or entry <= 0:
             continue
         state.add_trade(new_trade(row, side, amount, entry))
         open_market_ids.add(mid)
+        exposure += amount
+        open_count += 1
         opened += 1
     return opened
 
@@ -269,9 +287,11 @@ def auto_close_step(state: AppState) -> int:
         row = state.close_trade(trade["id"], float(current), reason)
         if row is None:
             continue
+        state.risk.on_close(row["pnl"], _utctoday())
         logging.info(
-            "AUTO CLOSE | %s | %s | pnl=%.2f USDC",
+            "AUTO CLOSE | %s | %s | pnl=%.2f USDC%s",
             trade["question"][:40], reason, row["pnl"],
+            " | RISK HALT" if state.risk.halted else "",
         )
         closed += 1
     return closed
@@ -291,6 +311,10 @@ class AppState:
         self.paper_mode: bool = paper_mode
         self.auto_trade: bool = False
         self.store: Store = store if store is not None else Store()
+        # Risk yöneticisi — realize PnL DB'den seed edilir (restart'a dayanıklı)
+        self.risk = RiskManager(RiskLimits(), starting_equity=PAPER_BANKROLL)
+        self.risk.realized_pnl = self.store.realized_pnl_total()
+        self.risk.peak_equity = max(self.risk.starting_equity, self.risk.equity)
         self._cache_lock = threading.Lock()
         self._cache: dict[str, Any] = {
             "markets": [],
@@ -475,11 +499,13 @@ class MarketsResponse(BaseModel):
 class SettingsBody(BaseModel):
     paper_mode: bool | None = None
     auto_trade: bool | None = None
+    reset_halt: bool | None = None
 
 
 class SettingsResponse(BaseModel):
     paper_mode: bool
     auto_trade: bool
+    risk_halted: bool
 
 
 class TradeRequest(BaseModel):
@@ -556,7 +582,14 @@ def health() -> dict[str, Any]:
         "error": snap["error"],
         "paper_mode": state.paper_mode,
         "auto_trade": state.auto_trade,
+        "risk_halted": state.risk.halted,
     }
+
+
+@app.get("/risk")
+def get_risk() -> dict[str, Any]:
+    """Risk durumu: equity, drawdown, halt, limitler."""
+    return state.risk.snapshot()
 
 
 @app.get("/arb", response_model=ArbResponse)
@@ -603,7 +636,14 @@ def patch_settings(body: SettingsBody) -> SettingsResponse:
     if body.auto_trade is not None:
         state.auto_trade = body.auto_trade
         logging.info("auto_trade -> %s", state.auto_trade)
-    return SettingsResponse(paper_mode=state.paper_mode, auto_trade=state.auto_trade)
+    if body.reset_halt:
+        state.risk.reset_halt()
+        logging.info("risk halt sıfırlandı")
+    return SettingsResponse(
+        paper_mode=state.paper_mode,
+        auto_trade=state.auto_trade,
+        risk_halted=state.risk.halted,
+    )
 
 
 @app.post("/trade", response_model=TradeRow)
@@ -686,6 +726,7 @@ def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     row = state.close_trade(trade_id, float(current), "manual")
     if row is None:
         raise HTTPException(status_code=404, detail="trade not found")
+    state.risk.on_close(row["pnl"], _utctoday())
     logging.info(
         "MANUAL CLOSE | %s | %s | pnl=%.2f USDC",
         trade["question"][:40], trade["side"], row["pnl"],

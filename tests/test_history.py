@@ -67,3 +67,38 @@ def test_replay_backtest_from_recorded_history(store):
 def test_record_history_flag_off_by_default(tmp_path):
     state = bot.AppState(store=Store(str(tmp_path / "s.db")))
     assert state.record_history is False
+
+
+def test_snapshot_span(store):
+    store.record_snapshots("2026-01-01T00:00:01+00:00",
+                           [_row("m1", 0.4, 0.41, 0.01), _row("m2", 0.5, 0.51, 0.01)])
+    store.record_snapshots("2026-01-03T00:00:01+00:00", [_row("m1", 0.4, 0.41, 0.01)])
+    span = store.snapshot_span()
+    assert span["count"] == 3
+    assert span["markets"] == 2
+    assert span["first_ts"] == "2026-01-01T00:00:01+00:00"
+    assert span["last_ts"] == "2026-01-03T00:00:01+00:00"
+
+
+def test_settings_persist(store):
+    assert store.get_setting("record_history") is None
+    store.set_setting("record_history", "1")
+    assert store.get_setting("record_history") == "1"
+    store.set_setting("record_history", "0")          # upsert
+    assert store.get_setting("record_history") == "0"
+
+
+def test_record_history_persists_across_restart(tmp_path):
+    path = str(tmp_path / "persist.db")
+    s1 = bot.AppState(store=Store(path))
+    assert s1.record_history is False
+    s1.store.set_setting("record_history", "1")        # dashboard toggle benzeri
+    # "restart": aynı DB ile yeni AppState
+    s2 = bot.AppState(store=Store(path))
+    assert s2.record_history is True
+
+
+def test_record_history_env_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECORD_HISTORY", "1")
+    state = bot.AppState(store=Store(str(tmp_path / "env.db")))
+    assert state.record_history is True

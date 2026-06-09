@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_snap_mkt_ts ON market_snapshots(market_id, ts);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 _TRADE_COLUMNS = (
@@ -379,3 +384,33 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount
+
+    def snapshot_span(self) -> dict[str, Any]:
+        """Geçmiş verisinin kapsamı: adet, ilk/son zaman, market sayısı."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
+                "COUNT(DISTINCT market_id) AS markets FROM market_snapshots",
+            ).fetchone()
+        return {
+            "count": int(row["c"]) if row else 0,
+            "first_ts": row["first_ts"] if row else None,
+            "last_ts": row["last_ts"] if row else None,
+            "markets": int(row["markets"]) if row else 0,
+        }
+
+    # ── Uygulama ayarları (kalıcı; restart'a dayanıklı) ───────────────────
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value),
+            )
+            self._conn.commit()
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,),
+            ).fetchone()
+        return row["value"] if row else default

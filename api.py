@@ -134,8 +134,8 @@ def get_audit(limit: int = 200) -> dict:
 
 @app.get("/history")
 def get_history_info() -> dict:
-    """Geçmiş snapshot kaydı durumu."""
-    return {"snapshots": _store.count_snapshots()}
+    """Geçmiş snapshot kaydı durumu + kapsam."""
+    return _store.snapshot_span()
 
 
 @app.get("/backtest")

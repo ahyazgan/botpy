@@ -825,10 +825,25 @@
 
         function renderHistMeta(h) {
           var el = $("histMeta");
+          if (!h || typeof h.count !== "number" || !h.count) {
+            el.textContent = "· geçmiş veri yok (record_history kapalı?)";
+            return;
+          }
+          var span = "";
+          if (h.first_ts && h.last_ts) {
+            span =
+              ", " +
+              new Date(h.first_ts).toLocaleDateString() +
+              "–" +
+              new Date(h.last_ts).toLocaleDateString();
+          }
           el.textContent =
-            h && typeof h.snapshots === "number"
-              ? "· " + h.snapshots.toLocaleString() + " snapshot kayıtlı"
-              : "";
+            "· " +
+            h.count.toLocaleString() +
+            " snapshot / " +
+            (h.markets || 0) +
+            " market" +
+            span;
         }
 
         function renderBacktest(d) {

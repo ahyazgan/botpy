@@ -58,7 +58,7 @@ def test_api_history_and_backtest_with_data():
         "2030-01-01T00:00:02+00:00",
         [{"id": "btM", "question": "Q", "bid": 0.60, "ask": 0.61, "spread": 0.01}])
     client = TestClient(api.app)
-    assert client.get("/history").json()["snapshots"] >= 2
+    assert client.get("/history").json()["count"] >= 2
     bt = client.get("/backtest").json()
     assert bt["trade_count"] >= 1
     assert bt["stats"]["count"] >= 1

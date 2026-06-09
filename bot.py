@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import threading
 import time
@@ -70,6 +71,18 @@ def _utcnow() -> str:
 
 def _utctoday() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _is_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_record_history(store: Store) -> bool:
+    """Kalıcı ayar > RECORD_HISTORY env > False."""
+    persisted = store.get_setting("record_history")
+    if persisted is not None:
+        return persisted == "1"
+    return _is_truthy(os.environ.get("RECORD_HISTORY"))
 
 
 def _make_session() -> requests.Session:
@@ -256,8 +269,9 @@ class AppState:
     ) -> None:
         self.paper_mode: bool = paper_mode
         self.auto_trade: bool = False
-        self.record_history: bool = False
         self.store: Store = store if store is not None else Store()
+        # record_history: kalıcı ayar > env > False (restart'a dayanıklı toplama)
+        self.record_history: bool = _resolve_record_history(self.store)
         # Risk yöneticisi — realize PnL DB'den seed edilir (restart'a dayanıklı)
         self.risk = RiskManager(RiskLimits(), starting_equity=PAPER_BANKROLL)
         self.risk.realized_pnl = self.store.realized_pnl_total()
@@ -593,7 +607,8 @@ def patch_settings(body: SettingsBody) -> SettingsResponse:
         logging.info("risk halt sıfırlandı")
     if body.record_history is not None:
         state.record_history = body.record_history
-        logging.info("record_history -> %s", state.record_history)
+        state.store.set_setting("record_history", "1" if body.record_history else "0")
+        logging.info("record_history -> %s (kalıcı)", state.record_history)
     return SettingsResponse(
         paper_mode=state.paper_mode,
         auto_trade=state.auto_trade,
@@ -689,11 +704,8 @@ def get_audit(limit: int = 200) -> dict[str, Any]:
 
 @app.get("/history")
 def get_history_info() -> dict[str, Any]:
-    """Geçmiş snapshot kaydı durumu (gerçek-veri backtest için)."""
-    return {
-        "record_history": state.record_history,
-        "snapshots": state.store.count_snapshots(),
-    }
+    """Geçmiş snapshot kaydı durumu + kapsam (ilk/son zaman, market sayısı)."""
+    return {"record_history": state.record_history, **state.store.snapshot_span()}
 
 
 @app.get("/backtest")

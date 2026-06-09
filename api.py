@@ -5,8 +5,9 @@ Yerel CORS proxy: Gamma market listesi + Binance BTC (dashboard.html icin).
 from __future__ import annotations
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from storage import Store
 
@@ -101,3 +102,16 @@ def get_closed_trades(limit: int = 200) -> dict:
     limit = max(1, min(limit, 1000))
     rows = _store.list_closed_trades(limit)
     return {"trades": rows, "realized_pnl": _store.realized_pnl_total()}
+
+
+class CloseBody(BaseModel):
+    close_price: float = Field(gt=0, lt=1)
+
+
+@app.post("/trades/{trade_id}/close")
+def close_trade(trade_id: str, body: CloseBody) -> dict:
+    """Açık pozisyonu istemci tarafında hesaplanan güncel fiyattan kapat."""
+    closed = _store.close_trade(trade_id, body.close_price, "manual")
+    if closed is None:
+        raise HTTPException(status_code=404, detail="trade not found")
+    return closed

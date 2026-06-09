@@ -232,25 +232,6 @@ def should_close(
     return None
 
 
-def closed_row(trade: dict[str, Any], close_price: float, reason: str) -> dict[str, Any]:
-    """Açık trade'i kapanan-işlem satırına çevir (realize PnL ile)."""
-    pnl = trade["shares"] * close_price - trade["amount_usdc"]
-    return {
-        "id": trade["id"],
-        "market_id": trade["market_id"],
-        "question": trade["question"],
-        "side": trade["side"],
-        "amount_usdc": trade["amount_usdc"],
-        "entry_price": trade["entry_price"],
-        "shares": trade["shares"],
-        "opened_at": trade["opened_at"],
-        "closed_at": _utcnow(),
-        "close_price": close_price,
-        "pnl": pnl,
-        "reason": reason,
-    }
-
-
 def auto_trade_step(
     state: AppState, rows: list[dict[str, Any]], *, amount: float = AUTO_TRADE_AMOUNT,
 ) -> int:
@@ -285,8 +266,9 @@ def auto_close_step(state: AppState) -> int:
         if reason is None:
             continue
         # current None değil (should_close None döndürürdü)
-        row = closed_row(trade, float(current), reason)
-        state.close_trade(row)
+        row = state.close_trade(trade["id"], float(current), reason)
+        if row is None:
+            continue
         logging.info(
             "AUTO CLOSE | %s | %s | pnl=%.2f USDC",
             trade["question"][:40], reason, row["pnl"],
@@ -373,10 +355,11 @@ class AppState:
     def remove_trade(self, trade_id: str) -> bool:
         return self.store.remove_trade(trade_id)
 
-    def close_trade(self, closed: dict[str, Any]) -> None:
-        """Açık pozisyonu kapat: kapanan defterine yaz + açıktan kaldır."""
-        self.store.add_closed_trade(closed)
-        self.store.remove_trade(closed["id"])
+    def close_trade(
+        self, trade_id: str, close_price: float, reason: str,
+    ) -> dict[str, Any] | None:
+        """Açık pozisyonu güncel fiyattan kapat (atomik). Kapanan satırı döner."""
+        return self.store.close_trade(trade_id, close_price, reason)
 
     def list_closed_trades(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.list_closed_trades(limit)
@@ -692,8 +675,9 @@ def close_trade_endpoint(trade_id: str) -> ClosedTradeRow:
     current = state.current_price(trade["market_id"], trade["side"])
     if current is None:
         raise HTTPException(status_code=422, detail="current price unavailable")
-    row = closed_row(trade, float(current), "manual")
-    state.close_trade(row)
+    row = state.close_trade(trade_id, float(current), "manual")
+    if row is None:
+        raise HTTPException(status_code=404, detail="trade not found")
     logging.info(
         "MANUAL CLOSE | %s | %s | pnl=%.2f USDC",
         trade["question"][:40], trade["side"], row["pnl"],

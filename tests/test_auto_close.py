@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import bot
-from storage import Store
+from storage import Store, closed_row
 
 
 # ── should_close ─────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ def test_closed_row_pnl_math():
         "amount_usdc": 10.0, "entry_price": 0.50, "shares": 20.0,
         "opened_at": "2026-01-01T00:00:00+00:00",
     }
-    row = bot.closed_row(trade, close_price=0.60, reason="take_profit")
+    row = closed_row(trade, close_price=0.60, reason="take_profit")
     # 20 shares * 0.60 - 10 = 2.0
     assert row["pnl"] == pytest.approx(2.0)
     assert row["reason"] == "take_profit"

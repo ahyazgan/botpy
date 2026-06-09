@@ -11,9 +11,33 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from typing import Any
 
 DEFAULT_DB_PATH = os.environ.get("BOTPY_DB", "botpy.db")
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def closed_row(trade: dict[str, Any], close_price: float, reason: str) -> dict[str, Any]:
+    """Açık trade'i kapanan-işlem satırına çevir (realize PnL ile). Saf fonksiyon."""
+    pnl = trade["shares"] * close_price - trade["amount_usdc"]
+    return {
+        "id": trade["id"],
+        "market_id": trade["market_id"],
+        "question": trade["question"],
+        "side": trade["side"],
+        "amount_usdc": trade["amount_usdc"],
+        "entry_price": trade["entry_price"],
+        "shares": trade["shares"],
+        "opened_at": trade["opened_at"],
+        "closed_at": _utcnow(),
+        "close_price": close_price,
+        "pnl": pnl,
+        "reason": reason,
+    }
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_trades (
@@ -115,6 +139,30 @@ class Store:
             return cur.rowcount > 0
 
     # ── Kapanan işlemler (realize PnL geçmişi) ────────────────────────────
+    def close_trade(
+        self, trade_id: str, close_price: float, reason: str,
+    ) -> dict[str, Any] | None:
+        """Açık pozisyonu atomik kapat: kapanan deftere yaz + açıktan kaldır.
+
+        Bulunamazsa None döner. Kapanan satırı (realize PnL ile) döner.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM paper_trades WHERE id = ?", (trade_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            closed = closed_row(dict(row), close_price, reason)
+            cols = ", ".join(_CLOSED_COLUMNS)
+            placeholders = ", ".join(f":{c}" for c in _CLOSED_COLUMNS)
+            self._conn.execute(
+                f"INSERT INTO closed_trades ({cols}) VALUES ({placeholders})",
+                {k: closed[k] for k in _CLOSED_COLUMNS},
+            )
+            self._conn.execute("DELETE FROM paper_trades WHERE id = ?", (trade_id,))
+            self._conn.commit()
+            return closed
+
     def add_closed_trade(self, trade: dict[str, Any]) -> None:
         row = {k: trade[k] for k in _CLOSED_COLUMNS}
         cols = ", ".join(_CLOSED_COLUMNS)

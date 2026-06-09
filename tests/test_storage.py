@@ -49,6 +49,22 @@ def test_persistence_across_connections(tmp_path):
     assert [r["id"] for r in rows] == ["keep"]
 
 
+def test_close_trade_moves_to_closed(store):
+    store.add_trade(_trade("x"))
+    closed = store.close_trade("x", close_price=0.60, reason="manual")
+    assert closed is not None
+    assert closed["reason"] == "manual"
+    # 22.22 shares * 0.60 - 10 ≈ +3.33
+    assert closed["pnl"] == pytest.approx(22.22 * 0.60 - 10.0)
+    assert store.list_trades() == []                      # açıktan kalktı
+    assert [c["id"] for c in store.list_closed_trades()] == ["x"]
+    assert store.realized_pnl_total() == pytest.approx(closed["pnl"])
+
+
+def test_close_trade_unknown_returns_none(store):
+    assert store.close_trade("nope", 0.5, "manual") is None
+
+
 def test_record_and_list_opportunity(store):
     oid = store.record_opportunity({
         "ts": "2026-01-01T00:00:00+00:00", "market_id": "m1", "question": "Q?",

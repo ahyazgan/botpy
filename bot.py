@@ -364,6 +364,22 @@ class TradesResponse(BaseModel):
     total_pnl: float
 
 
+class ArbOppRow(BaseModel):
+    id: int
+    ts: str
+    market_id: str
+    question: str
+    direction: str
+    profit_pct: float
+    yes_price: float
+    no_price: float
+
+
+class ArbResponse(BaseModel):
+    opportunities: list[ArbOppRow]
+    count: int
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Servis sağlığı: arka plan tarayıcı çalışıyor mu, son güncelleme ne zaman."""
@@ -377,6 +393,17 @@ def health() -> dict[str, Any]:
         "error": snap["error"],
         "paper_mode": state.paper_mode,
     }
+
+
+@app.get("/arb", response_model=ArbResponse)
+def get_arb(limit: int = 100) -> ArbResponse:
+    """Arb radarı: arb_bot tarafından kaydedilen son fırsatlar (read-only)."""
+    limit = max(1, min(limit, 500))
+    rows = state.store.list_opportunities(limit)
+    return ArbResponse(
+        opportunities=[ArbOppRow(**o) for o in rows],
+        count=len(rows),
+    )
 
 
 @app.get("/btc", response_model=BtcResponse)

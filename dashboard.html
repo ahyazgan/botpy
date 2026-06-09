@@ -198,7 +198,7 @@
           <h1>Market tarayıcı</h1>
           <p class="sub">
             Veriler <code style="color: var(--accent)">http://localhost:3001</code>
-            üzerinden (<code>/markets</code>, <code>/btc</code>). Sayfa her 30 saniyede
+            üzerinden (<code>/markets</code>, <code>/btc</code>, <code>/arb</code>). Sayfa her 30 saniyede
             yenilenir. Önce
             <code style="color: var(--accent)">uvicorn api:app --reload --port 3001</code>
             çalıştırın.
@@ -229,6 +229,32 @@
             <tbody id="rows">
               <tr class="loading">
                 <td colspan="5">Yükleniyor…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <h2 style="margin: 28px 0 8px; font-size: 18px;">
+        Arb Radar
+        <span id="arbMeta" style="font-weight: 400; color: var(--muted); font-size: 13px;"></span>
+      </h2>
+      <div class="table-shell">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Yön</th>
+                <th>Kâr %</th>
+                <th>YES</th>
+                <th>NO</th>
+                <th>Zaman</th>
+              </tr>
+            </thead>
+            <tbody id="arbRows">
+              <tr class="loading">
+                <td colspan="6">Henüz arb fırsatı kaydedilmedi.</td>
               </tr>
             </tbody>
           </table>
@@ -307,6 +333,63 @@
           });
         }
 
+        function fetchArb() {
+          return fetchJson(API_BASE + "/arb?limit=50")
+            .then(function (d) {
+              return d && Array.isArray(d.opportunities)
+                ? d.opportunities
+                : [];
+            })
+            .catch(function () {
+              return [];
+            });
+        }
+
+        function renderArb(opps) {
+          var tbody = $("arbRows");
+          tbody.innerHTML = "";
+          $("arbMeta").textContent = opps.length
+            ? "· son " + opps.length + " kayıt"
+            : "";
+
+          if (!opps.length) {
+            var tr0 = document.createElement("tr");
+            tr0.className = "loading";
+            tr0.innerHTML =
+              '<td colspan="6">Henüz arb fırsatı kaydedilmedi ' +
+              "(arb_bot çalışıyor mu?).</td>";
+            tbody.appendChild(tr0);
+            return;
+          }
+
+          for (var i = 0; i < opps.length; i++) {
+            var o = opps[i];
+            var dir = String(o.direction || "").toUpperCase();
+            var when = o.ts ? new Date(o.ts).toLocaleString() : "—";
+            var tr = document.createElement("tr");
+            tr.innerHTML =
+              '<td class="q">' +
+              escapeHtml(o.question || o.market_id || "?") +
+              "</td>" +
+              '<td>' +
+              escapeHtml(dir) +
+              "</td>" +
+              '<td class="num" style="color: var(--accent)">' +
+              fmtPrice(toNum(o.profit_pct), 2) +
+              "</td>" +
+              '<td class="num">' +
+              fmtPrice(toNum(o.yes_price)) +
+              "</td>" +
+              '<td class="num">' +
+              fmtPrice(toNum(o.no_price)) +
+              "</td>" +
+              '<td class="num">' +
+              escapeHtml(when) +
+              "</td>";
+            tbody.appendChild(tr);
+          }
+        }
+
         function rowSpread(m) {
           var bid = toNum(m.bestBid);
           var ask = toNum(m.bestAsk);
@@ -317,10 +400,12 @@
         function refresh() {
           showAlert("");
 
-          Promise.all([fetchBtc(), fetchAllActiveMarkets()])
+          Promise.all([fetchBtc(), fetchAllActiveMarkets(), fetchArb()])
             .then(function (pair) {
               var btc = pair[0];
               var raw = pair[1];
+
+              renderArb(pair[2]);
 
               $("btcPrice").textContent =
                 btc !== null

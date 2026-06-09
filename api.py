@@ -8,12 +8,17 @@ import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from storage import Store
+
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 BINANCE_BTC_URL = "https://api.binance.com/api/v3/ticker/price"
 REQUEST_TIMEOUT = 60
 PAGE_LIMIT = 500
 
 app = FastAPI(title="Polymarket proxy")
+
+# arb_bot ile paylaşılan SQLite (radar fırsat geçmişi okunur)
+_store = Store()
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,3 +78,11 @@ def get_btc() -> dict:
         "symbol": data.get("symbol", "BTCUSDT"),
         "price": data.get("price"),
     }
+
+
+@app.get("/arb")
+def get_arb(limit: int = 100) -> dict:
+    """Arb radarı: arb_bot'un kaydettiği son fırsatlar (read-only)."""
+    limit = max(1, min(limit, 500))
+    rows = _store.list_opportunities(limit)
+    return {"opportunities": rows, "count": len(rows)}

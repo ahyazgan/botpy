@@ -7,9 +7,15 @@ node_modules/
 frontend/node_modules/
 dashboard/node_modules/
 dashboard/dist/
+dashboard-arb/node_modules/
+dashboard-arb/dist/
 
 # Gecici loglar
 *.log
 
 # Islem durumu (pozisyon/gecmis)
 trade_state.json
+
+# SQLite veritabanı
+*.db
+botpy.db

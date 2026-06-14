@@ -630,6 +630,38 @@ def notify_remote(text: str) -> None:
         log.warning("Uzak bildirim hatası: %s", e)
 
 
+def _fmt_summary_msg(s: dict[str, Any]) -> str:
+    """Günlük işlem özetini uzak kanal için düz metne çevir."""
+    sign = "+" if s["realized"] >= 0 else ""
+    return "\n".join([
+        f"📊 Günlük özet · {s['date']}",
+        f"İşlem: {s['trades']} ({s['wins']}K/{s['losses']}Z) · Realized: {sign}{s['realized']} USDT",
+        f"En iyi/kötü: +{s['best']} / {s['worst']}",
+        f"Açık: {s['open_positions']} pozisyon · {s['open_exposure_usdt']} USDT maruziyet",
+    ])
+
+
+# Gün dönümünde dünün özetini uzak kanaldan gönder (profesyonel end-of-day rapor).
+_last_summary_date: str | None = None
+
+
+def _maybe_daily_digest() -> None:
+    """Tarih değiştiyse biten günün özetini gönder. Arka plan döngüsünden çağrılır."""
+    global _last_summary_date
+    today = trader._today()
+    if _last_summary_date is None:
+        _last_summary_date = today      # ilk tur: tetikleme yok
+        return
+    if today != _last_summary_date:
+        prev, _last_summary_date = _last_summary_date, today
+        try:
+            summary = trader.daily_summary(prev)
+            if summary["trades"] > 0:   # işlemsiz gün için özet gönderme
+                notify_remote(_fmt_summary_msg(summary))
+        except Exception as e:
+            log.warning("Günlük özet hatası: %s", e)
+
+
 def notify(item: NewsItem) -> None:
     """Güçlü haber için masaüstü (winotify) + uzak (Telegram/Discord) bildirim."""
     notify_remote(_fmt_news_msg(item))  # winotify yoksa bile uzak kanal çalışır
@@ -801,6 +833,7 @@ def _background_loop(stop: threading.Event) -> None:
     session.headers.setdefault("User-Agent", "kripto-haber-bot/1.0")
     while not stop.is_set():
         refresh(session)
+        _maybe_daily_digest()   # gün dönümünde dünün özetini gönder
         if stop.wait(SCAN_INTERVAL_SEC):
             break
 
@@ -1016,6 +1049,12 @@ def health() -> dict[str, Any]:
 def risk() -> dict[str, Any]:
     """Anlık risk/maruziyet özeti (limitler, kullanım, günlük zarar, kill-switch)."""
     return trader.get_risk()
+
+
+@app.get("/summary")
+def summary(date: str | None = None) -> dict[str, Any]:
+    """Günlük işlem özeti (varsayılan bugün): işlem sayısı, realized, en iyi/kötü, açık."""
+    return trader.daily_summary(date)
 
 
 @app.get("/trades/closed")

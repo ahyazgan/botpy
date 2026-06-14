@@ -714,6 +714,31 @@ def get_risk() -> dict[str, Any]:
     }
 
 
+def daily_summary(date: str | None = None) -> dict[str, Any]:
+    """Bir günün (varsayılan bugün) işlem özeti: kapanan işlemler + anlık maruziyet.
+
+    `_daily` reset'inden bağımsız — `_closed`'tan `closed_at` tarihine göre süzer.
+    """
+    d = date or _today()
+    with _lock:
+        rows = [c for c in _closed
+                if c.get("pnl") is not None and str(c.get("closed_at", "")).startswith(d)]
+        total, _ = _exposure()
+        n_open = len(_positions)
+    pnls = [c["pnl"] for c in rows]
+    return {
+        "date": d,
+        "trades": len(rows),
+        "wins": len([p for p in pnls if p > 0]),
+        "losses": len([p for p in pnls if p < 0]),
+        "realized": round(sum(pnls), 2),
+        "best": round(max(pnls, default=0.0), 2),
+        "worst": round(min(pnls, default=0.0), 2),
+        "open_positions": n_open,
+        "open_exposure_usdt": round(total, 2),
+    }
+
+
 def get_performance() -> dict[str, Any]:
     with _lock:
         closed = list(_closed)

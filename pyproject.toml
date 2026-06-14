@@ -3,3 +3,13 @@
 #   refactor-modular/ — modüler mimari denemesi (geçmişi ayrı dalda)
 #   *.ipynb           — Colab test notebook'ları
 extend-exclude = ["refactor-modular", "*.ipynb"]
+
+[tool.mypy]
+# Aktif kripto haber-trade modülleri statik tip-kontrolden geçer (eski
+# Polymarket bot.py/arb_bot.py/api.py kapsam dışı). 3. taraf stub'ları yoksay.
+ignore_missing_imports = true
+files = [
+    "trader.py", "storage.py", "notify.py", "metrics.py", "news.py",
+    "news_bot.py", "news_backtest.py", "risk.py", "reconcile.py",
+    "strategy.py", "optimize.py", "walkforward.py",
+]

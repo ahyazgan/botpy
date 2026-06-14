@@ -74,7 +74,7 @@ class Notifier:
         if self.telegram_enabled:
             url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
             ok = self._safe_post(url, {"chat_id": self.telegram_chat_id, "text": text}) or ok
-        if self.discord_enabled:
+        if self.discord_webhook:
             ok = self._safe_post(self.discord_webhook, {"content": text}) or ok
         return ok
 

@@ -85,6 +85,10 @@ type Performance = {
   equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
   max_drawdown: number;
   profit_factor: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  payoff_ratio: number | null;
+  sharpe: number | null;
 };
 
 type Position = {
@@ -958,7 +962,7 @@ export default function App() {
       {perf && perf.total_trades > 0 && (
         <section className="mx-auto mt-10 max-w-5xl">
           <h2 className="mb-3 text-lg font-semibold text-white">Performans <span className="ml-1 text-sm font-normal text-zinc-500">(kapanmış {perf.total_trades} işlem)</span></h2>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
               <p className="text-xs uppercase text-zinc-500">Kazanma oranı</p>
               <p className="font-display mt-1 text-2xl font-semibold tabular-nums text-white">%{perf.win_rate}</p>
@@ -989,6 +993,21 @@ export default function App() {
               <p className="text-xs uppercase text-zinc-500">Profit factor</p>
               <p className={`font-display mt-1 text-2xl font-semibold tabular-nums ${perf.profit_factor === null ? "text-zinc-400" : perf.profit_factor >= 1 ? "text-emerald-400" : "text-red-400"}`}>
                 {perf.profit_factor === null ? "∞" : perf.profit_factor}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4" title="Ort. kazanç / ort. kayıp — &gt;1 ise kazançlar kayıpları geçer">
+              <p className="text-xs uppercase text-zinc-500">Payoff oranı</p>
+              <p className={`font-display mt-1 text-2xl font-semibold tabular-nums ${perf.payoff_ratio === null ? "text-zinc-400" : perf.payoff_ratio >= 1 ? "text-emerald-400" : "text-red-400"}`}>
+                {perf.payoff_ratio ?? "—"}
+              </p>
+              {perf.avg_win !== null && perf.avg_loss !== null && (
+                <p className="text-xs text-zinc-500"><span className="text-emerald-400">+{perf.avg_win}</span> / <span className="text-red-400">{perf.avg_loss}</span></p>
+              )}
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4" title="İşlem başına P&L tutarlılığı (ortalama/std); yüksek = istikrarlı">
+              <p className="text-xs uppercase text-zinc-500">Sharpe (işlem)</p>
+              <p className={`font-display mt-1 text-2xl font-semibold tabular-nums ${perf.sharpe === null ? "text-zinc-400" : perf.sharpe >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                {perf.sharpe ?? "—"}
               </p>
             </div>
           </div>

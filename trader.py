@@ -489,6 +489,36 @@ def equity_curve() -> list[dict[str, Any]]:
     return _equity_from(closed)
 
 
+def closed_trades(limit: int = 200) -> list[dict[str, Any]]:
+    """Kapanan işlemler, en yeniden eskiye (işlem günlüğü)."""
+    with _lock:
+        return list(reversed(_closed[-limit:]))
+
+
+def get_risk() -> dict[str, Any]:
+    """Anlık risk/maruziyet özeti: limitler, kullanım, günlük zarar, kill-switch."""
+    with _lock:
+        _reset_daily_if_needed()
+        total, per_coin = _exposure()
+        realized = _daily.get("realized", 0.0)
+        n_open = len(_positions)
+    daily_limit = S.daily_loss_limit_usdt
+    return {
+        "open_positions": n_open,
+        "max_positions": S.max_positions,
+        "total_exposure_usdt": round(total, 2),
+        "max_total_exposure_usdt": S.max_total_exposure_usdt,
+        "per_coin_exposure": {k: round(v, 2) for k, v in per_coin.items()},
+        "max_per_coin_usdt": S.max_per_coin_usdt,
+        "realized_today": round(realized, 2),
+        "daily_loss_limit_usdt": daily_limit,
+        # kill-switch: günlük zarar limiti aşıldıysa bugün yeni işlem açılmaz
+        "trading_halted": bool(daily_limit > 0 and realized <= -abs(daily_limit)),
+        "paper_trading": S.paper_trading,
+        "auto_trade": S.auto_trade,
+    }
+
+
 def get_performance() -> dict[str, Any]:
     with _lock:
         closed = list(_closed)

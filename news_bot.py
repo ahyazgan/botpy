@@ -15,7 +15,9 @@ Claude API ile daha akıllı puanlama (score_with_claude — sonraki adımda).
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
@@ -34,6 +36,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 import storage
@@ -186,6 +189,7 @@ _status: dict[str, Any] = {
     "total_seen": 0,
     "alert_threshold": ALERT_THRESHOLD,
 }
+_started_at = time.time()   # uptime hesabı için
 
 # ── Çalışma zamanı ayarları (panelden değişir, store'da kalıcı) ───────────
 _news_settings: dict[str, Any] = {
@@ -966,7 +970,49 @@ def get_alerts(limit: int = 50) -> NewsResponse:
 @app.get("/health")
 def health() -> dict[str, Any]:
     with _cache_lock:
-        return {"ok": _status["error"] is None, **_status}
+        st = dict(_status)
+    try:
+        archived = get_store().signal_span()["count"]
+    except Exception:
+        archived = None
+    return {
+        "ok": st["error"] is None,
+        **st,
+        "uptime_sec": int(time.time() - _started_at),
+        "scorer": "claude" if USE_CLAUDE else "rule",
+        "treenews": USE_TREENEWS,
+        "signals_archived": archived,
+    }
+
+
+@app.get("/risk")
+def risk() -> dict[str, Any]:
+    """Anlık risk/maruziyet özeti (limitler, kullanım, günlük zarar, kill-switch)."""
+    return trader.get_risk()
+
+
+@app.get("/trades/closed")
+def trades_closed(limit: int = 200) -> dict[str, Any]:
+    """Kapanan işlemler (işlem günlüğü), en yeniden eskiye."""
+    return {"trades": trader.closed_trades(limit)}
+
+
+_CSV_FIELDS = (
+    "closed_at", "opened_at", "symbol", "side", "mode", "usdt", "entry_price",
+    "close_price", "pnl", "pnl_pct", "close_reason", "source",
+)
+
+
+@app.get("/trades/closed.csv")
+def trades_closed_csv(limit: int = 1000) -> PlainTextResponse:
+    """Kapanan işlemleri CSV olarak dışa aktar (işlem günlüğü / vergi-rapor)."""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for t in trader.closed_trades(limit):
+        writer.writerow(t)
+    headers = {"Content-Disposition": 'attachment; filename="closed_trades.csv"'}
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers=headers)
 
 
 class NewsSettingsPatch(BaseModel):

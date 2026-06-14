@@ -85,7 +85,7 @@ Güvenli varsayılan: `paper_trading=True`, `auto_trade=False`, SL=3% TP=6%.
 
 ### `backtest.py` — Sinyal Backtest (CLI)
 
-Sinyalleri iki kaynaktan alır: (a) çalışan motorun `/news` (RAM) ucu — varsayılan; (b) `--db botpy.db` ile **kalıcı SQLite arşivi** (motor çalışmasa da olur). `news_bot` güçlü sinyalleri arşive yazdığı için (`_archive_signal` → `storage.add_signal`, restart'a dayanıklı), günlerce biriken veriyle backtest yapılabilir. Her sinyal için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
+Sinyalleri iki kaynaktan alır: (a) çalışan motorun `/news` (RAM) ucu — varsayılan; (b) `--db botpy.db` ile **kalıcı SQLite arşivi** (motor çalışmasa da olur). `news_bot` güçlü sinyalleri arşive yazdığı için (`_archive_signal` → `storage.add_signal`, restart'a dayanıklı), günlerce biriken veriyle backtest yapılabilir. Her sinyal için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). `--walk` ile **walk-forward doğrulama** (`walk_forward`): sinyalleri zamana göre böl, ilk %`train_frac`'te SL/TP optimize et (`_best_params`, `SL_GRID`×`TP_GRID`), son kısımda (out-of-sample) test et — `walkforward._verdict` ile zayıflama + karar raporlar (overfit'i ölçer). `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
 
 ### `bot.py` — FastAPI Market Tarayıcı (eski Polymarket)
 

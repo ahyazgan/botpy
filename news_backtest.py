@@ -172,6 +172,57 @@ def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verb
     return summary
 
 
+# Walk-forward için varsayılan SL/TP ızgarası (main --grid ile aynı)
+SL_GRID = (1.5, 2, 3, 4, 5)
+TP_GRID = (2, 3, 5, 6, 8, 10)
+
+
+def _best_params(signals: list[dict], fee: float, usdt: float, min_trades: int):
+    """Verilen sinyallerde en kârlı (SL, TP) kombinasyonunu ara (in-sample)."""
+    best = None
+    for sl in SL_GRID:
+        for tp in TP_GRID:
+            s = run(signals, sl, tp, fee, usdt, False)
+            if s.get("n", 0) < min_trades:
+                continue
+            if best is None or s["total_pnl_usdt"] > best[2]["total_pnl_usdt"]:
+                best = (sl, tp, s)
+    return best
+
+
+def walk_forward(
+    signals: list[dict], *, train_frac: float = 0.7, fee: float = 0.2,
+    usdt: float = 100.0, min_trades: int = 3,
+) -> dict:
+    """Sinyalleri zamana göre böl: ilk %train'de SL/TP optimize et, son %test'te ölç.
+
+    In-sample harika ama out-of-sample kötüyse strateji geçmişe uydurulmuştur
+    (overfit). Sinyaller önceden prefetch edilmiş (candles dolu) olmalı.
+    """
+    from walkforward import _verdict  # in/out beklenti karşılaştırması (ortak mantık)
+
+    ordered = sorted(signals, key=lambda s: s["time"])
+    cut = int(len(ordered) * train_frac)
+    train, test = ordered[:cut], ordered[cut:]
+    best = _best_params(train, fee, usdt, min_trades)
+    if best is None:
+        return {"ok": False, "reason": "in-sample'da yeterli işlem yok", "params": None}
+
+    sl, tp, is_stats = best
+    oos = run(test, sl, tp, fee, usdt, False)
+    oos_n = oos.get("n", 0)
+    oos_avg = oos.get("avg_net_pct", 0.0)
+    verdict, degradation = _verdict(is_stats["avg_net_pct"], oos_avg, oos_n)
+    return {
+        "ok": True,
+        "params": {"sl": sl, "tp": tp},
+        "in_sample": is_stats,
+        "out_of_sample": oos,
+        "degradation": degradation,
+        "verdict": verdict,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Haber sinyali backtest")
     ap.add_argument("--api", default="http://127.0.0.1:8000")
@@ -184,6 +235,9 @@ def main() -> None:
     ap.add_argument("--fee", type=float, default=0.2, help="gidiş-dönüş komisyon %% (spot ~0.2)")
     ap.add_argument("--usdt", type=float, default=100.0)
     ap.add_argument("--grid", action="store_true", help="en iyi SL/TP kombinasyonunu ara")
+    ap.add_argument("--walk", action="store_true",
+                    help="walk-forward: ilk %%70'te optimize, son %%30'da test (overfit ölç)")
+    ap.add_argument("--train-frac", type=float, default=0.7, help="walk-forward eğitim oranı")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -209,12 +263,37 @@ def main() -> None:
         print("Yeterli sinyal yok — motoru bir süre çalıştırıp tekrar dene.")
         return
 
+    if args.walk:
+        wf = walk_forward(signals, train_frac=args.train_frac, fee=args.fee,
+                          usdt=args.usdt, min_trades=3)
+        print(f"\n{'='*50}")
+        print("WALK-FORWARD DOĞRULAMA (overfit testi)")
+        if not wf["ok"]:
+            print(f"  {wf['reason']}")
+            print(f"{'='*50}")
+            return
+        p, is_s, oos = wf["params"], wf["in_sample"], wf["out_of_sample"]
+        print(f"En iyi (in-sample): SL={p['sl']}% TP={p['tp']}%")
+        print(f"  in-sample  : n={is_s['n']:<3} kazanma%={is_s['win_rate']:<5} "
+              f"ort.net%={is_s['avg_net_pct']:+.3f}")
+        oos_n = oos.get("n", 0)
+        if oos_n:
+            print(f"  out-sample : n={oos_n:<3} kazanma%={oos['win_rate']:<5} "
+                  f"ort.net%={oos['avg_net_pct']:+.3f}")
+        else:
+            print("  out-sample : işlem yok")
+        if wf["degradation"] is not None:
+            print(f"  zayıflama  : %{wf['degradation']*100:.0f}")
+        print(f"  KARAR      : {wf['verdict']}")
+        print(f"{'='*50}")
+        return
+
     if args.grid:
         print("\nGrid search (komisyon %{:.1f} dahil, {:.0f}s pencere):".format(args.fee, args.hours))
         print(f"{'SL%':>5}{'TP%':>5}{'n':>5}{'kazanma%':>10}{'ort.net%':>10}{'P&L USDT':>10}")
         best = None
-        for sl in (1.5, 2, 3, 4, 5):
-            for tp in (2, 3, 5, 6, 8, 10):
+        for sl in SL_GRID:
+            for tp in TP_GRID:
                 s = run(signals, sl, tp, args.fee, args.usdt, False)
                 if s["n"] == 0:
                     continue

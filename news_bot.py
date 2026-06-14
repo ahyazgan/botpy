@@ -930,13 +930,14 @@ def get_signals(limit: int = 500, min_impact: int = 0) -> dict[str, Any]:
 def run_backtest(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
-    walk: bool = False, train_frac: float = 0.7,
+    mode: str = "simple", train_frac: float = 0.7,
 ) -> dict[str, Any]:
-    """Arşivlenmiş sinyaller üzerinde backtest/walk-forward koşar.
+    """Arşivlenmiş sinyaller üzerinde backtest koşar.
 
     Her sinyal için Binance geçmiş klines indirip SL/TP çıkışını simüle eder
-    (komisyon dahil). `walk=true` → walk-forward (overfit testi). Ağ gerektirir;
-    senkron çalışır (FastAPI bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
+    (komisyon dahil). `mode`: "simple" (tek SL/TP), "grid" (en kârlı SL/TP araması),
+    "walk" (walk-forward overfit testi). Ağ gerektirir; senkron çalışır (FastAPI
+    bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
     """
     import news_backtest as nbt
 
@@ -948,11 +949,16 @@ def run_backtest(
     if not signals:
         return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
 
-    if walk:
+    if mode == "walk":
         wf = nbt.walk_forward(signals, train_frac=train_frac, fee=fee, usdt=usdt, min_trades=3)
         wf["mode"] = "walk"
         wf["tested"] = len(signals)
         return wf
+
+    if mode == "grid":
+        grid = nbt.grid_search(signals, fee, usdt)
+        return {"ok": True, "mode": "grid", "tested": len(signals),
+                "rows": grid, "best": grid[0] if grid else None}
 
     summary = nbt.run(signals, sl, tp, fee, usdt, False)
     summary["ok"] = True

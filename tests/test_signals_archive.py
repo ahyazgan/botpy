@@ -114,7 +114,7 @@ def test_backtest_endpoint_simple(monkeypatch, store):
     monkeypatch.setattr(nb, "_store", store)
     monkeypatch.setattr(nbt, "prefetch", _fake_prefetch)
     _populate(store, 6)
-    res = nb.run_backtest(sl=3, tp=6, walk=False)
+    res = nb.run_backtest(sl=3, tp=6, mode="simple")
     assert res["ok"] is True and res["mode"] == "simple"
     assert res["n"] == 6 and res["tested"] == 6
     assert res["win_rate"] == 100.0          # hepsi TP
@@ -125,11 +125,23 @@ def test_backtest_endpoint_walk(monkeypatch, store):
     monkeypatch.setattr(nb, "_store", store)
     monkeypatch.setattr(nbt, "prefetch", _fake_prefetch)
     _populate(store, 10)
-    res = nb.run_backtest(walk=True, train_frac=0.7)
+    res = nb.run_backtest(mode="walk", train_frac=0.7)
     assert res["mode"] == "walk" and res["ok"] is True
     assert res["params"]["tp"] == 10
     assert res["in_sample"]["n"] == 7 and res["out_of_sample"]["n"] == 3
     assert isinstance(res["verdict"], str)
+
+
+def test_backtest_endpoint_grid(monkeypatch, store):
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nbt, "prefetch", _fake_prefetch)
+    _populate(store, 6)
+    res = nb.run_backtest(mode="grid")
+    assert res["ok"] is True and res["mode"] == "grid"
+    assert len(res["rows"]) == len(nbt.SL_GRID) * len(nbt.TP_GRID)
+    pnls = [r["total_pnl_usdt"] for r in res["rows"]]
+    assert pnls == sorted(pnls, reverse=True)   # P&L'e göre azalan sıralı
+    assert res["best"]["tp"] == 10              # en yüksek TP en kârlı
 
 
 def test_backtest_endpoint_empty_archive(monkeypatch, store):

@@ -99,7 +99,7 @@ type SignalSpan = {
 
 type BacktestResult = {
   ok: boolean;
-  mode?: "simple" | "walk";
+  mode?: "simple" | "grid" | "walk";
   reason?: string;
   n?: number;
   tested?: number;
@@ -116,7 +116,12 @@ type BacktestResult = {
   out_of_sample?: { n: number; win_rate: number; avg_net_pct: number };
   degradation?: number | null;
   verdict?: string;
+  // grid
+  rows?: Array<{ sl: number; tp: number; n: number; win_rate: number; avg_net_pct: number; total_pnl_usdt: number }>;
+  best?: { sl: number; tp: number; total_pnl_usdt: number } | null;
 };
+
+type BacktestMode = "simple" | "grid" | "walk";
 
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
@@ -202,7 +207,7 @@ export default function App() {
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
   const [btSl, setBtSl] = useState(3);
   const [btTp, setBtTp] = useState(6);
-  const [btWalk, setBtWalk] = useState(false);
+  const [btMode, setBtMode] = useState<BacktestMode>("simple");
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
 
@@ -302,7 +307,7 @@ export default function App() {
       const qs = new URLSearchParams({
         sl: String(btSl),
         tp: String(btTp),
-        walk: String(btWalk),
+        mode: btMode,
         min_impact: String(meta.alert_threshold),
       });
       const r = await fetch(`${API_BASE}/backtest?${qs.toString()}`);
@@ -763,7 +768,7 @@ export default function App() {
             <label className="flex flex-col gap-1 text-xs text-zinc-400">
               <span>Stop-loss %</span>
               <input
-                type="number" value={btSl} step={0.5} min={0.5} disabled={btWalk}
+                type="number" value={btSl} step={0.5} min={0.5} disabled={btMode !== "simple"}
                 onChange={(e) => setBtSl(Number(e.target.value))}
                 className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
               />
@@ -771,21 +776,29 @@ export default function App() {
             <label className="flex flex-col gap-1 text-xs text-zinc-400">
               <span>Take-profit %</span>
               <input
-                type="number" value={btTp} step={0.5} min={0.5} disabled={btWalk}
+                type="number" value={btTp} step={0.5} min={0.5} disabled={btMode !== "simple"}
                 onChange={(e) => setBtTp(Number(e.target.value))}
                 className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
               />
             </label>
-            <button
-              type="button"
-              onClick={() => setBtWalk((v) => !v)}
-              title="Walk-forward: ilk %70'te SL/TP optimize, son %30'da test (overfit ölçer)"
-              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
-                btWalk ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200" : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
-              }`}
-            >
-              Walk-forward {btWalk ? "açık" : "kapalı"}
-            </button>
+            <div className="flex flex-col gap-1 text-xs text-zinc-400">
+              <span>Mod</span>
+              <div className="flex overflow-hidden rounded-lg border border-zinc-700">
+                {([["simple", "Basit"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setBtMode(m)}
+                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : "Tek SL/TP ile backtest"}
+                    className={`h-9 px-3 text-sm font-semibold transition ${
+                      btMode === m ? "bg-emerald-900/50 text-emerald-200" : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <button
               type="button"
               onClick={() => void runBacktest()}
@@ -801,6 +814,44 @@ export default function App() {
             <div className="mt-4 border-t border-white/10 pt-4">
               {!btResult.ok ? (
                 <p className="text-sm text-amber-300">{btResult.reason ?? "Sonuç yok"}</p>
+              ) : btResult.mode === "grid" ? (
+                <div className="space-y-3">
+                  {btResult.best && (
+                    <p className="text-sm text-zinc-300">
+                      En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
+                      <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
+                      <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                    </p>
+                  )}
+                  <div className="overflow-x-auto rounded-lg border border-white/10">
+                    <table className="w-full min-w-[420px] text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                          <th className="px-3 py-2">SL %</th>
+                          <th className="px-3 py-2">TP %</th>
+                          <th className="px-3 py-2">n</th>
+                          <th className="px-3 py-2">Kazanma</th>
+                          <th className="px-3 py-2">Ort. net %</th>
+                          <th className="px-3 py-2">P&L USDT</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(btResult.rows ?? []).map((r, i) => (
+                          <tr key={`${r.sl}-${r.tp}`} className={`border-b border-white/5 ${i === 0 ? "bg-emerald-950/30" : "hover:bg-white/[0.03]"}`}>
+                            <td className="px-3 py-2 tabular-nums text-zinc-300">{r.sl}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-300">{r.tp}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">{r.n}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">%{r.win_rate}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">{r.avg_net_pct}</td>
+                            <td className={`px-3 py-2 tabular-nums font-semibold ${r.total_pnl_usdt >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                              {r.total_pnl_usdt >= 0 ? "+" : ""}{r.total_pnl_usdt.toFixed(2)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               ) : btResult.mode === "walk" ? (
                 <div className="space-y-3">
                   {btResult.in_sample ? (

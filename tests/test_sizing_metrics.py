@@ -94,3 +94,24 @@ def test_get_performance_has_metrics(monkeypatch):
     assert "max_drawdown" in perf and "profit_factor" in perf
     assert perf["max_drawdown"] == -6.0
     assert perf["profit_factor"] == round(10 / 6, 2)
+    # gelişmiş oranlar
+    assert perf["avg_win"] == 10.0 and perf["avg_loss"] == -6.0
+    assert perf["payoff_ratio"] == round(10 / 6, 2)
+    assert perf["sharpe"] is not None
+
+
+# ── Gelişmiş performans oranları ───────────────────────────────────────────
+def test_perf_ratios_payoff_and_sharpe():
+    scored = [{"pnl": 8.0}, {"pnl": 12.0}, {"pnl": -4.0}, {"pnl": -6.0}]
+    r = trader._perf_ratios(scored)
+    assert r["avg_win"] == 10.0 and r["avg_loss"] == -5.0
+    assert r["payoff_ratio"] == 2.0          # 10 / |−5|
+    assert r["sharpe"] is not None
+
+
+def test_perf_ratios_edge_cases():
+    # sadece kazanç → payoff None (kayıp yok), tek işlem → sharpe None
+    only_win = trader._perf_ratios([{"pnl": 5.0}])
+    assert only_win["avg_loss"] is None and only_win["payoff_ratio"] is None
+    assert only_win["sharpe"] is None
+    assert trader._perf_ratios([]) == {"avg_win": None, "avg_loss": None, "payoff_ratio": None, "sharpe": None}

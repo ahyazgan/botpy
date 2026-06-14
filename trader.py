@@ -655,6 +655,28 @@ def _profit_factor(scored: list[dict[str, Any]]) -> float | None:
     return round(gross_win / gross_loss, 2)
 
 
+def _perf_ratios(scored: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Gelişmiş performans metrikleri (saf): ort. kazanç/kayıp, payoff, Sharpe-benzeri.
+
+    payoff_ratio = ort.kazanç / |ort.kayıp| (>1 iyi). sharpe = işlem başına
+    P&L'in ortalama/std oranı (yıllıklandırılmamış; tutarlılık göstergesi).
+    """
+    pnls = [c["pnl"] for c in scored]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    avg_win = round(sum(wins) / len(wins), 2) if wins else None
+    avg_loss = round(sum(losses) / len(losses), 2) if losses else None
+    payoff = round(avg_win / abs(avg_loss), 2) if (avg_win and avg_loss) else None
+    sharpe: float | None = None
+    if len(pnls) >= 2:
+        mean = sum(pnls) / len(pnls)
+        var = sum((p - mean) ** 2 for p in pnls) / (len(pnls) - 1)
+        sd = var ** 0.5
+        if sd > 0:
+            sharpe = round(mean / sd, 2)
+    return {"avg_win": avg_win, "avg_loss": avg_loss, "payoff_ratio": payoff, "sharpe": sharpe}
+
+
 def equity_curve() -> list[dict[str, Any]]:
     """Kümülatif P&L eğrisi (kapanan işlemlerden, kronolojik)."""
     with _lock:
@@ -731,6 +753,7 @@ def get_performance() -> dict[str, Any]:
         "equity": equity,
         "max_drawdown": _max_drawdown(equity),
         "profit_factor": _profit_factor(scored),
+        **_perf_ratios(scored),
     }
 
 

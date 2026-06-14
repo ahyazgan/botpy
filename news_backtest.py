@@ -7,16 +7,18 @@ SL mi TP mi önce vururdu, sonuç ne olurdu" diye simüle eder. Komisyon dahil.
 
 Ayrıca grid search: hangi stop-loss / take-profit kombinasyonu en kârlı olurdu.
 
-NOT (dürüstlük): geçmiş haber arşivi tutmuyoruz; bu yüzden backtest yalnızca
-motorun ŞU AN belleğindeki sinyalleri kapsar (motoru ne kadar uzun çalıştırırsan
-o kadar çok veri birikir). Gerçek ileri-test için paper modda biriken /performance
-istatistikleri esastır. Mum içi SL+TP aynı anda olursa kötümser (SL önce) sayılır.
+Sinyal kaynağı: çalışan motorun /news (RAM) ucu VEYA kalıcı SQLite arşivi
+(--db). Motor güçlü sinyalleri arşive yazdığı için (news_bot._archive_signal),
+restart'tan bağımsız, günlerce biriken veriyle backtest yapılabilir — motorun
+o an çalışıyor olması gerekmez. Mum içi SL+TP aynı anda olursa kötümser (SL
+önce) sayılır.
 
 Kullanım:
-  python backtest.py                      # varsayılan SL=3 TP=6, 4 saat pencere
-  python backtest.py --sl 2 --tp 5 --hours 6
-  python backtest.py --grid               # en iyi SL/TP kombinasyonunu ara
-  python backtest.py --min-impact 8 --fee 0.2 --usdt 100
+  python news_backtest.py                      # çalışan motordan (/news, RAM)
+  python news_backtest.py --db botpy.db        # kalıcı arşivden (motor gerekmez)
+  python news_backtest.py --sl 2 --tp 5 --hours 6
+  python news_backtest.py --grid               # en iyi SL/TP kombinasyonunu ara
+  python news_backtest.py --min-impact 8 --fee 0.2 --usdt 100
 """
 
 from __future__ import annotations
@@ -47,20 +49,17 @@ def _to_ms(s: str | None) -> int | None:
         return None
 
 
-def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
-    r = requests.get(f"{api_base}/news", params={"limit": 300, "min_impact": min_impact}, timeout=15)
-    r.raise_for_status()
+def _signals_from_rows(rows: list[dict]) -> list[dict]:
+    """Ham sinyal kayıtlarını backtest biçimine süz (ortak filtre)."""
     out = []
-    for n in r.json().get("news", []):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    for n in rows:
         if not n.get("symbol") or n.get("direction") not in ("bullish", "bearish"):
             continue
-        t = _to_ms(n.get("published"))
-        if t is None:
-            t = _to_ms(n.get("fetched_at"))
+        t = _to_ms(n.get("published")) or _to_ms(n.get("fetched_at"))
         if t is None:
             continue
         # Arkasında en az ~30 dk fiyat verisi olmayan (çok yeni) sinyalleri atla
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         if now_ms - t < 30 * 60 * 1000:
             continue
         out.append({
@@ -68,6 +67,23 @@ def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
             "impact": n["impact"], "title": n["title"][:60],
         })
     return out
+
+
+def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
+    """Çalışan motorun /news (RAM) ucundan sinyalleri çek."""
+    r = requests.get(f"{api_base}/news", params={"limit": 300, "min_impact": min_impact}, timeout=15)
+    r.raise_for_status()
+    return _signals_from_rows(r.json().get("news", []))
+
+
+def fetch_signals_from_db(db_path: str, min_impact: int) -> list[dict]:
+    """Kalıcı SQLite arşivinden sinyalleri çek (motor çalışmasa da olur)."""
+    from storage import Store
+    store = Store(db_path)
+    try:
+        return _signals_from_rows(store.list_signals(limit=5000, min_impact=min_impact))
+    finally:
+        store.close()
 
 
 def fetch_klines(symbol: str, start_ms: int, minutes: int) -> list[list]:
@@ -108,7 +124,7 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
 
     outcome, gross = "timeout", 0.0
     for c in candles[1:]:
-        high = float(c[2]); low = float(c[3])
+        high, low = float(c[2]), float(c[3])
         if is_long:
             hit_sl = low <= sl
             hit_tp = high >= tp
@@ -116,11 +132,14 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
             hit_sl = high >= sl
             hit_tp = low <= tp
         if hit_sl and hit_tp:          # aynı mum: kötümser (SL önce)
-            outcome, gross = "sl", -sl_pct; break
+            outcome, gross = "sl", -sl_pct
+            break
         if hit_sl:
-            outcome, gross = "sl", -sl_pct; break
+            outcome, gross = "sl", -sl_pct
+            break
         if hit_tp:
-            outcome, gross = "tp", tp_pct; break
+            outcome, gross = "tp", tp_pct
+            break
     if outcome == "timeout":
         last = float(candles[-1][4])
         move = (last - entry) / entry * 100
@@ -156,9 +175,62 @@ def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verb
     return summary
 
 
+# Walk-forward için varsayılan SL/TP ızgarası (main --grid ile aynı)
+SL_GRID = (1.5, 2, 3, 4, 5)
+TP_GRID = (2, 3, 5, 6, 8, 10)
+
+
+def _best_params(signals: list[dict], fee: float, usdt: float, min_trades: int):
+    """Verilen sinyallerde en kârlı (SL, TP) kombinasyonunu ara (in-sample)."""
+    best = None
+    for sl in SL_GRID:
+        for tp in TP_GRID:
+            s = run(signals, sl, tp, fee, usdt, False)
+            if s.get("n", 0) < min_trades:
+                continue
+            if best is None or s["total_pnl_usdt"] > best[2]["total_pnl_usdt"]:
+                best = (sl, tp, s)
+    return best
+
+
+def walk_forward(
+    signals: list[dict], *, train_frac: float = 0.7, fee: float = 0.2,
+    usdt: float = 100.0, min_trades: int = 3,
+) -> dict:
+    """Sinyalleri zamana göre böl: ilk %train'de SL/TP optimize et, son %test'te ölç.
+
+    In-sample harika ama out-of-sample kötüyse strateji geçmişe uydurulmuştur
+    (overfit). Sinyaller önceden prefetch edilmiş (candles dolu) olmalı.
+    """
+    from walkforward import _verdict  # in/out beklenti karşılaştırması (ortak mantık)
+
+    ordered = sorted(signals, key=lambda s: s["time"])
+    cut = int(len(ordered) * train_frac)
+    train, test = ordered[:cut], ordered[cut:]
+    best = _best_params(train, fee, usdt, min_trades)
+    if best is None:
+        return {"ok": False, "reason": "in-sample'da yeterli işlem yok", "params": None}
+
+    sl, tp, is_stats = best
+    oos = run(test, sl, tp, fee, usdt, False)
+    oos_n = oos.get("n", 0)
+    oos_avg = oos.get("avg_net_pct", 0.0)
+    verdict, degradation = _verdict(is_stats["avg_net_pct"], oos_avg, oos_n)
+    return {
+        "ok": True,
+        "params": {"sl": sl, "tp": tp},
+        "in_sample": is_stats,
+        "out_of_sample": oos,
+        "degradation": degradation,
+        "verdict": verdict,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Haber sinyali backtest")
     ap.add_argument("--api", default="http://127.0.0.1:8000")
+    ap.add_argument("--db", default=None,
+                    help="SQLite arşivinden oku (motor çalışmasa da olur). Örn: botpy.db")
     ap.add_argument("--min-impact", type=int, default=7)
     ap.add_argument("--sl", type=float, default=3.0)
     ap.add_argument("--tp", type=float, default=6.0)
@@ -166,16 +238,27 @@ def main() -> None:
     ap.add_argument("--fee", type=float, default=0.2, help="gidiş-dönüş komisyon %% (spot ~0.2)")
     ap.add_argument("--usdt", type=float, default=100.0)
     ap.add_argument("--grid", action="store_true", help="en iyi SL/TP kombinasyonunu ara")
+    ap.add_argument("--walk", action="store_true",
+                    help="walk-forward: ilk %%70'te optimize, son %%30'da test (overfit ölç)")
+    ap.add_argument("--train-frac", type=float, default=0.7, help="walk-forward eğitim oranı")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     minutes = int(args.hours * 60)
-    print(f"Sinyaller çekiliyor ({args.api}, güç ≥ {args.min_impact})...")
-    try:
-        signals = fetch_signals(args.api, args.min_impact)
-    except Exception as e:
-        print(f"HATA: motora bağlanılamadı ({e}). Motor çalışıyor mu?")
-        return
+    if args.db:
+        print(f"Sinyaller arşivden çekiliyor ({args.db}, güç ≥ {args.min_impact})...")
+        try:
+            signals = fetch_signals_from_db(args.db, args.min_impact)
+        except Exception as e:
+            print(f"HATA: arşiv okunamadı ({e}). Yol doğru mu?")
+            return
+    else:
+        print(f"Sinyaller çekiliyor ({args.api}, güç ≥ {args.min_impact})...")
+        try:
+            signals = fetch_signals(args.api, args.min_impact)
+        except Exception as e:
+            print(f"HATA: motora bağlanılamadı ({e}). Motor çalışıyor mu? (veya --db ile arşivden oku)")
+            return
     print(f"{len(signals)} aday sinyal — fiyat verisi indiriliyor...")
     signals = prefetch(signals, minutes)
     print(f"{len(signals)} sinyal test edilebilir (yeterli fiyat verisi olan).")
@@ -183,12 +266,37 @@ def main() -> None:
         print("Yeterli sinyal yok — motoru bir süre çalıştırıp tekrar dene.")
         return
 
+    if args.walk:
+        wf = walk_forward(signals, train_frac=args.train_frac, fee=args.fee,
+                          usdt=args.usdt, min_trades=3)
+        print(f"\n{'='*50}")
+        print("WALK-FORWARD DOĞRULAMA (overfit testi)")
+        if not wf["ok"]:
+            print(f"  {wf['reason']}")
+            print(f"{'='*50}")
+            return
+        p, is_s, oos = wf["params"], wf["in_sample"], wf["out_of_sample"]
+        print(f"En iyi (in-sample): SL={p['sl']}% TP={p['tp']}%")
+        print(f"  in-sample  : n={is_s['n']:<3} kazanma%={is_s['win_rate']:<5} "
+              f"ort.net%={is_s['avg_net_pct']:+.3f}")
+        oos_n = oos.get("n", 0)
+        if oos_n:
+            print(f"  out-sample : n={oos_n:<3} kazanma%={oos['win_rate']:<5} "
+                  f"ort.net%={oos['avg_net_pct']:+.3f}")
+        else:
+            print("  out-sample : işlem yok")
+        if wf["degradation"] is not None:
+            print(f"  zayıflama  : %{wf['degradation']*100:.0f}")
+        print(f"  KARAR      : {wf['verdict']}")
+        print(f"{'='*50}")
+        return
+
     if args.grid:
         print("\nGrid search (komisyon %{:.1f} dahil, {:.0f}s pencere):".format(args.fee, args.hours))
         print(f"{'SL%':>5}{'TP%':>5}{'n':>5}{'kazanma%':>10}{'ort.net%':>10}{'P&L USDT':>10}")
         best = None
-        for sl in (1.5, 2, 3, 4, 5):
-            for tp in (2, 3, 5, 6, 8, 10):
+        for sl in SL_GRID:
+            for tp in TP_GRID:
                 s = run(signals, sl, tp, args.fee, args.usdt, False)
                 if s["n"] == 0:
                     continue

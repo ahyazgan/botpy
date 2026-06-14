@@ -63,11 +63,13 @@ npm run preview
 1. **Kaynakları çek** (`fetch_all`): RSS feed'leri (`RSS_FEEDS`, feedparser) + Binance yeni listeleme duyuruları (catalogId=48). Biri patlarsa diğerleri devam eder.
 2. **Tekrar engelle**: `_seen_ids` ile yeni haberleri ayıkla. İlk tarama bildirimsiz **tohumlama** (`_primed`) — spam önler.
 3. **Puanla**: `USE_CLAUDE` (ANTHROPIC_API_KEY varsa) → `score_with_claude` (Claude `claude-haiku-4-5`, `messages.parse` + Pydantic `_ScoreBatch`, tüm yeni haberler **tek istekte**). Yoksa/başarısızsa → `score_item` (kural-tabanlı: `COIN_PATTERNS`, `IMPACT_KEYWORDS`, Binance ticker çıkarımı). Her haber: `coins`, `impact` (1-10), `direction` (bullish/bearish/neutral), `reason`.
-4. **Bildir** (`notify`): `impact >= ALERT_THRESHOLD` (7) olanlara winotify masaüstü bildirimi ("Habere git" butonuyla).
+4. **Bildir** (`notify`): `impact >= ALERT_THRESHOLD` (7) olanlara winotify masaüstü bildirimi ("Habere git" butonuyla) **+ uzak bildirim** (`notify_remote` → `notify.py`'deki `Notifier`, Telegram/Discord). Uzak kanal env tanımlıysa (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`/`DISCORD_WEBHOOK_URL`) otomatik etkin, yoksa sessiz; winotify kurulu olmasa da çalışır (bilgisayardan uzaktayken telefona sinyal). Oto-işlem **açılış** (`process_items`) ve **kapanış** (`_monitor_loop`, `monitor_positions` artık kapanan pozisyonları döndürür) olayları da uzak kanaldan bildirilir.
 
 **Fiyat teyidi** (`confirm_with_price`): güçlü haberler için Binance public API'den 24s/15dk fiyat hareketi + hacim çekilir. `confirmed` = haber yönü ile son hareket uyumlu **ve** likidite ≥ `MIN_VOLUME_USD`. "Zaten fiyatlanmış" (24s'te > `ALREADY_PRICED_PCT`) uyarısı verir.
 
-**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
+**Sinyal arşivi** (`_archive_signal` → `storage.add_signal`): güçlü haberler (canlı, tohumlama değil) `news_signals` tablosuna kalıcı yazılır (id ile dedupe, restart'a dayanıklı). `Store` lazy açılır (`get_store`, `BOTPY_DB` yolu); import'ta dosya yaratma yan etkisi yok. `news_backtest.py --db` bu arşivi motor çalışmadan okur.
+
+**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/signals?limit=&min_impact=` (kalıcı arşiv + kapsam), `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
 
 ### `trader.py` — Binance İşlem Modülü (AKTİF, profesyonel)
 
@@ -83,7 +85,7 @@ Güvenli varsayılan: `paper_trading=True`, `auto_trade=False`, SL=3% TP=6%.
 
 ### `backtest.py` — Sinyal Backtest (CLI)
 
-Çalışan motorun `/news` güçlü sinyallerini çeker, her biri için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). Kısıt: geçmiş haber arşivi yok, yalnızca motorun o anki bellekteki sinyalleri test edilir; `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
+Sinyalleri iki kaynaktan alır: (a) çalışan motorun `/news` (RAM) ucu — varsayılan; (b) `--db botpy.db` ile **kalıcı SQLite arşivi** (motor çalışmasa da olur). `news_bot` güçlü sinyalleri arşive yazdığı için (`_archive_signal` → `storage.add_signal`, restart'a dayanıklı), günlerce biriken veriyle backtest yapılabilir. Her sinyal için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). `--walk` ile **walk-forward doğrulama** (`walk_forward`): sinyalleri zamana göre böl, ilk %`train_frac`'te SL/TP optimize et (`_best_params`, `SL_GRID`×`TP_GRID`), son kısımda (out-of-sample) test et — `walkforward._verdict` ile zayıflama + karar raporlar (overfit'i ölçer). `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
 
 ### `bot.py` — FastAPI Market Tarayıcı (eski Polymarket)
 
@@ -122,7 +124,7 @@ Strateji: `YES_ask + NO_ask < (1 - MIN_PROFIT)` → iki tarafı da al; `YES_bid 
 
 ### `dashboard/` — React Panel (AKTİF — haber radarı)
 
-`src/App.tsx` artık `news_bot.py`'nin `/news` endpoint'ine bağlanır (15s polling). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
+`src/App.tsx` `news_bot.py`'ye bağlanır (15s polling, `/news` + `/settings` + `/positions` + `/performance` + `/signals`). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". Footer'da **arşiv kapsam göstergesi** (`/signals` span'ı: biriken sinyal sayısı + gün/saat aralığı — backtest için ne kadar veri olduğunu gösterir). `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
 
 ### `api.py` — CORS Proxy (eski)
 

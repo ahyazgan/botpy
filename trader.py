@@ -154,7 +154,7 @@ def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | 
     avail = sum(float(p) * float(q) for p, q in levels)
     remaining, cost, qty = usdt, 0.0, 0.0
     for p, q in levels:
-        p = float(p); q = float(q)
+        p, q = float(p), float(q)
         take = min(remaining, p * q)
         if p > 0:
             qty += take / p
@@ -370,8 +370,13 @@ def get_positions() -> tuple[list[dict[str, Any]], float]:
 
 
 # ── Otomatik çıkış (SL/TP/trailing) ──────────────────────────────────────
-def monitor_positions() -> None:
-    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat."""
+def monitor_positions() -> list[dict[str, Any]]:
+    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat.
+
+    Otomatik kapatılan pozisyonların listesini döndürür (boş olabilir) — çağıran
+    taraf bildirim atabilsin diye.
+    """
+    closed: list[dict[str, Any]] = []
     with _lock:
         snap = list(_positions)
     for p in snap:
@@ -390,12 +395,14 @@ def monitor_positions() -> None:
                 p["high_water"] = cur
                 new_sl = round(cur * (1 - tr / 100), 8)
                 if p.get("sl_price") is None or new_sl > p["sl_price"]:
-                    p["sl_price"] = new_sl; changed = True
+                    p["sl_price"] = new_sl
+                    changed = True
             elif not is_long and cur < p.get("high_water", cur):
                 p["high_water"] = cur
                 new_sl = round(cur * (1 + tr / 100), 8)
                 if p.get("sl_price") is None or new_sl < p["sl_price"]:
-                    p["sl_price"] = new_sl; changed = True
+                    p["sl_price"] = new_sl
+                    changed = True
             if changed:
                 with _lock:
                     _save_state()
@@ -414,9 +421,10 @@ def monitor_positions() -> None:
                 hit = "take-profit"
         if hit:
             try:
-                close_position(p["id"], reason=hit)
+                closed.append(close_position(p["id"], reason=hit))
             except Exception as e:
                 log.warning("Otomatik kapatma hatası (%s): %s", p["symbol"], e)
+    return closed
 
 
 # ── Otomatik işlem ───────────────────────────────────────────────────────

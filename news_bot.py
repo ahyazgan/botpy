@@ -36,9 +36,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import storage
 import trader
+from notify import Notifier
 
 load_dotenv()  # .env dosyasındaki ANTHROPIC_API_KEY'i okur
+
+# Uzak bildirim (Telegram/Discord) — env tanımlıysa otomatik etkin, yoksa sessiz.
+# winotify (masaüstü) yalnızca bilgisayar başındayken işe yarar; bu kanal güçlü
+# haber + oto-işlem olaylarını telefona/uzağa ulaştırır.
+_notifier = Notifier.from_env()
+
+# Sinyal arşivi: güçlü haberleri SQLite'a kalıcı yazar (restart'a dayanıklı).
+# Lazy — yalnızca ilk kullanımda açılır (import'ta dosya yaratma yan etkisi yok).
+_store: storage.Store | None = None
+
+
+def get_store() -> storage.Store:
+    global _store
+    if _store is None:
+        _store = storage.Store()
+    return _store
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
@@ -436,7 +454,7 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
     if k.status_code == 200:
         candles = k.json()
         if candles:
-            o = float(candles[0][1]); c = float(candles[-1][4])
+            o, c = float(candles[0][1]), float(candles[-1][4])
             if o:
                 move15 = (c - o) / o * 100
     return {
@@ -499,15 +517,66 @@ def confirm_with_price(session: requests.Session, item: NewsItem) -> None:
 
 
 # ── Bildirim ─────────────────────────────────────────────────────────────
+_ARROW = {"bullish": "🟢 YÜKSELİŞ", "bearish": "🔴 DÜŞÜŞ", "neutral": "⚪ NÖTR"}
+
+
+def _fmt_news_msg(item: NewsItem) -> str:
+    """Güçlü haberi uzak kanal (Telegram/Discord) için düz metne çevir."""
+    coins = ", ".join(item.coins) if item.coins else "Genel"
+    tick = "✅ TEYİTLİ" if item.confirmed else "⏳ teyit yok"
+    lines = [
+        f"⚡ Güç {item.impact}/10 · {_ARROW[item.direction]} · {coins}",
+        f"[{item.source}] {item.title[:200]}",
+        tick + (f" · {item.price_note}" if item.price_note else ""),
+    ]
+    if item.reason:
+        lines.append(f"💡 {item.reason[:200]}")
+    if item.url:
+        lines.append(f"🔗 {item.url}")
+    return "\n".join(lines)
+
+
+def _fmt_trade_msg(pos: dict[str, Any], opened: bool) -> str:
+    """Oto-işlem açılış/kapanış olayını uzak kanal için düz metne çevir."""
+    mode = pos.get("mode", "paper").upper()
+    side = pos.get("side", "?").upper()
+    sym = pos.get("symbol", "?")
+    if opened:
+        head = f"🤖 OTO İŞLEM AÇILDI [{mode}]"
+        body = f"{side} {sym} · {pos.get('usdt', 0):.0f} USDT @ {pos.get('entry_price')}"
+        sl, tp = pos.get("sl_price"), pos.get("tp_price")
+        tail = f"SL {sl} · TP {tp}" if (sl or tp) else ""
+    else:
+        pnl, pct = pos.get("pnl"), pos.get("pnl_pct")
+        emoji = "🟩" if (pnl or 0) >= 0 else "🟥"
+        head = f"{emoji} POZİSYON KAPANDI [{mode}] · {pos.get('close_reason', '?')}"
+        body = f"{side} {sym} @ {pos.get('close_price')}"
+        if pnl is not None:
+            tail = f"P&L {pnl:+.2f} USDT" + (f" ({pct:+.1f}%)" if pct is not None else "")
+        else:
+            tail = ""
+    return "\n".join(x for x in (head, body, tail) if x)
+
+
+def notify_remote(text: str) -> None:
+    """Telegram/Discord'a gönder (env tanımlı değilse sessizce atlanır)."""
+    try:
+        _notifier.send(text)
+    except Exception as e:
+        log.warning("Uzak bildirim hatası: %s", e)
+
+
 def notify(item: NewsItem) -> None:
-    """Güçlü haber için Windows masaüstü bildirimi."""
+    """Güçlü haber için masaüstü (winotify) + uzak (Telegram/Discord) bildirim."""
+    notify_remote(_fmt_news_msg(item))  # winotify yoksa bile uzak kanal çalışır
+
     try:
         from winotify import Notification, audio
     except ImportError:
-        log.warning("winotify yok — bildirim atlanıyor (pip install winotify)")
+        log.warning("winotify yok — masaüstü bildirimi atlanıyor (pip install winotify)")
         return
 
-    arrow = {"bullish": "🟢 YÜKSELİŞ", "bearish": "🔴 DÜŞÜŞ", "neutral": "⚪ NÖTR"}[item.direction]
+    arrow = _ARROW[item.direction]
     coins = ", ".join(item.coins) if item.coins else "Genel"
     tick = "✅ TEYİTLİ" if item.confirmed else "⏳ teyit yok"
     note = f"\n{tick}" + (f" · {item.price_note}" if item.price_note else "")
@@ -610,12 +679,22 @@ def process_items(
 
     if allow_notify:
         for it in alerts:
+            _archive_signal(it)
             notify(it)
             pos = trader.maybe_auto_trade(it)
             if pos:
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
+                notify_remote(_fmt_trade_msg(pos, opened=True))
 
     return len(new_items), len(alerts)
+
+
+def _archive_signal(item: NewsItem) -> None:
+    """Güçlü sinyali kalıcı arşive yaz (backtest için). Hata akışı bozmaz."""
+    try:
+        get_store().add_signal(item.to_dict())
+    except Exception as e:
+        log.warning("Sinyal arşivleme hatası: %s", e)
 
 
 # ── Arka plan döngüsü (RSS + Binance polling) ────────────────────────────
@@ -656,7 +735,8 @@ MONITOR_INTERVAL_SEC = 8
 def _monitor_loop(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
-            trader.monitor_positions()
+            for pos in trader.monitor_positions():
+                notify_remote(_fmt_trade_msg(pos, opened=False))
         except Exception as e:
             log.warning("Pozisyon izleme hatası: %s", e)
         if stop.wait(MONITOR_INTERVAL_SEC):
@@ -836,6 +916,14 @@ def get_alerts(limit: int = 50) -> NewsResponse:
 def health() -> dict[str, Any]:
     with _cache_lock:
         return {"ok": _status["error"] is None, **_status}
+
+
+@app.get("/signals")
+def get_signals(limit: int = 500, min_impact: int = 0) -> dict[str, Any]:
+    """Kalıcı arşivdeki güçlü haber sinyalleri (restart'tan bağımsız, backtest için)."""
+    store = get_store()
+    return {"signals": store.list_signals(limit=limit, min_impact=min_impact),
+            **store.signal_span()}
 
 
 # ── İşlem endpoint'leri ──────────────────────────────────────────────────

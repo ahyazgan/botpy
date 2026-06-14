@@ -1,0 +1,5 @@
+[tool.ruff]
+# Arşivlenmiş/deneysel kod CI lint kapsamı dışında (aktif kod değil):
+#   refactor-modular/ — modüler mimari denemesi (geçmişi ayrı dalda)
+#   *.ipynb           — Colab test notebook'ları
+extend-exclude = ["refactor-modular", "*.ipynb"]

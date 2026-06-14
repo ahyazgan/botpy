@@ -91,6 +91,12 @@ type Position = {
   tp_price: number | null;
 };
 
+type SignalSpan = {
+  count: number;
+  first_ts: string | null;
+  last_ts: string | null;
+};
+
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
   const then = new Date(iso).getTime();
@@ -102,6 +108,14 @@ function timeAgo(iso: string | null): string {
   const hr = Math.floor(min / 60);
   if (hr < 24) return `${hr} sa önce`;
   return `${Math.floor(hr / 24)} gün önce`;
+}
+
+function spanDays(first: string | null, last: string | null): number | null {
+  if (!first || !last) return null;
+  const a = new Date(first).getTime();
+  const b = new Date(last).getTime();
+  if (Number.isNaN(a) || Number.isNaN(b)) return null;
+  return Math.max(0, (b - a) / 86_400_000);
 }
 
 const DIR_LABEL: Record<Direction, string> = {
@@ -154,6 +168,7 @@ export default function App() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
+  const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -166,11 +181,12 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
         fetch(`${API_BASE}/performance`),
+        fetch(`${API_BASE}/signals?limit=1`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -184,6 +200,10 @@ export default function App() {
         setTotalPnl(pData.total_pnl);
       }
       if (perfRes.ok) setPerf(await perfRes.json());
+      if (sigRes.ok) {
+        const sig = await sigRes.json();
+        setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
     } finally {
@@ -422,6 +442,16 @@ export default function App() {
           <span>Taranan: <strong className="text-zinc-300">{meta.total_seen}</strong></span>
           <span className="text-zinc-700">|</span>
           <span>Görüntülenen: <strong className="text-zinc-300">{displayed.length}</strong></span>
+          <span className="text-zinc-700">|</span>
+          <span title="Backtest için kalıcı arşivde biriken güçlü sinyal sayısı (restart'a dayanıklı)">
+            Arşiv: <strong className="text-zinc-300">{signalSpan.count}</strong> sinyal
+            {(() => {
+              const d = spanDays(signalSpan.first_ts, signalSpan.last_ts);
+              return d !== null && d >= 0.1 ? (
+                <span className="text-zinc-600"> · {d < 1 ? `${(d * 24).toFixed(0)} sa` : `${d.toFixed(1)} gün`}</span>
+              ) : null;
+            })()}
+          </span>
           {meta.updated_at && (
             <>
               <span className="text-zinc-700">|</span>

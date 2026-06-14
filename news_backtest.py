@@ -89,7 +89,8 @@ def fetch_signals_from_db(db_path: str, min_impact: int) -> list[dict]:
 def fetch_klines(symbol: str, start_ms: int, minutes: int) -> list[list]:
     try:
         r = requests.get(BINANCE_KLINES, params={
-            "symbol": symbol, "interval": "1m", "startTime": start_ms, "limit": min(minutes, 1000),
+            "symbol": symbol, "interval": "1m",
+            "startTime": str(start_ms), "limit": str(min(minutes, 1000)),
         }, timeout=15)
         if r.status_code != 200:
             return []

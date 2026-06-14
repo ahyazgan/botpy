@@ -34,7 +34,7 @@ from typing import Any
 import feedparser
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -61,10 +61,22 @@ def get_store() -> storage.Store:
         _store = storage.Store()
     return _store
 
+# İşlem/ayar uçları için opsiyonel token koruması. API_TOKEN env tanımlıysa
+# mutasyon uçları (trade/settings/positions) X-API-Token başlığı ister; yoksa
+# açık (yerel kullanım — geriye dönük uyumlu).
+API_TOKEN = os.environ.get("API_TOKEN") or None
+
+
+def require_token(x_api_token: str | None = Header(default=None)) -> None:
+    if API_TOKEN and x_api_token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Geçersiz veya eksik API token (X-API-Token)")
+
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
+MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
+ARCHIVE_PRUNE_EVERY = 200   # her N yeni sinyalde bir eski kayıtları buda
 MAX_NEWS_AGE_HOURS = 24     # bundan eski haberler feed'den düşer
 REQUEST_TIMEOUT   = 15
 
@@ -497,7 +509,7 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
     t = r.json()
     k = session.get(
         f"{BINANCE_API}/klines",
-        params={"symbol": symbol, "interval": "5m", "limit": 3},
+        params={"symbol": symbol, "interval": "5m", "limit": "3"},
         timeout=REQUEST_TIMEOUT,
     )
     move15 = 0.0
@@ -743,10 +755,21 @@ def process_items(
     return len(new_items), len(alerts)
 
 
+_archive_count = 0
+
+
 def _archive_signal(item: NewsItem) -> None:
-    """Güçlü sinyali kalıcı arşive yaz (backtest için). Hata akışı bozmaz."""
+    """Güçlü sinyali kalıcı arşive yaz (backtest için). Hata akışı bozmaz.
+
+    Arşivin sınırsız büyümesini önlemek için periyodik olarak eski kayıtları budar.
+    """
+    global _archive_count
     try:
-        get_store().add_signal(item.to_dict())
+        store = get_store()
+        if store.add_signal(item.to_dict()):
+            _archive_count += 1
+            if _archive_count % ARCHIVE_PRUNE_EVERY == 0:
+                store.prune_signals(MAX_ARCHIVE_SIGNALS)
     except Exception as e:
         log.warning("Sinyal arşivleme hatası: %s", e)
 
@@ -906,6 +929,10 @@ async def lifespan(app: FastAPI):
     global _bg_thread, _ws_thread, _mon_thread
     setup_logging()
     _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
+    try:
+        get_store().prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
+    except Exception as e:
+        log.warning("Arşiv budama hatası: %s", e)
     _stop_event.clear()
     _bg_thread = threading.Thread(target=_background_loop, args=(_stop_event,), daemon=True)
     _bg_thread.start()
@@ -1025,7 +1052,7 @@ def news_settings_get() -> dict[str, Any]:
     return get_news_settings()
 
 
-@app.patch("/news-settings")
+@app.patch("/news-settings", dependencies=[Depends(require_token)])
 def news_settings_patch(body: NewsSettingsPatch) -> dict[str, Any]:
     return update_news_settings(body.model_dump(exclude_none=True))
 
@@ -1125,7 +1152,7 @@ def get_trade_settings() -> dict[str, Any]:
     return trader.get_settings()
 
 
-@app.patch("/settings")
+@app.patch("/settings", dependencies=[Depends(require_token)])
 def patch_trade_settings(body: SettingsPatch) -> dict[str, Any]:
     try:
         return trader.update_settings(body.model_dump(exclude_none=True))
@@ -1133,7 +1160,7 @@ def patch_trade_settings(body: SettingsPatch) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/trade")
+@app.post("/trade", dependencies=[Depends(require_token)])
 def post_trade(body: TradeRequest) -> dict[str, Any]:
     symbol = body.symbol or (f"{body.coin.upper()}USDT" if body.coin else None)
     if not symbol:
@@ -1155,7 +1182,7 @@ def get_performance() -> dict[str, Any]:
     return trader.get_performance()
 
 
-@app.delete("/positions/{pid}")
+@app.delete("/positions/{pid}", dependencies=[Depends(require_token)])
 def delete_position(pid: str) -> dict[str, Any]:
     try:
         return trader.close_position(pid)

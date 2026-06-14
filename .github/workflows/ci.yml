@@ -26,6 +26,9 @@ jobs:
       - name: Ruff lint
         run: ruff check .
 
+      - name: Type check (mypy)
+        run: mypy
+
       - name: Compile check
         run: python -m py_compile bot.py arb_bot.py api.py
 

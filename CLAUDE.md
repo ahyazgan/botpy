@@ -67,7 +67,9 @@ npm run preview
 
 **Fiyat teyidi** (`confirm_with_price`): güçlü haberler için Binance public API'den 24s/15dk fiyat hareketi + hacim çekilir. `confirmed` = haber yönü ile son hareket uyumlu **ve** likidite ≥ `MIN_VOLUME_USD`. "Zaten fiyatlanmış" (24s'te > `ALREADY_PRICED_PCT`) uyarısı verir.
 
-**Sinyal arşivi** (`_archive_signal` → `storage.add_signal`): güçlü haberler (canlı, tohumlama değil) `news_signals` tablosuna kalıcı yazılır (id ile dedupe, restart'a dayanıklı). `Store` lazy açılır (`get_store`, `BOTPY_DB` yolu); import'ta dosya yaratma yan etkisi yok. `news_backtest.py --db` bu arşivi motor çalışmadan okur.
+**Sinyal arşivi** (`_archive_signal` → `storage.add_signal`): güçlü haberler (canlı, tohumlama değil) `news_signals` tablosuna kalıcı yazılır (id ile dedupe, restart'a dayanıklı). `Store` lazy açılır (`get_store`, `BOTPY_DB` yolu); import'ta dosya yaratma yan etkisi yok. `news_backtest.py --db` bu arşivi motor çalışmadan okur. Sınırsız büyümeyi önlemek için `prune_signals` ile budanır (`MAX_ARCHIVE_SIGNALS`=5000; başlangıçta + her `ARCHIVE_PRUNE_EVERY` yeni sinyalde).
+
+**Token koruması** (`require_token`, `API_TOKEN` env): tanımlıysa mutasyon uçları (`POST /trade`, `PATCH /settings`, `PATCH /news-settings`, `DELETE /positions`) `X-API-Token` başlığı ister; yoksa açık (yerel kullanım, geriye dönük uyumlu). Sunucu dışa açılırsa ayarlanmalı.
 
 **Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/signals?limit=&min_impact=` (kalıcı arşiv + kapsam), `/backtest?sl=&tp=&fee=&usdt=&hours=&min_impact=&limit=&mode=&train_frac=` (arşiv üzerinde `news_backtest` fonksiyonlarını koşar — Binance klines indirir, senkron/threadpool; `mode`: `simple`/`grid` (`grid_search`, en kârlı SL/TP)/`walk` (walk-forward)), `GET/PATCH /news-settings` (uyarı eşiği + uzak bildirim, store'da kalıcı), `/health` (uptime/scorer/treenews/arşiv sayısı ile zenginleştirilmiş). İşlem/risk: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`, `GET /performance`, `GET /risk` (maruziyet/limit/kill-switch), `GET /trades/closed` (işlem günlüğü) + `/trades/closed.csv` (CSV dışa aktarım).
 
@@ -145,6 +147,12 @@ POLY_PASSPHRASE=    # Polymarket CLOB passphrase
 ```
 
 `bot.py` bu değişkenlere ihtiyaç duymaz — sadece public Gamma API kullanır.
+
+`news_bot.py` opsiyonel env'ler: `ANTHROPIC_API_KEY` (Claude puanlama), `BINANCE_API_KEY`/`BINANCE_SECRET` (canlı işlem), `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`/`DISCORD_WEBHOOK_URL` (uzak bildirim), `BOTPY_DB` (SQLite yolu), `API_TOKEN` (mutasyon uçlarını korur — dışa açılırsa ayarla).
+
+## CI / Kalite
+
+`.github/workflows/ci.yml` iki iş: **lint-and-test** (ruff + `mypy` [aktif modüller, `pyproject.toml` `[tool.mypy]`] + py_compile + pytest) ve **dashboard** (npm ci + `npm run build` = `tsc --noEmit && vite build`). Yerelde tümü: `ruff check . && mypy && pytest` ve `cd dashboard && npm run build`.
 
 ## Önemli Notlar
 

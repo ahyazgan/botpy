@@ -156,7 +156,7 @@ def get_price(symbol: str) -> float | None:
 def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | None:
     """Orderbook'tan bu büyüklükteki emrin ortalama dolum fiyatı + slippage + likidite."""
     try:
-        r = requests.get(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": 50}, timeout=10)
+        r = requests.get(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": "50"}, timeout=10)
         if r.status_code != 200:
             return None
         book = r.json()

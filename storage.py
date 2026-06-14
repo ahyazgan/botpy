@@ -498,6 +498,22 @@ class Store:
             "last_ts": row["last_ts"] if row else None,
         }
 
+    def prune_signals(self, keep: int) -> int:
+        """En yeni `keep` sinyal dışındakileri sil (sınırsız büyümeyi önler).
+
+        Silinen satır sayısını döndürür. keep <= 0 ise hiçbir şey yapmaz.
+        """
+        if keep <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM news_signals WHERE id NOT IN "
+                "(SELECT id FROM news_signals ORDER BY ts DESC, id DESC LIMIT ?)",
+                (keep,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     # ── Uygulama ayarları (kalıcı; restart'a dayanıklı) ───────────────────
     def set_setting(self, key: str, value: str) -> None:
         with self._lock:

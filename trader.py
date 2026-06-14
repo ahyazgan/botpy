@@ -51,15 +51,26 @@ class Settings:
     stop_loss_pct: float = 3.0       # -%3'te zarar durdur
     take_profit_pct: float = 6.0     # +%6'da kâr al
     trailing_stop_pct: float = 0.0   # 0 = kapalı; >0 ise kârı takip eden stop
+    # Akıllı çıkış yönetimi
+    time_stop_min: int = 0           # >0: bu kadar dk sonra hâlâ açıksa kapat (haber edge'i söndü)
+    breakeven_pct: float = 0.0       # >0: +%X kâra ulaşınca SL'i girişe çek (kârı koru)
+    partial_tp_pct: float = 0.0      # >0: +%X'te pozisyonun bir kısmını al (scale-out)
+    partial_tp_frac: float = 0.5     # kısmi TP'de kapatılacak oran (0-1)
     # Risk limitleri
     daily_loss_limit_usdt: float = 200.0   # günlük gerçekleşen zarar bu USDT'yi geçerse dur (0=kapalı)
     max_total_exposure_usdt: float = 2000.0  # toplam açık pozisyon USDT tavanı (0=kapalı)
     max_per_coin_usdt: float = 500.0       # tek coin için açık pozisyon tavanı (0=kapalı)
+    max_open_risk_usdt: float = 0.0  # >0: açık pozisyonların SL'de toplam riski bu USDT'yi geçemez
+    reduce_after_losses: int = 0     # >0: son N işlem zararsa boyutu yarıla (kayıp serisi freni)
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
+    # Sinyal kalitesi / öğrenme
+    suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
+    min_source_samples: int = 8      # bir kaynağı yargılamak için gereken min kapanmış işlem
+    skip_already_priced_pct: float = 0.0   # >0: 24s'te bu % haber yönünde oynamışsa girme (chase önleme)
 
 
 S = Settings()
@@ -77,6 +88,9 @@ _PERSIST_KEYS = (
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
+    "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
+    "max_open_risk_usdt", "reduce_after_losses",
+    "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
 )
 
 
@@ -215,6 +229,45 @@ def _exposure() -> tuple[float, dict[str, float]]:
     return total, per_coin
 
 
+def _position_risk(p: dict[str, Any]) -> float:
+    """Pozisyonun SL'de potansiyel zararı (USDT). SL yoksa tüm tutar riskte."""
+    sl = p.get("sl_price")
+    entry = p.get("entry_price")
+    if not sl or not entry:
+        return p["usdt"]
+    return round(p["usdt"] * abs(entry - sl) / entry, 2)
+
+
+def _open_risk() -> float:
+    """Açık pozisyonların SL'de toplam potansiyel zararı (lock'suz; caller tutar)."""
+    return round(sum(_position_risk(p) for p in _positions), 2)
+
+
+def _losing_streak() -> int:
+    """Üst üste kapanmış zararlı işlem sayısı (en yeniden geriye)."""
+    with _lock:
+        rows = list(_closed)
+    n = 0
+    for c in reversed(rows):
+        if c.get("pnl") is None:
+            continue
+        if c["pnl"] < 0:
+            n += 1
+        else:
+            break
+    return n
+
+
+def source_stats(news_source: str) -> dict[str, Any]:
+    """Bir haber kaynağının kapanmış işlem beklentisi: {count, avg_pnl}."""
+    with _lock:
+        rows = [c for c in _closed
+                if c.get("news_source") == news_source and c.get("pnl") is not None]
+    if not rows:
+        return {"count": 0, "avg_pnl": 0.0}
+    return {"count": len(rows), "avg_pnl": round(sum(c["pnl"] for c in rows) / len(rows), 2)}
+
+
 def _check_risk(symbol: str, usdt: float) -> None:
     """Risk limitlerini ihlal eden işlemde RuntimeError fırlatır."""
     _reset_daily_if_needed()
@@ -225,11 +278,16 @@ def _check_risk(symbol: str, usdt: float) -> None:
         raise RuntimeError(f"Toplam maruziyet tavanı ({S.max_total_exposure_usdt:.0f} USDT) aşılır")
     if S.max_per_coin_usdt > 0 and per_coin.get(symbol, 0.0) + usdt > S.max_per_coin_usdt:
         raise RuntimeError(f"{symbol} için coin maruziyet tavanı ({S.max_per_coin_usdt:.0f} USDT) aşılır")
+    if S.max_open_risk_usdt > 0:
+        new_risk = usdt * (S.stop_loss_pct / 100) if S.stop_loss_pct > 0 else usdt
+        if _open_risk() + new_risk > S.max_open_risk_usdt:
+            raise RuntimeError(f"Açık risk tavanı aşılır (SL'de toplam ≤ {S.max_open_risk_usdt:.0f} USDT)")
 
 
 # ── İşlem açma ───────────────────────────────────────────────────────────
 def place_trade(symbol: str, side: str, usdt: float | None = None,
-                source: str = "manual", reason: str = "") -> dict[str, Any]:
+                source: str = "manual", reason: str = "",
+                news_source: str = "") -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -306,6 +364,7 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "high_water": price,
         "opened_at": _now(),
         "source": source,
+        "news_source": news_source,
         "reason": reason,
     }
     with _lock:
@@ -371,27 +430,70 @@ def get_positions() -> tuple[list[dict[str, Any]], float]:
 
 
 # ── Otomatik çıkış (SL/TP/trailing) ──────────────────────────────────────
-def monitor_positions() -> list[dict[str, Any]]:
-    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat.
+def _parse_dt(s: str | None) -> datetime | None:
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except (ValueError, TypeError):
+        return None
 
-    Otomatik kapatılan pozisyonların listesini döndürür (boş olabilir) — çağıran
-    taraf bildirim atabilsin diye.
+
+def _partial_close(p: dict[str, Any], frac: float, reason: str, cur: float) -> dict[str, Any] | None:
+    """Pozisyonun `frac` oranını kapat (scale-out). Kapanan kısmı kayıt eder,
+    canlı pozisyonu küçültür. Kapanan satırı döndürür (canlı emir hatasında None)."""
+    frac = max(0.0, min(1.0, frac))
+    close_usdt = round(p["usdt"] * frac, 2)
+    close_amt = round(p["amount"] * frac, 8)
+    if close_amt <= 0 or close_usdt <= 0:
+        return None
+    if p["mode"] == "live":
+        try:
+            ex = _get_exchange()
+            csym = _ccxt_symbol(p["symbol"])
+            ex_side = "sell" if p["side"] == "long" else "buy"
+            params = {"reduceOnly": True} if p["market"] == "futures" else {}
+            ex.create_order(csym, "market", ex_side, close_amt, None, params)
+        except Exception as e:
+            log.warning("Kısmi kapatma hatası (%s): %s", p["symbol"], e)
+            return None
+    pnl, pct = _pnl({**p, "usdt": close_usdt}, cur)
+    rec = dict(p)
+    rec.update(usdt=close_usdt, amount=close_amt, closed_at=_now(), close_price=cur,
+               pnl=pnl, pnl_pct=pct, close_reason=reason)
+    p["usdt"] = round(p["usdt"] - close_usdt, 2)
+    p["amount"] = round(p["amount"] - close_amt, 8)
+    p["partial_done"] = True
+    with _lock:
+        _closed.append(rec)
+        _reset_daily_if_needed()
+        if pnl is not None:
+            _daily["realized"] = round(_daily["realized"] + pnl, 2)
+        _save_state()
+    log.info("%s KISMİ TP | %s %s | P&L=%s | kalan %.2f USDT",
+             p["mode"].upper(), p["side"], p["symbol"], pnl, p["usdt"])
+    return rec
+
+
+def monitor_positions() -> list[dict[str, Any]]:
+    """Açık pozisyonları izle: trailing, breakeven, kısmi TP, SL/TP/time-stop.
+
+    Otomatik kapatılan (tam veya kısmi) pozisyonların listesini döndürür.
     """
     closed: list[dict[str, Any]] = []
     with _lock:
         snap = list(_positions)
+    now = datetime.now(timezone.utc)
     for p in snap:
-        if not (p.get("sl_price") or p.get("tp_price")):
-            continue
         cur = get_price(p["symbol"])
         if cur is None:
             continue
         is_long = p["side"] == "long"
+        entry = p["entry_price"]
+        gain = ((cur - entry) / entry * 100) * (1 if is_long else -1)  # haber yönünde % kazanç
+        changed = False
 
-        # Trailing stop: kâr yönünde ilerledikçe stop'u çek
+        # 1) Trailing stop: kâr yönünde ilerledikçe stop'u çek
         tr = p.get("trailing_pct", 0) or 0
         if tr > 0:
-            changed = False
             if is_long and cur > p.get("high_water", cur):
                 p["high_water"] = cur
                 new_sl = round(cur * (1 - tr / 100), 8)
@@ -404,10 +506,28 @@ def monitor_positions() -> list[dict[str, Any]]:
                 if p.get("sl_price") is None or new_sl < p["sl_price"]:
                     p["sl_price"] = new_sl
                     changed = True
-            if changed:
-                with _lock:
-                    _save_state()
 
+        # 2) Breakeven: +X% kârda SL'i girişe çek (kârı koru)
+        if S.breakeven_pct > 0 and not p.get("breakeven_done") and gain >= S.breakeven_pct:
+            be = round(entry, 8)
+            if (is_long and (p.get("sl_price") is None or be > p["sl_price"])) or \
+               (not is_long and (p.get("sl_price") is None or be < p["sl_price"])):
+                p["sl_price"] = be
+            p["breakeven_done"] = True
+            changed = True
+
+        if changed:
+            with _lock:
+                _save_state()
+
+        # 3) Kısmi TP (scale-out, bir kez)
+        if (S.partial_tp_pct > 0 and S.partial_tp_frac > 0
+                and not p.get("partial_done") and gain >= S.partial_tp_pct):
+            rec = _partial_close(p, S.partial_tp_frac, "partial-tp", cur)
+            if rec:
+                closed.append(rec)
+
+        # 4) Tam çıkış: SL / TP / time-stop
         hit = None
         sl, tp = p.get("sl_price"), p.get("tp_price")
         if is_long:
@@ -420,6 +540,10 @@ def monitor_positions() -> list[dict[str, Any]]:
                 hit = "stop-loss"
             elif tp and cur <= tp:
                 hit = "take-profit"
+        if hit is None and S.time_stop_min > 0:
+            opened = _parse_dt(p.get("opened_at"))
+            if opened and (now - opened).total_seconds() >= S.time_stop_min * 60:
+                hit = "time-stop"
         if hit:
             try:
                 closed.append(close_position(p["id"], reason=hit))
@@ -465,11 +589,31 @@ def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
         return None
     if not _can_auto_trade(symbol):
         return None
-    usdt = None
+    # Chase önleme: 24s'te haber yönünde çok oynamışsa (zaten fiyatlanmış) girme
+    if S.skip_already_priced_pct > 0:
+        m = getattr(item, "price_24h_pct", None)
+        if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
+                              or (side == "short" and m <= -S.skip_already_priced_pct)):
+            log.info("Atla (zaten fiyatlanmış): %s %s 24s=%%%.1f", side, symbol, m)
+            return None
+    # Kaynak öğrenme: yeterli örnekte negatif beklentili kaynağı sustur
+    news_source = getattr(item, "source", "") or ""
+    if S.suppress_losing_sources and news_source:
+        st = source_stats(news_source)
+        if st["count"] >= S.min_source_samples and st["avg_pnl"] < 0:
+            log.info("Atla (kaynak negatif beklenti): %s avg=%.2f n=%d",
+                     news_source, st["avg_pnl"], st["count"])
+            return None
+    # Boyut: conviction (güce göre) + kayıp serisi freni
+    usdt = S.trade_usdt
     if S.size_by_impact:
-        usdt = round(S.trade_usdt * _size_multiplier(int(item.impact)), 2)
+        usdt *= _size_multiplier(int(item.impact))
+    if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
+        usdt *= 0.5
+    usdt = round(usdt, 2)
     try:
-        return place_trade(symbol, side, usdt=usdt, source="auto", reason=getattr(item, "reason", ""))
+        return place_trade(symbol, side, usdt=usdt, source="auto",
+                           news_source=news_source, reason=getattr(item, "reason", ""))
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", symbol, e)
         return None
@@ -580,6 +724,7 @@ def get_performance() -> dict[str, Any]:
         "worst": round(min((c["pnl"] for c in scored), default=0.0), 2),
         "realized_today": realized_today,
         "by_source": _agg("source"),
+        "by_news_source": _agg("news_source"),
         "by_symbol": _agg("symbol"),
         "by_reason": _agg("close_reason"),
         "recent": list(reversed(closed[-30:])),

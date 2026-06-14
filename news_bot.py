@@ -1109,6 +1109,15 @@ class SettingsPatch(BaseModel):
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None
+    time_stop_min: int | None = None
+    breakeven_pct: float | None = None
+    partial_tp_pct: float | None = None
+    partial_tp_frac: float | None = None
+    max_open_risk_usdt: float | None = None
+    reduce_after_losses: int | None = None
+    suppress_losing_sources: bool | None = None
+    min_source_samples: int | None = None
+    skip_already_priced_pct: float | None = None
 
 
 @app.get("/settings")

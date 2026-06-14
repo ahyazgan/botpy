@@ -54,6 +54,15 @@ type Settings = {
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
+  time_stop_min: number;
+  breakeven_pct: number;
+  partial_tp_pct: number;
+  partial_tp_frac: number;
+  max_open_risk_usdt: number;
+  reduce_after_losses: number;
+  suppress_losing_sources: boolean;
+  min_source_samples: number;
+  skip_already_priced_pct: number;
   has_live_keys: boolean;
   open_exposure_usdt: number;
   realized_today: number;
@@ -70,6 +79,7 @@ type Performance = {
   worst: number;
   realized_today: number;
   by_source: Record<string, { count: number; pnl: number; wins: number }>;
+  by_news_source: Record<string, { count: number; pnl: number; wins: number }>;
   by_symbol: Record<string, { count: number; pnl: number; wins: number }>;
   recent: Array<{ symbol: string; side: string; pnl: number | null; pnl_pct: number | null; close_reason?: string; source: string }>;
   equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
@@ -584,6 +594,10 @@ export default function App() {
               <NumField label="Stop-loss %" value={settings.stop_loss_pct} onSave={(v) => patchSettings({ stop_loss_pct: v })} />
               <NumField label="Take-profit %" value={settings.take_profit_pct} onSave={(v) => patchSettings({ take_profit_pct: v })} />
               <NumField label="Trailing stop % (0=kapalı)" value={settings.trailing_stop_pct} onSave={(v) => patchSettings({ trailing_stop_pct: v })} />
+              <NumField label="Time-stop dk (0=kapalı)" value={settings.time_stop_min} onSave={(v) => patchSettings({ time_stop_min: v })} />
+              <NumField label="Breakeven % (0=kapalı)" value={settings.breakeven_pct} onSave={(v) => patchSettings({ breakeven_pct: v })} />
+              <NumField label="Kısmi TP % (0=kapalı)" value={settings.partial_tp_pct} onSave={(v) => patchSettings({ partial_tp_pct: v })} />
+              <NumField label="Kısmi TP oranı (0-1)" value={settings.partial_tp_frac} onSave={(v) => patchSettings({ partial_tp_frac: v })} />
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-amber-400/80">Risk limitleri</p>
@@ -591,6 +605,8 @@ export default function App() {
               <NumField label="Toplam maruziyet USDT" value={settings.max_total_exposure_usdt} onSave={(v) => patchSettings({ max_total_exposure_usdt: v })} />
               <NumField label="Coin başına maruziyet USDT" value={settings.max_per_coin_usdt} onSave={(v) => patchSettings({ max_per_coin_usdt: v })} />
               <NumField label="Max açık pozisyon" value={settings.max_positions} onSave={(v) => patchSettings({ max_positions: v })} />
+              <NumField label="Max açık risk USDT (0=kapalı)" value={settings.max_open_risk_usdt} onSave={(v) => patchSettings({ max_open_risk_usdt: v })} />
+              <NumField label="Kayıp serisi freni (0=kapalı)" value={settings.reduce_after_losses} onSave={(v) => patchSettings({ reduce_after_losses: v })} />
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-sky-400/80">Emir kalitesi</p>
@@ -605,6 +621,17 @@ export default function App() {
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
+              <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Sinyal kalitesi</p>
+              <NumField label="Zaten-fiyatlanmış atla % (0=kapalı)" value={settings.skip_already_priced_pct} onSave={(v) => patchSettings({ skip_already_priced_pct: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ suppress_losing_sources: !settings.suppress_losing_sources })}
+                title="Yeterli örnekte negatif beklentili haber kaynağını oto-işlemde sustur"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.suppress_losing_sources ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                Kaybeden kaynağı sustur: {settings.suppress_losing_sources ? "AÇIK" : "kapalı"}
+              </button>
+              <NumField label="Min. kaynak örneği" value={settings.min_source_samples} onSave={(v) => patchSettings({ min_source_samples: v })} />
             </div>
           </div>
         )}
@@ -970,9 +997,22 @@ export default function App() {
           )}
           {Object.keys(perf.by_source).length > 0 && (
             <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
-              <p className="mb-2 text-xs uppercase text-zinc-500">Kaynağa göre (hangisi kazandırıyor?)</p>
+              <p className="mb-2 text-xs uppercase text-zinc-500">İşlem türüne göre (oto/manuel)</p>
               <div className="flex flex-wrap gap-2">
                 {Object.entries(perf.by_source).map(([k, v]) => (
+                  <span key={k} className="rounded-lg border border-white/10 bg-zinc-800/60 px-2 py-1 text-xs text-zinc-300">
+                    {k}: <span className={v.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>{v.pnl >= 0 ? "+" : ""}{v.pnl}</span>
+                    <span className="text-zinc-500"> ({v.wins}/{v.count})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {Object.keys(perf.by_news_source).length > 0 && (
+            <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
+              <p className="mb-2 text-xs uppercase text-zinc-500">Haber kaynağına göre (hangi kaynak kazandırıyor?)</p>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(perf.by_news_source).filter(([k]) => k !== "?").map(([k, v]) => (
                   <span key={k} className="rounded-lg border border-white/10 bg-zinc-800/60 px-2 py-1 text-xs text-zinc-300">
                     {k}: <span className={v.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>{v.pnl >= 0 ? "+" : ""}{v.pnl}</span>
                     <span className="text-zinc-500"> ({v.wins}/{v.count})</span>

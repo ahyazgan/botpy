@@ -63,7 +63,7 @@ npm run preview
 1. **Kaynakları çek** (`fetch_all`): RSS feed'leri (`RSS_FEEDS`, feedparser) + Binance yeni listeleme duyuruları (catalogId=48). Biri patlarsa diğerleri devam eder.
 2. **Tekrar engelle**: `_seen_ids` ile yeni haberleri ayıkla. İlk tarama bildirimsiz **tohumlama** (`_primed`) — spam önler.
 3. **Puanla**: `USE_CLAUDE` (ANTHROPIC_API_KEY varsa) → `score_with_claude` (Claude `claude-haiku-4-5`, `messages.parse` + Pydantic `_ScoreBatch`, tüm yeni haberler **tek istekte**). Yoksa/başarısızsa → `score_item` (kural-tabanlı: `COIN_PATTERNS`, `IMPACT_KEYWORDS`, Binance ticker çıkarımı). Her haber: `coins`, `impact` (1-10), `direction` (bullish/bearish/neutral), `reason`.
-4. **Bildir** (`notify`): `impact >= ALERT_THRESHOLD` (7) olanlara winotify masaüstü bildirimi ("Habere git" butonuyla).
+4. **Bildir** (`notify`): `impact >= ALERT_THRESHOLD` (7) olanlara winotify masaüstü bildirimi ("Habere git" butonuyla) **+ uzak bildirim** (`notify_remote` → `notify.py`'deki `Notifier`, Telegram/Discord). Uzak kanal env tanımlıysa (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`/`DISCORD_WEBHOOK_URL`) otomatik etkin, yoksa sessiz; winotify kurulu olmasa da çalışır (bilgisayardan uzaktayken telefona sinyal). Oto-işlem **açılış** (`process_items`) ve **kapanış** (`_monitor_loop`, `monitor_positions` artık kapanan pozisyonları döndürür) olayları da uzak kanaldan bildirilir.
 
 **Fiyat teyidi** (`confirm_with_price`): güçlü haberler için Binance public API'den 24s/15dk fiyat hareketi + hacim çekilir. `confirmed` = haber yönü ile son hareket uyumlu **ve** likidite ≥ `MIN_VOLUME_USD`. "Zaten fiyatlanmış" (24s'te > `ALREADY_PRICED_PCT`) uyarısı verir.
 

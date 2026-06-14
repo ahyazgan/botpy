@@ -370,8 +370,13 @@ def get_positions() -> tuple[list[dict[str, Any]], float]:
 
 
 # ── Otomatik çıkış (SL/TP/trailing) ──────────────────────────────────────
-def monitor_positions() -> None:
-    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat."""
+def monitor_positions() -> list[dict[str, Any]]:
+    """Açık pozisyonları kontrol et; SL/TP/trailing tetiklenirse kapat.
+
+    Otomatik kapatılan pozisyonların listesini döndürür (boş olabilir) — çağıran
+    taraf bildirim atabilsin diye.
+    """
+    closed: list[dict[str, Any]] = []
     with _lock:
         snap = list(_positions)
     for p in snap:
@@ -414,9 +419,10 @@ def monitor_positions() -> None:
                 hit = "take-profit"
         if hit:
             try:
-                close_position(p["id"], reason=hit)
+                closed.append(close_position(p["id"], reason=hit))
             except Exception as e:
                 log.warning("Otomatik kapatma hatası (%s): %s", p["symbol"], e)
+    return closed
 
 
 # ── Otomatik işlem ───────────────────────────────────────────────────────

@@ -98,6 +98,8 @@ type SignalSpan = {
   last_ts: string | null;
 };
 
+type ArchivedSignal = NewsItem & { ts: string };
+
 type BacktestResult = {
   ok: boolean;
   mode?: "simple" | "grid" | "walk";
@@ -196,6 +198,8 @@ export default function App() {
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
+  const [archive, setArchive] = useState<ArchivedSignal[]>([]);
+  const [showArchive, setShowArchive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -220,7 +224,7 @@ export default function App() {
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
         fetch(`${API_BASE}/performance`),
-        fetch(`${API_BASE}/signals?limit=1`),
+        fetch(`${API_BASE}/signals?limit=50`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -237,6 +241,7 @@ export default function App() {
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
+        setArchive(sig.signals ?? []);
       }
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
@@ -497,7 +502,12 @@ export default function App() {
           <span className="text-zinc-700">|</span>
           <span>Görüntülenen: <strong className="text-zinc-300">{displayed.length}</strong></span>
           <span className="text-zinc-700">|</span>
-          <span title="Backtest için kalıcı arşivde biriken güçlü sinyal sayısı (restart'a dayanıklı)">
+          <button
+            type="button"
+            onClick={() => setShowArchive((v) => !v)}
+            title="Kalıcı arşivde biriken güçlü sinyaller (restart'a dayanıklı) — listeyi aç/kapat"
+            className="text-zinc-500 transition hover:text-zinc-300"
+          >
             Arşiv: <strong className="text-zinc-300">{signalSpan.count}</strong> sinyal
             {(() => {
               const d = spanDays(signalSpan.first_ts, signalSpan.last_ts);
@@ -505,7 +515,8 @@ export default function App() {
                 <span className="text-zinc-600"> · {d < 1 ? `${(d * 24).toFixed(0)} sa` : `${d.toFixed(1)} gün`}</span>
               ) : null;
             })()}
-          </span>
+            <span className="ml-1 text-zinc-600">{showArchive ? "▾" : "▸"}</span>
+          </button>
           {meta.updated_at && (
             <>
               <span className="text-zinc-700">|</span>
@@ -914,6 +925,53 @@ export default function App() {
           )}
         </div>
       </section>
+
+      {/* Sinyal arşivi tarayıcısı */}
+      {showArchive && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <h2 className="mb-3 text-lg font-semibold text-white">
+            Sinyal arşivi <span className="ml-2 text-sm font-normal text-zinc-500">(son {archive.length} / {signalSpan.count})</span>
+          </h2>
+          {archive.length === 0 ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">
+              Henüz arşivlenmiş sinyal yok — motor güçlü haber yakaladıkça burada birikir.
+            </p>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[680px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                      <th className="px-4 py-3">Zaman</th>
+                      <th className="px-4 py-3">Güç</th>
+                      <th className="px-4 py-3">Yön</th>
+                      <th className="px-4 py-3">Coin</th>
+                      <th className="px-4 py-3">Kaynak</th>
+                      <th className="px-4 py-3">Teyit</th>
+                      <th className="px-4 py-3">Başlık</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {archive.map((s) => (
+                      <tr key={s.id} className="border-b border-white/5 hover:bg-white/[0.03]">
+                        <td className="px-4 py-3 whitespace-nowrap text-xs text-zinc-500">{timeAgo(s.published ?? s.fetched_at ?? s.ts)}</td>
+                        <td className="px-4 py-3"><ImpactBadge impact={s.impact} direction={s.direction} /></td>
+                        <td className="px-4 py-3 whitespace-nowrap text-xs">{DIR_LABEL[s.direction]}</td>
+                        <td className="px-4 py-3 text-xs font-semibold text-zinc-300">{s.coins.length ? s.coins.join(", ") : "—"}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{s.source}</td>
+                        <td className="px-4 py-3 text-xs">{s.confirmed ? <span className="text-emerald-400">✅</span> : <span className="text-zinc-600">⏳</span>}</td>
+                        <td className="px-4 py-3 max-w-md truncate text-xs text-zinc-400" title={s.title}>
+                          {s.url ? <a href={s.url} target="_blank" rel="noreferrer" className="hover:text-emerald-300">{s.title}</a> : s.title}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }

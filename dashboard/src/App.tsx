@@ -106,6 +106,43 @@ type NewsSettings = {
   remote_channels_available: boolean;
 };
 
+type Risk = {
+  open_positions: number;
+  max_positions: number;
+  total_exposure_usdt: number;
+  max_total_exposure_usdt: number;
+  per_coin_exposure: Record<string, number>;
+  max_per_coin_usdt: number;
+  realized_today: number;
+  daily_loss_limit_usdt: number;
+  trading_halted: boolean;
+  paper_trading: boolean;
+  auto_trade: boolean;
+};
+
+type Health = {
+  ok: boolean;
+  uptime_sec: number;
+  scorer: string;
+  treenews: boolean;
+  signals_archived: number | null;
+  updated_at: string | null;
+};
+
+type ClosedTrade = {
+  closed_at: string | null;
+  symbol: string;
+  side: string;
+  mode: string;
+  usdt: number;
+  entry_price: number;
+  close_price: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  close_reason?: string;
+  source: string;
+};
+
 type BacktestResult = {
   ok: boolean;
   mode?: "simple" | "grid" | "walk";
@@ -143,6 +180,31 @@ function timeAgo(iso: string | null): string {
   const hr = Math.floor(min / 60);
   if (hr < 24) return `${hr} sa önce`;
   return `${Math.floor(hr / 24)} gün önce`;
+}
+
+function fmtUptime(sec: number): string {
+  if (sec < 60) return `${sec}sn`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}dk`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}sa ${m % 60}dk`;
+  return `${Math.floor(h / 24)}g ${h % 24}sa`;
+}
+
+function RiskMeter({ label, used, cap, suffix = "USDT" }: { label: string; used: number; cap: number; suffix?: string }) {
+  const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+  const color = pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
+  return (
+    <div className="rounded-xl border border-white/10 bg-zinc-900/40 p-3">
+      <div className="flex items-baseline justify-between text-xs">
+        <span className="uppercase text-zinc-500">{label}</span>
+        <span className="tabular-nums text-zinc-300">{used.toLocaleString()} / {cap > 0 ? `${cap.toLocaleString()} ${suffix}` : "∞"}</span>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+        <div className={`h-full ${color}`} style={{ width: `${cap > 0 ? pct : 0}%` }} />
+      </div>
+    </div>
+  );
 }
 
 function spanDays(first: string | null, last: string | null): number | null {
@@ -207,6 +269,10 @@ export default function App() {
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
   const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
+  const [risk, setRisk] = useState<Risk | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [closed, setClosed] = useState<ClosedTrade[]>([]);
+  const [showJournal, setShowJournal] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -226,13 +292,16 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
         fetch(`${API_BASE}/performance`),
         fetch(`${API_BASE}/signals?limit=50`),
         fetch(`${API_BASE}/news-settings`),
+        fetch(`${API_BASE}/risk`),
+        fetch(`${API_BASE}/health`),
+        fetch(`${API_BASE}/trades/closed?limit=100`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -252,6 +321,9 @@ export default function App() {
         setArchive(sig.signals ?? []);
       }
       if (nsRes.ok) setNewsSettings(await nsRes.json());
+      if (riskRes.ok) setRisk(await riskRes.json());
+      if (healthRes.ok) setHealth(await healthRes.json());
+      if (closedRes.ok) setClosed((await closedRes.json()).trades ?? []);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
     } finally {
@@ -580,6 +652,16 @@ export default function App() {
               <span>Son tarama: <time className="text-zinc-400">{timeAgo(meta.updated_at)}</time></span>
             </>
           )}
+          {health && (
+            <>
+              <span className="text-zinc-700">|</span>
+              <span title="Motor sağlığı / uptime / puanlayıcı / kaynak">
+                <span className={health.ok ? "text-emerald-400" : "text-red-400"}>●</span>{" "}
+                {fmtUptime(health.uptime_sec)} · {health.scorer === "claude" ? "Claude" : "kural"}
+                {health.treenews ? " · TreeNews" : ""}
+              </span>
+            </>
+          )}
         </div>
 
         {err && (
@@ -777,6 +859,48 @@ export default function App() {
               </table>
             </div>
           </div>
+        </section>
+      )}
+
+      {/* Risk / maruziyet */}
+      {risk && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-white">Risk &amp; maruziyet</h2>
+            {risk.trading_halted && (
+              <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200">
+                ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <RiskMeter label="Toplam maruziyet" used={risk.total_exposure_usdt} cap={risk.max_total_exposure_usdt} />
+            <RiskMeter label="Açık pozisyon" used={risk.open_positions} cap={risk.max_positions} suffix="adet" />
+            <div className="rounded-xl border border-white/10 bg-zinc-900/40 p-3">
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="uppercase text-zinc-500">Bugünkü P&L / limit</span>
+                <span className={`tabular-nums ${risk.realized_today >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                  {risk.realized_today >= 0 ? "+" : ""}{risk.realized_today} / -{risk.daily_loss_limit_usdt || "∞"}
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+                <div
+                  className="h-full bg-red-500"
+                  style={{ width: `${risk.daily_loss_limit_usdt > 0 && risk.realized_today < 0 ? Math.min(100, (-risk.realized_today / risk.daily_loss_limit_usdt) * 100) : 0}%` }}
+                />
+              </div>
+            </div>
+          </div>
+          {Object.keys(risk.per_coin_exposure).length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {Object.entries(risk.per_coin_exposure).map(([sym, v]) => (
+                <span key={sym} className="rounded-lg border border-white/10 bg-zinc-800/60 px-2 py-1 text-xs text-zinc-300">
+                  {sym}: <span className="tabular-nums">{v}</span>
+                  {risk.max_per_coin_usdt > 0 && <span className="text-zinc-600"> / {risk.max_per_coin_usdt}</span>}
+                </span>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
@@ -981,6 +1105,70 @@ export default function App() {
             </div>
           )}
         </div>
+      </section>
+
+      {/* İşlem günlüğü (kapanan işlemler + CSV) */}
+      <section className="mx-auto mt-10 max-w-5xl">
+        <div className="mb-3 flex items-center justify-between">
+          <button
+            type="button"
+            onClick={() => setShowJournal((v) => !v)}
+            className="text-lg font-semibold text-white transition hover:text-zinc-300"
+          >
+            İşlem günlüğü <span className="ml-1 text-sm font-normal text-zinc-500">({closed.length}) {showJournal ? "▾" : "▸"}</span>
+          </button>
+          <a
+            href={`${API_BASE}/trades/closed.csv`}
+            className="rounded-lg border border-zinc-700 bg-zinc-800/80 px-3 py-1.5 text-xs font-semibold text-zinc-300 transition hover:border-emerald-500/40 hover:text-emerald-300"
+          >
+            ⬇ CSV indir
+          </a>
+        </div>
+        {showJournal && (
+          closed.length === 0 ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Henüz kapanmış işlem yok.</p>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[680px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                      <th className="px-4 py-3">Kapanış</th>
+                      <th className="px-4 py-3">Coin</th>
+                      <th className="px-4 py-3">Yön</th>
+                      <th className="px-4 py-3">Mod</th>
+                      <th className="px-4 py-3">Tutar</th>
+                      <th className="px-4 py-3">Sebep</th>
+                      <th className="px-4 py-3">P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {closed.map((t, i) => (
+                      <tr key={`${t.symbol}-${t.closed_at}-${i}`} className="border-b border-white/5 hover:bg-white/[0.03]">
+                        <td className="px-4 py-3 whitespace-nowrap text-xs text-zinc-500">{timeAgo(t.closed_at)}</td>
+                        <td className="px-4 py-3 font-semibold text-zinc-200">{t.symbol}</td>
+                        <td className="px-4 py-3 text-xs">
+                          <span className={t.side === "long" ? "text-emerald-300" : "text-red-300"}>{t.side === "long" ? "LONG" : "SHORT"}</span>
+                        </td>
+                        <td className="px-4 py-3 text-xs"><span className={t.mode === "live" ? "text-red-300" : "text-emerald-300"}>{t.mode === "live" ? "CANLI" : "paper"}{t.source === "auto" ? " · oto" : ""}</span></td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-400">${t.usdt}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{t.close_reason ?? "—"}</td>
+                        <td className="px-4 py-3 tabular-nums">
+                          {t.pnl === null ? <span className="text-zinc-500">—</span> : (
+                            <span className={t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>
+                              {t.pnl >= 0 ? "+" : ""}{t.pnl} USDT
+                              {t.pnl_pct !== null && <span className="ml-1 text-xs opacity-70">({t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct}%)</span>}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )
+        )}
       </section>
 
       {/* Sinyal arşivi tarayıcısı */}

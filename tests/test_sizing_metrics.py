@@ -38,13 +38,16 @@ def auto_env(monkeypatch):
     trader.S.trade_usdt = 100.0
     captured = {}
 
-    def fake_place(symbol, side, usdt=None, source="manual", reason=""):
+    def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source=""):
         captured["usdt"] = usdt
         captured["side"] = side
         return {"id": "x", "symbol": symbol, "side": side, "usdt": usdt, "mode": "paper"}
 
     monkeypatch.setattr(trader, "place_trade", fake_place)
     monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
+    trader.S.reduce_after_losses = 0
+    trader.S.suppress_losing_sources = False
+    trader.S.skip_already_priced_pct = 0.0
     yield captured
     trader.S.auto_trade = False
     trader.S.size_by_impact = False
@@ -53,7 +56,7 @@ def auto_env(monkeypatch):
 def test_auto_trade_fixed_size_by_default(auto_env):
     trader.S.size_by_impact = False
     trader.maybe_auto_trade(_Item(impact=10))
-    assert auto_env["usdt"] is None          # taban trade_usdt kullanılır
+    assert auto_env["usdt"] == 100.0         # taban trade_usdt (artık explicit)
 
 
 def test_auto_trade_conviction_size(auto_env):

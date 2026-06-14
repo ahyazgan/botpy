@@ -124,7 +124,7 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
 
     outcome, gross = "timeout", 0.0
     for c in candles[1:]:
-        high = float(c[2]); low = float(c[3])
+        high, low = float(c[2]), float(c[3])
         if is_long:
             hit_sl = low <= sl
             hit_tp = high >= tp
@@ -132,11 +132,14 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
             hit_sl = high >= sl
             hit_tp = low <= tp
         if hit_sl and hit_tp:          # aynı mum: kötümser (SL önce)
-            outcome, gross = "sl", -sl_pct; break
+            outcome, gross = "sl", -sl_pct
+            break
         if hit_sl:
-            outcome, gross = "sl", -sl_pct; break
+            outcome, gross = "sl", -sl_pct
+            break
         if hit_tp:
-            outcome, gross = "tp", tp_pct; break
+            outcome, gross = "tp", tp_pct
+            break
     if outcome == "timeout":
         last = float(candles[-1][4])
         move = (last - entry) / entry * 100

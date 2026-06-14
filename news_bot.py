@@ -454,7 +454,7 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
     if k.status_code == 200:
         candles = k.json()
         if candles:
-            o = float(candles[0][1]); c = float(candles[-1][4])
+            o, c = float(candles[0][1]), float(candles[-1][4])
             if o:
                 move15 = (c - o) / o * 100
     return {

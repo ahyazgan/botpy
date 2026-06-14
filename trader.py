@@ -154,7 +154,7 @@ def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | 
     avail = sum(float(p) * float(q) for p, q in levels)
     remaining, cost, qty = usdt, 0.0, 0.0
     for p, q in levels:
-        p = float(p); q = float(q)
+        p, q = float(p), float(q)
         take = min(remaining, p * q)
         if p > 0:
             qty += take / p
@@ -395,12 +395,14 @@ def monitor_positions() -> list[dict[str, Any]]:
                 p["high_water"] = cur
                 new_sl = round(cur * (1 - tr / 100), 8)
                 if p.get("sl_price") is None or new_sl > p["sl_price"]:
-                    p["sl_price"] = new_sl; changed = True
+                    p["sl_price"] = new_sl
+                    changed = True
             elif not is_long and cur < p.get("high_water", cur):
                 p["high_water"] = cur
                 new_sl = round(cur * (1 + tr / 100), 8)
                 if p.get("sl_price") is None or new_sl < p["sl_price"]:
-                    p["sl_price"] = new_sl; changed = True
+                    p["sl_price"] = new_sl
+                    changed = True
             if changed:
                 with _lock:
                     _save_state()

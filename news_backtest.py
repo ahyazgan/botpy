@@ -180,17 +180,31 @@ SL_GRID = (1.5, 2, 3, 4, 5)
 TP_GRID = (2, 3, 5, 6, 8, 10)
 
 
-def _best_params(signals: list[dict], fee: float, usdt: float, min_trades: int):
-    """Verilen sinyallerde en kârlı (SL, TP) kombinasyonunu ara (in-sample)."""
-    best = None
+def grid_search(signals: list[dict], fee: float, usdt: float, min_trades: int = 1) -> list[dict]:
+    """SL_GRID × TP_GRID üzerinde backtest koş; P&L'e göre azalan sırala.
+
+    Her satır: {sl, tp, n, win_rate, avg_net_pct, total_pnl_usdt}. Sinyaller
+    önceden prefetch edilmiş olmalı (klines tekrar tekrar çekilmez).
+    """
+    rows: list[dict] = []
     for sl in SL_GRID:
         for tp in TP_GRID:
             s = run(signals, sl, tp, fee, usdt, False)
             if s.get("n", 0) < min_trades:
                 continue
-            if best is None or s["total_pnl_usdt"] > best[2]["total_pnl_usdt"]:
-                best = (sl, tp, s)
-    return best
+            rows.append({"sl": sl, "tp": tp, "n": s["n"], "win_rate": s["win_rate"],
+                         "avg_net_pct": s["avg_net_pct"], "total_pnl_usdt": s["total_pnl_usdt"]})
+    rows.sort(key=lambda r: r["total_pnl_usdt"], reverse=True)
+    return rows
+
+
+def _best_params(signals: list[dict], fee: float, usdt: float, min_trades: int):
+    """Verilen sinyallerde en kârlı (SL, TP) kombinasyonunu ara (in-sample)."""
+    rows = grid_search(signals, fee, usdt, min_trades)
+    if not rows:
+        return None
+    best = rows[0]
+    return best["sl"], best["tp"], run(signals, best["sl"], best["tp"], fee, usdt, False)
 
 
 def walk_forward(
@@ -294,17 +308,12 @@ def main() -> None:
     if args.grid:
         print("\nGrid search (komisyon %{:.1f} dahil, {:.0f}s pencere):".format(args.fee, args.hours))
         print(f"{'SL%':>5}{'TP%':>5}{'n':>5}{'kazanma%':>10}{'ort.net%':>10}{'P&L USDT':>10}")
-        best = None
-        for sl in SL_GRID:
-            for tp in TP_GRID:
-                s = run(signals, sl, tp, args.fee, args.usdt, False)
-                if s["n"] == 0:
-                    continue
-                print(f"{sl:>5}{tp:>5}{s['n']:>5}{s['win_rate']:>10}{s['avg_net_pct']:>10}{s['total_pnl_usdt']:>10}")
-                if best is None or s["total_pnl_usdt"] > best[1]:
-                    best = ((sl, tp), s["total_pnl_usdt"])
-        if best:
-            print(f"\n>>> En kârlı: SL={best[0][0]}% TP={best[0][1]}% → {best[1]:+.2f} USDT")
+        rows = grid_search(signals, args.fee, args.usdt)
+        for r in rows:
+            print(f"{r['sl']:>5}{r['tp']:>5}{r['n']:>5}{r['win_rate']:>10}{r['avg_net_pct']:>10}{r['total_pnl_usdt']:>10}")
+        if rows:
+            b = rows[0]
+            print(f"\n>>> En kârlı: SL={b['sl']}% TP={b['tp']}% → {b['total_pnl_usdt']:+.2f} USDT")
         return
 
     print(f"\nBacktest: SL={args.sl}% TP={args.tp}% pencere={args.hours}s komisyon=%{args.fee}\n")

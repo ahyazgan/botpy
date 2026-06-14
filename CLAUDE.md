@@ -69,7 +69,7 @@ npm run preview
 
 **Sinyal arşivi** (`_archive_signal` → `storage.add_signal`): güçlü haberler (canlı, tohumlama değil) `news_signals` tablosuna kalıcı yazılır (id ile dedupe, restart'a dayanıklı). `Store` lazy açılır (`get_store`, `BOTPY_DB` yolu); import'ta dosya yaratma yan etkisi yok. `news_backtest.py --db` bu arşivi motor çalışmadan okur.
 
-**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/signals?limit=&min_impact=` (kalıcı arşiv + kapsam), `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
+**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/signals?limit=&min_impact=` (kalıcı arşiv + kapsam), `/backtest?sl=&tp=&fee=&usdt=&hours=&min_impact=&limit=&mode=&train_frac=` (arşiv üzerinde `news_backtest` fonksiyonlarını koşar — Binance klines indirir, senkron/threadpool; `mode`: `simple`/`grid` (`grid_search`, en kârlı SL/TP)/`walk` (walk-forward)), `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
 
 ### `trader.py` — Binance İşlem Modülü (AKTİF, profesyonel)
 
@@ -124,7 +124,7 @@ Strateji: `YES_ask + NO_ask < (1 - MIN_PROFIT)` → iki tarafı da al; `YES_bid 
 
 ### `dashboard/` — React Panel (AKTİF — haber radarı)
 
-`src/App.tsx` `news_bot.py`'ye bağlanır (15s polling, `/news` + `/settings` + `/positions` + `/performance` + `/signals`). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". Footer'da **arşiv kapsam göstergesi** (`/signals` span'ı: biriken sinyal sayısı + gün/saat aralığı — backtest için ne kadar veri olduğunu gösterir). `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
+`src/App.tsx` `news_bot.py`'ye bağlanır (15s polling, `/news` + `/settings` + `/positions` + `/performance` + `/signals`). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". Footer'da **arşiv kapsam göstergesi** (`/signals` span'ı: biriken sinyal sayısı + gün/saat aralığı). **Backtest paneli** (`/backtest`, talep üzerine — 15s polling'e dahil değil): SL/TP gir + mod seçici (Basit / Grid / Walk-forward) + "Çalıştır". Basit: kazanma oranı/TP-SL-timeout/P&L; Grid: tüm SL/TP kombinasyonları P&L'e göre sıralı tablo (en kârlı vurgulu); Walk-forward: in/out-sample + karar + zayıflama. `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
 
 ### `api.py` — CORS Proxy (eski)
 

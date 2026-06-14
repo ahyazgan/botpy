@@ -97,6 +97,32 @@ type SignalSpan = {
   last_ts: string | null;
 };
 
+type BacktestResult = {
+  ok: boolean;
+  mode?: "simple" | "grid" | "walk";
+  reason?: string;
+  n?: number;
+  tested?: number;
+  candidates?: number;
+  win_rate?: number;
+  tp?: number;
+  sl?: number;
+  timeout?: number;
+  avg_net_pct?: number;
+  total_pnl_usdt?: number;
+  // walk-forward
+  params?: { sl: number; tp: number };
+  in_sample?: { n: number; win_rate: number; avg_net_pct: number };
+  out_of_sample?: { n: number; win_rate: number; avg_net_pct: number };
+  degradation?: number | null;
+  verdict?: string;
+  // grid
+  rows?: Array<{ sl: number; tp: number; n: number; win_rate: number; avg_net_pct: number; total_pnl_usdt: number }>;
+  best?: { sl: number; tp: number; total_pnl_usdt: number } | null;
+};
+
+type BacktestMode = "simple" | "grid" | "walk";
+
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
   const then = new Date(iso).getTime();
@@ -177,6 +203,13 @@ export default function App() {
   const [minImpact, setMinImpact] = useState(0);
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
+  const [btSl, setBtSl] = useState(3);
+  const [btTp, setBtTp] = useState(6);
+  const [btMode, setBtMode] = useState<BacktestMode>("simple");
+  const [btResult, setBtResult] = useState<BacktestResult | null>(null);
+  const [btRunning, setBtRunning] = useState(false);
 
   const load = useCallback(async () => {
     setErr(null);
@@ -264,6 +297,26 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Kapatılamadı");
     } finally {
       setBusy(null);
+    }
+  };
+
+  const runBacktest = async () => {
+    setBtRunning(true);
+    setBtResult(null);
+    try {
+      const qs = new URLSearchParams({
+        sl: String(btSl),
+        tp: String(btTp),
+        mode: btMode,
+        min_impact: String(meta.alert_threshold),
+      });
+      const r = await fetch(`${API_BASE}/backtest?${qs.toString()}`);
+      if (!r.ok) throw new Error(`backtest ${r.status}`);
+      setBtResult(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Backtest hatası");
+    } finally {
+      setBtRunning(false);
     }
   };
 
@@ -701,6 +754,164 @@ export default function App() {
           )}
         </section>
       )}
+
+      {/* Backtest / Walk-forward */}
+      <section className="mx-auto mt-10 max-w-5xl">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-white">
+            Backtest <span className="ml-2 text-sm font-normal text-zinc-500">(arşivdeki güç ≥ {meta.alert_threshold} sinyaller)</span>
+          </h2>
+          <span className="text-xs text-zinc-500">{signalSpan.count} arşiv sinyali</span>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 shadow-xl backdrop-blur">
+          <div className="flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1 text-xs text-zinc-400">
+              <span>Stop-loss %</span>
+              <input
+                type="number" value={btSl} step={0.5} min={0.5} disabled={btMode !== "simple"}
+                onChange={(e) => setBtSl(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-zinc-400">
+              <span>Take-profit %</span>
+              <input
+                type="number" value={btTp} step={0.5} min={0.5} disabled={btMode !== "simple"}
+                onChange={(e) => setBtTp(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
+              />
+            </label>
+            <div className="flex flex-col gap-1 text-xs text-zinc-400">
+              <span>Mod</span>
+              <div className="flex overflow-hidden rounded-lg border border-zinc-700">
+                {([["simple", "Basit"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setBtMode(m)}
+                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : "Tek SL/TP ile backtest"}
+                    className={`h-9 px-3 text-sm font-semibold transition ${
+                      btMode === m ? "bg-emerald-900/50 text-emerald-200" : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void runBacktest()}
+              disabled={btRunning}
+              className="h-9 rounded-lg border border-emerald-500/40 bg-emerald-900/40 px-4 text-sm font-bold text-emerald-200 transition hover:bg-emerald-900/60 disabled:opacity-40"
+            >
+              {btRunning ? "Çalışıyor…" : "Çalıştır"}
+            </button>
+            <span className="text-xs text-zinc-600">Binance'ten fiyat indirir, birkaç saniye sürebilir.</span>
+          </div>
+
+          {btResult && (
+            <div className="mt-4 border-t border-white/10 pt-4">
+              {!btResult.ok ? (
+                <p className="text-sm text-amber-300">{btResult.reason ?? "Sonuç yok"}</p>
+              ) : btResult.mode === "grid" ? (
+                <div className="space-y-3">
+                  {btResult.best && (
+                    <p className="text-sm text-zinc-300">
+                      En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
+                      <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
+                      <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                    </p>
+                  )}
+                  <div className="overflow-x-auto rounded-lg border border-white/10">
+                    <table className="w-full min-w-[420px] text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                          <th className="px-3 py-2">SL %</th>
+                          <th className="px-3 py-2">TP %</th>
+                          <th className="px-3 py-2">n</th>
+                          <th className="px-3 py-2">Kazanma</th>
+                          <th className="px-3 py-2">Ort. net %</th>
+                          <th className="px-3 py-2">P&L USDT</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(btResult.rows ?? []).map((r, i) => (
+                          <tr key={`${r.sl}-${r.tp}`} className={`border-b border-white/5 ${i === 0 ? "bg-emerald-950/30" : "hover:bg-white/[0.03]"}`}>
+                            <td className="px-3 py-2 tabular-nums text-zinc-300">{r.sl}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-300">{r.tp}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">{r.n}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">%{r.win_rate}</td>
+                            <td className="px-3 py-2 tabular-nums text-zinc-400">{r.avg_net_pct}</td>
+                            <td className={`px-3 py-2 tabular-nums font-semibold ${r.total_pnl_usdt >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                              {r.total_pnl_usdt >= 0 ? "+" : ""}{r.total_pnl_usdt.toFixed(2)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : btResult.mode === "walk" ? (
+                <div className="space-y-3">
+                  {btResult.in_sample ? (
+                    <>
+                      <p className="text-sm text-zinc-300">
+                        En iyi (in-sample): <strong className="text-emerald-300">SL {btResult.params?.sl}% · TP {btResult.params?.tp}%</strong>
+                        <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                      </p>
+                      <div className="grid grid-cols-2 gap-3 text-sm">
+                        <div className="rounded-lg bg-zinc-800/50 p-3">
+                          <p className="text-xs uppercase text-zinc-500">In-sample (eğitim)</p>
+                          <p className="mt-1 text-zinc-300">n={btResult.in_sample.n} · kazanma %{btResult.in_sample.win_rate} · ort.net %{btResult.in_sample.avg_net_pct}</p>
+                        </div>
+                        <div className="rounded-lg bg-zinc-800/50 p-3">
+                          <p className="text-xs uppercase text-zinc-500">Out-of-sample (test)</p>
+                          <p className="mt-1 text-zinc-300">
+                            {btResult.out_of_sample && btResult.out_of_sample.n > 0
+                              ? `n=${btResult.out_of_sample.n} · kazanma %${btResult.out_of_sample.win_rate} · ort.net %${btResult.out_of_sample.avg_net_pct}`
+                              : "işlem yok"}
+                          </p>
+                        </div>
+                      </div>
+                      <p className="text-sm">
+                        <span className="text-zinc-500">Karar: </span>
+                        <span className="font-semibold text-amber-300">{btResult.verdict}</span>
+                        {btResult.degradation != null && (
+                          <span className="ml-2 text-zinc-500">(zayıflama %{Math.round(btResult.degradation * 100)})</span>
+                        )}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-sm text-amber-300">{btResult.reason ?? "in-sample'da yeterli işlem yok"}</p>
+                  )}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                  <Stat label="Sinyal" value={String(btResult.n ?? 0)} />
+                  <Stat label="Kazanma" value={`%${btResult.win_rate ?? 0}`} />
+                  <Stat label="TP / SL / timeout" value={`${btResult.tp ?? 0} / ${btResult.sl ?? 0} / ${btResult.timeout ?? 0}`} />
+                  <Stat
+                    label="Toplam P&L"
+                    value={`${(btResult.total_pnl_usdt ?? 0) >= 0 ? "+" : ""}${(btResult.total_pnl_usdt ?? 0).toFixed(2)} USDT`}
+                    accent={(btResult.total_pnl_usdt ?? 0) >= 0 ? "pos" : "neg"}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Stat({ label, value, accent }: { label: string; value: string; accent?: "pos" | "neg" }) {
+  const color = accent === "pos" ? "text-emerald-400" : accent === "neg" ? "text-red-400" : "text-zinc-200";
+  return (
+    <div className="rounded-lg bg-zinc-800/50 p-3">
+      <p className="text-xs uppercase text-zinc-500">{label}</p>
+      <p className={`mt-1 font-semibold tabular-nums ${color}`}>{value}</p>
     </div>
   );
 }

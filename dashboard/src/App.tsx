@@ -71,6 +71,7 @@ type Performance = {
   by_source: Record<string, { count: number; pnl: number; wins: number }>;
   by_symbol: Record<string, { count: number; pnl: number; wins: number }>;
   recent: Array<{ symbol: string; side: string; pnl: number | null; pnl_pct: number | null; close_reason?: string; source: string }>;
+  equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
 };
 
 type Position = {
@@ -95,6 +96,14 @@ type SignalSpan = {
   count: number;
   first_ts: string | null;
   last_ts: string | null;
+};
+
+type ArchivedSignal = NewsItem & { ts: string };
+
+type NewsSettings = {
+  alert_threshold: number;
+  remote_notify: boolean;
+  remote_channels_available: boolean;
 };
 
 type BacktestResult = {
@@ -195,6 +204,9 @@ export default function App() {
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
+  const [archive, setArchive] = useState<ArchivedSignal[]>([]);
+  const [showArchive, setShowArchive] = useState(false);
+  const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -214,12 +226,13 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
         fetch(`${API_BASE}/performance`),
-        fetch(`${API_BASE}/signals?limit=1`),
+        fetch(`${API_BASE}/signals?limit=50`),
+        fetch(`${API_BASE}/news-settings`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -236,7 +249,9 @@ export default function App() {
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
+        setArchive(sig.signals ?? []);
       }
+      if (nsRes.ok) setNewsSettings(await nsRes.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
     } finally {
@@ -264,6 +279,22 @@ export default function App() {
       setSettings(await r.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Ayar değişmedi");
+    }
+  };
+
+  const patchNewsSettings = async (patch: Partial<NewsSettings>) => {
+    try {
+      const r = await fetch(`${API_BASE}/news-settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      const ns: NewsSettings = await r.json();
+      setNewsSettings(ns);
+      setMeta((m) => ({ ...m, alert_threshold: ns.alert_threshold }));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Haber ayarı değişmedi");
     }
   };
 
@@ -491,12 +522,49 @@ export default function App() {
           </div>
         )}
 
+        {/* Haber ayarları (uyarı eşiği + uzak bildirim) */}
+        {newsSettings && (
+          <div className="mt-3 flex flex-wrap items-center gap-4 rounded-2xl border border-white/10 bg-zinc-900/60 p-3 text-sm">
+            <label className="flex items-center gap-2 text-zinc-400">
+              <span>Uyarı eşiği</span>
+              <input
+                type="range" min={1} max={10} value={newsSettings.alert_threshold}
+                onChange={(e) => void patchNewsSettings({ alert_threshold: Number(e.target.value) })}
+                className="accent-amber-500"
+              />
+              <span className="w-6 text-center font-semibold tabular-nums text-amber-300">{newsSettings.alert_threshold}</span>
+            </label>
+            <button
+              type="button"
+              disabled={!newsSettings.remote_channels_available}
+              onClick={() => void patchNewsSettings({ remote_notify: !newsSettings.remote_notify })}
+              title={newsSettings.remote_channels_available
+                ? "Telegram/Discord'a güçlü haber + işlem bildirimi gönder"
+                : "Uzak kanal yok — .env'de TELEGRAM_BOT_TOKEN/CHAT_ID veya DISCORD_WEBHOOK_URL tanımla"}
+              className={`h-8 rounded-lg border px-3 text-xs font-semibold transition disabled:opacity-40 ${
+                newsSettings.remote_notify && newsSettings.remote_channels_available
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-400"
+              }`}
+            >
+              {newsSettings.remote_channels_available
+                ? `📲 Uzak bildirim ${newsSettings.remote_notify ? "açık" : "kapalı"}`
+                : "📲 Uzak bildirim (env yok)"}
+            </button>
+          </div>
+        )}
+
         <div className="mt-4 flex flex-wrap gap-4 text-sm text-zinc-500">
           <span>Taranan: <strong className="text-zinc-300">{meta.total_seen}</strong></span>
           <span className="text-zinc-700">|</span>
           <span>Görüntülenen: <strong className="text-zinc-300">{displayed.length}</strong></span>
           <span className="text-zinc-700">|</span>
-          <span title="Backtest için kalıcı arşivde biriken güçlü sinyal sayısı (restart'a dayanıklı)">
+          <button
+            type="button"
+            onClick={() => setShowArchive((v) => !v)}
+            title="Kalıcı arşivde biriken güçlü sinyaller (restart'a dayanıklı) — listeyi aç/kapat"
+            className="text-zinc-500 transition hover:text-zinc-300"
+          >
             Arşiv: <strong className="text-zinc-300">{signalSpan.count}</strong> sinyal
             {(() => {
               const d = spanDays(signalSpan.first_ts, signalSpan.last_ts);
@@ -504,7 +572,8 @@ export default function App() {
                 <span className="text-zinc-600"> · {d < 1 ? `${(d * 24).toFixed(0)} sa` : `${d.toFixed(1)} gün`}</span>
               ) : null;
             })()}
-          </span>
+            <span className="ml-1 text-zinc-600">{showArchive ? "▾" : "▸"}</span>
+          </button>
           {meta.updated_at && (
             <>
               <span className="text-zinc-700">|</span>
@@ -739,6 +808,17 @@ export default function App() {
               </p>
             </div>
           </div>
+          {perf.equity.length >= 2 && (
+            <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-xs uppercase text-zinc-500">Kümülatif P&L eğrisi ({perf.equity.length} işlem)</p>
+                <p className={`text-sm font-semibold tabular-nums ${perf.total_pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                  {perf.total_pnl >= 0 ? "+" : ""}{perf.total_pnl} USDT
+                </p>
+              </div>
+              <EquityChart points={perf.equity} />
+            </div>
+          )}
           {Object.keys(perf.by_source).length > 0 && (
             <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
               <p className="mb-2 text-xs uppercase text-zinc-500">Kaynağa göre (hangisi kazandırıyor?)</p>
@@ -902,7 +982,79 @@ export default function App() {
           )}
         </div>
       </section>
+
+      {/* Sinyal arşivi tarayıcısı */}
+      {showArchive && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <h2 className="mb-3 text-lg font-semibold text-white">
+            Sinyal arşivi <span className="ml-2 text-sm font-normal text-zinc-500">(son {archive.length} / {signalSpan.count})</span>
+          </h2>
+          {archive.length === 0 ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">
+              Henüz arşivlenmiş sinyal yok — motor güçlü haber yakaladıkça burada birikir.
+            </p>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[680px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                      <th className="px-4 py-3">Zaman</th>
+                      <th className="px-4 py-3">Güç</th>
+                      <th className="px-4 py-3">Yön</th>
+                      <th className="px-4 py-3">Coin</th>
+                      <th className="px-4 py-3">Kaynak</th>
+                      <th className="px-4 py-3">Teyit</th>
+                      <th className="px-4 py-3">Başlık</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {archive.map((s) => (
+                      <tr key={s.id} className="border-b border-white/5 hover:bg-white/[0.03]">
+                        <td className="px-4 py-3 whitespace-nowrap text-xs text-zinc-500">{timeAgo(s.published ?? s.fetched_at ?? s.ts)}</td>
+                        <td className="px-4 py-3"><ImpactBadge impact={s.impact} direction={s.direction} /></td>
+                        <td className="px-4 py-3 whitespace-nowrap text-xs">{DIR_LABEL[s.direction]}</td>
+                        <td className="px-4 py-3 text-xs font-semibold text-zinc-300">{s.coins.length ? s.coins.join(", ") : "—"}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{s.source}</td>
+                        <td className="px-4 py-3 text-xs">{s.confirmed ? <span className="text-emerald-400">✅</span> : <span className="text-zinc-600">⏳</span>}</td>
+                        <td className="px-4 py-3 max-w-md truncate text-xs text-zinc-400" title={s.title}>
+                          {s.url ? <a href={s.url} target="_blank" rel="noreferrer" className="hover:text-emerald-300">{s.title}</a> : s.title}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
     </div>
+  );
+}
+
+function EquityChart({ points }: { points: Array<{ cumulative: number }> }) {
+  if (points.length < 2) return null;
+  const W = 600;
+  const H = 120;
+  const pad = 6;
+  const vals = points.map((p) => p.cumulative);
+  const min = Math.min(0, ...vals);
+  const max = Math.max(0, ...vals);
+  const range = max - min || 1;
+  const x = (i: number) => pad + (i / (points.length - 1)) * (W - 2 * pad);
+  const y = (v: number) => pad + (1 - (v - min) / range) * (H - 2 * pad);
+  const line = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.cumulative).toFixed(1)}`).join(" ");
+  const last = vals[vals.length - 1];
+  const color = last >= 0 ? "#34d399" : "#f87171";
+  const area = `${line} L${x(points.length - 1).toFixed(1)},${y(min).toFixed(1)} L${x(0).toFixed(1)},${y(min).toFixed(1)} Z`;
+  const zeroY = y(0);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="h-28 w-full" preserveAspectRatio="none" role="img" aria-label="Kümülatif P&L eğrisi">
+      <line x1={pad} y1={zeroY} x2={W - pad} y2={zeroY} stroke="#3f3f46" strokeWidth={1} strokeDasharray="3 3" />
+      <path d={area} fill={color} fillOpacity={0.12} />
+      <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+    </svg>
   );
 }
 

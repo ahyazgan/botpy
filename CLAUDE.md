@@ -79,7 +79,7 @@ CCXT ile Binance işlem. **paper** (varsayılan, simülasyon) + **canlı** (`.en
 - **Otomatik çıkış:** `monitor_positions` (news_bot `_monitor_loop`, 8s) — SL (`stop_loss_pct`), TP (`take_profit_pct`), trailing (`trailing_stop_pct`) kontrol eder, tetiklenince kapatır.
 - **Risk limitleri:** günlük zarar freni (`daily_loss_limit_usdt`, `_daily` realized takibi), toplam (`max_total_exposure_usdt`) + coin (`max_per_coin_usdt`) maruziyet — `_check_risk` ile `place_trade`'de uygulanır.
 - **Emir kalitesi:** `_estimate_fill` (orderbook `/depth`) ile slippage tahmini (`slippage_guard_pct`) + likidite kontrolü (`min_orderbook_usd`); `order_type` market/limit.
-- **Performans:** `_closed` işlem günlüğü + `get_performance` (kazanma oranı, P&L, kaynak/coin/sebep kırılımı). Endpoint: `/performance`.
+- **Performans:** `_closed` işlem günlüğü + `get_performance` (kazanma oranı, P&L, kaynak/coin/sebep kırılımı + `equity` kümülatif P&L eğrisi via `_equity_from`). Endpoint: `/performance`.
 
 Güvenli varsayılan: `paper_trading=True`, `auto_trade=False`, SL=3% TP=6%.
 
@@ -124,7 +124,7 @@ Strateji: `YES_ask + NO_ask < (1 - MIN_PROFIT)` → iki tarafı da al; `YES_bid 
 
 ### `dashboard/` — React Panel (AKTİF — haber radarı)
 
-`src/App.tsx` `news_bot.py`'ye bağlanır (15s polling, `/news` + `/settings` + `/positions` + `/performance` + `/signals`). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". Footer'da **arşiv kapsam göstergesi** (`/signals` span'ı: biriken sinyal sayısı + gün/saat aralığı). **Backtest paneli** (`/backtest`, talep üzerine — 15s polling'e dahil değil): SL/TP gir + mod seçici (Basit / Grid / Walk-forward) + "Çalıştır". Basit: kazanma oranı/TP-SL-timeout/P&L; Grid: tüm SL/TP kombinasyonları P&L'e göre sıralı tablo (en kârlı vurgulu); Walk-forward: in/out-sample + karar + zayıflama. `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
+`src/App.tsx` `news_bot.py`'ye bağlanır (15s polling, `/news` + `/settings` + `/positions` + `/performance` + `/signals`). Canlı haber akışı: güç rozeti (yöne göre renkli), coin etiketleri, kaynak, zaman, gerekçe; güç ≥ eşik olan haberler vurgulanır. Performans bölümünde **kümülatif P&L eğrisi** (`EquityChart`, bağımlılıksız inline SVG; `/performance`'ın `equity` alanı). Filtreler: arama, min. güç slider'ı, "sadece güçlü uyarılar". Footer'da **arşiv kapsam göstergesi** (`/signals` span'ı: biriken sinyal sayısı + gün/saat aralığı). **Backtest paneli** (`/backtest`, talep üzerine — 15s polling'e dahil değil): SL/TP gir + mod seçici (Basit / Grid / Walk-forward) + "Çalıştır". Basit: kazanma oranı/TP-SL-timeout/P&L; Grid: tüm SL/TP kombinasyonları P&L'e göre sıralı tablo (en kârlı vurgulu); Walk-forward: in/out-sample + karar + zayıflama. `VITE_API_BASE` (varsayılan `http://127.0.0.1:8000`). Tailwind + koyu zinc tema (eski Polymarket panelinden devralındı).
 
 ### `api.py` — CORS Proxy (eski)
 

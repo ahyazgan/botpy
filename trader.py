@@ -467,6 +467,28 @@ def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
 
 
 # ── Performans ───────────────────────────────────────────────────────────
+def _equity_from(closed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Kapanan işlemlerden kronolojik kümülatif P&L eğrisi (saf fonksiyon).
+
+    [{closed_at, pnl, cumulative}, ...] — en eskiden en yeniye.
+    """
+    curve: list[dict[str, Any]] = []
+    cum = 0.0
+    for c in closed:
+        if c.get("pnl") is None:
+            continue
+        cum = round(cum + c["pnl"], 2)
+        curve.append({"closed_at": c.get("closed_at"), "pnl": c["pnl"], "cumulative": cum})
+    return curve
+
+
+def equity_curve() -> list[dict[str, Any]]:
+    """Kümülatif P&L eğrisi (kapanan işlemlerden, kronolojik)."""
+    with _lock:
+        closed = list(_closed)
+    return _equity_from(closed)
+
+
 def get_performance() -> dict[str, Any]:
     with _lock:
         closed = list(_closed)
@@ -501,6 +523,7 @@ def get_performance() -> dict[str, Any]:
         "by_symbol": _agg("symbol"),
         "by_reason": _agg("close_reason"),
         "recent": list(reversed(closed[-30:])),
+        "equity": _equity_from(closed),
     }
 
 

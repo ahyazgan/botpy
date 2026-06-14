@@ -113,3 +113,63 @@ def test_list_opportunities_limit_and_order(store):
     assert len(rows) == 3
     # en yeni (en büyük id) önce
     assert rows[0]["market_id"] == "m4"
+
+
+# ── Haber sinyali arşivi ──────────────────────────────────────────────────
+def _signal(sid="s1", impact=8, **kw):
+    base = {
+        "id": sid, "source": "TreeNews", "title": "Binance lists FOO",
+        "url": "https://x/foo", "published": None,
+        "fetched_at": "2026-06-14T00:00:00+00:00",
+        "coins": ["FOO"], "impact": impact, "direction": "bullish",
+        "reason": "listeleme", "scorer": "claude", "symbol": "FOOUSDT",
+        "price_24h_pct": 1.2, "price_15m_pct": 0.5, "volume_usd": 2_000_000.0,
+        "confirmed": True, "price_note": "uyumlu",
+    }
+    base.update(kw)
+    return base
+
+
+def test_add_signal_and_list(store):
+    assert store.add_signal(_signal("a")) is True
+    assert store.add_signal(_signal("b", impact=5, confirmed=False, coins=[])) is True
+    rows = store.list_signals()
+    assert {r["id"] for r in rows} == {"a", "b"}
+    a = next(r for r in rows if r["id"] == "a")
+    assert a["coins"] == ["FOO"]          # JSON listeye çözüldü
+    assert a["confirmed"] is True         # int → bool
+    b = next(r for r in rows if r["id"] == "b")
+    assert b["coins"] == [] and b["confirmed"] is False
+
+
+def test_add_signal_dedupe(store):
+    assert store.add_signal(_signal("dup")) is True
+    assert store.add_signal(_signal("dup")) is False   # aynı id → atlanır
+    assert len(store.list_signals()) == 1
+
+
+def test_list_signals_min_impact(store):
+    store.add_signal(_signal("low", impact=5))
+    store.add_signal(_signal("high", impact=9))
+    rows = store.list_signals(min_impact=7)
+    assert [r["id"] for r in rows] == ["high"]
+
+
+def test_signal_span(store):
+    assert store.signal_span()["count"] == 0
+    store.add_signal(_signal("a"))
+    store.add_signal(_signal("b"))
+    span = store.signal_span()
+    assert span["count"] == 2
+    assert span["first_ts"] is not None and span["last_ts"] is not None
+
+
+def test_signals_persist_across_connections(tmp_path):
+    path = str(tmp_path / "sig.db")
+    s1 = Store(path)
+    s1.add_signal(_signal("keep"))
+    s1.close()
+    s2 = Store(path)
+    rows = s2.list_signals()
+    s2.close()
+    assert [r["id"] for r in rows] == ["keep"]

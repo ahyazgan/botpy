@@ -8,6 +8,7 @@ arka plan thread'i ile API thread'leri aynı bağlantıyı paylaşır).
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -123,6 +124,30 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS news_signals (
+    id            TEXT PRIMARY KEY,      -- NewsItem.id (restart'lar arası dedupe)
+    ts            TEXT NOT NULL,         -- arşivlenme zamanı (utcnow)
+    source        TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    url           TEXT,
+    published     TEXT,
+    fetched_at    TEXT,
+    coins         TEXT,                  -- JSON list
+    impact        INTEGER NOT NULL,
+    direction     TEXT NOT NULL,
+    reason        TEXT,
+    scorer        TEXT,
+    symbol        TEXT,
+    price_24h_pct REAL,
+    price_15m_pct REAL,
+    volume_usd    REAL,
+    confirmed     INTEGER,               -- 0/1
+    price_note    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_ts ON news_signals(ts);
+CREATE INDEX IF NOT EXISTS idx_signal_impact ON news_signals(impact);
 """
 
 _TRADE_COLUMNS = (
@@ -136,6 +161,11 @@ _OPP_COLUMNS = (
 _CLOSED_COLUMNS = (
     "id", "market_id", "question", "side", "amount_usdc", "entry_price",
     "shares", "opened_at", "closed_at", "close_price", "pnl", "reason",
+)
+_SIGNAL_COLUMNS = (
+    "id", "ts", "source", "title", "url", "published", "fetched_at", "coins",
+    "impact", "direction", "reason", "scorer", "symbol", "price_24h_pct",
+    "price_15m_pct", "volume_usd", "confirmed", "price_note",
 )
 
 
@@ -397,6 +427,75 @@ class Store:
             "first_ts": row["first_ts"] if row else None,
             "last_ts": row["last_ts"] if row else None,
             "markets": int(row["markets"]) if row else 0,
+        }
+
+    # ── Haber sinyali arşivi (restart'a dayanıklı backtest verisi) ────────
+    def add_signal(self, item: dict[str, Any]) -> bool:
+        """Bir haber sinyalini arşivle. id zaten varsa atlanır (dedupe).
+
+        `item` = NewsItem.to_dict() biçimi. Yeni eklendiyse True döner.
+        """
+        row = {
+            "id": item["id"],
+            "ts": _utcnow(),
+            "source": item.get("source", ""),
+            "title": item.get("title", ""),
+            "url": item.get("url"),
+            "published": item.get("published"),
+            "fetched_at": item.get("fetched_at"),
+            "coins": json.dumps(item.get("coins") or [], ensure_ascii=False),
+            "impact": int(item.get("impact", 0)),
+            "direction": item.get("direction", "neutral"),
+            "reason": item.get("reason", ""),
+            "scorer": item.get("scorer", ""),
+            "symbol": item.get("symbol"),
+            "price_24h_pct": item.get("price_24h_pct"),
+            "price_15m_pct": item.get("price_15m_pct"),
+            "volume_usd": item.get("volume_usd"),
+            "confirmed": 1 if item.get("confirmed") else 0,
+            "price_note": item.get("price_note", ""),
+        }
+        cols = ", ".join(_SIGNAL_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _SIGNAL_COLUMNS)
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT OR IGNORE INTO news_signals ({cols}) VALUES ({placeholders})",
+                row,
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def _decode_signal(self, row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        try:
+            d["coins"] = json.loads(d["coins"]) if d.get("coins") else []
+        except (ValueError, TypeError):
+            d["coins"] = []
+        d["confirmed"] = bool(d.get("confirmed"))
+        return d
+
+    def list_signals(
+        self, limit: int = 500, min_impact: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Arşivlenmiş sinyaller, en yeniden eskiye. coins listeye çözülür."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM news_signals WHERE impact >= ? "
+                "ORDER BY ts DESC, id DESC LIMIT ?", (min_impact, limit),
+            ).fetchall()
+        return [self._decode_signal(r) for r in rows]
+
+    def signal_span(self) -> dict[str, Any]:
+        """Sinyal arşivinin kapsamı: adet, ilk/son zaman."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+                "FROM news_signals",
+            ).fetchone()
+        return {
+            "count": int(row["c"]) if row else 0,
+            "first_ts": row["first_ts"] if row else None,
+            "last_ts": row["last_ts"] if row else None,
         }
 
     # ── Uygulama ayarları (kalıcı; restart'a dayanıklı) ───────────────────

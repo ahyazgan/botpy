@@ -67,7 +67,9 @@ npm run preview
 
 **Fiyat teyidi** (`confirm_with_price`): güçlü haberler için Binance public API'den 24s/15dk fiyat hareketi + hacim çekilir. `confirmed` = haber yönü ile son hareket uyumlu **ve** likidite ≥ `MIN_VOLUME_USD`. "Zaten fiyatlanmış" (24s'te > `ALREADY_PRICED_PCT`) uyarısı verir.
 
-**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
+**Sinyal arşivi** (`_archive_signal` → `storage.add_signal`): güçlü haberler (canlı, tohumlama değil) `news_signals` tablosuna kalıcı yazılır (id ile dedupe, restart'a dayanıklı). `Store` lazy açılır (`get_store`, `BOTPY_DB` yolu); import'ta dosya yaratma yan etkisi yok. `news_backtest.py --db` bu arşivi motor çalışmadan okur.
+
+**Endpoint'ler:** Haber: `GET /news?limit=&min_impact=`, `/alerts`, `/signals?limit=&min_impact=` (kalıcı arşiv + kapsam), `/health`. İşlem: `GET/PATCH /settings`, `POST /trade`, `GET /positions`, `DELETE /positions/{id}`.
 
 ### `trader.py` — Binance İşlem Modülü (AKTİF, profesyonel)
 
@@ -83,7 +85,7 @@ Güvenli varsayılan: `paper_trading=True`, `auto_trade=False`, SL=3% TP=6%.
 
 ### `backtest.py` — Sinyal Backtest (CLI)
 
-Çalışan motorun `/news` güçlü sinyallerini çeker, her biri için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). Kısıt: geçmiş haber arşivi yok, yalnızca motorun o anki bellekteki sinyalleri test edilir; `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
+Sinyalleri iki kaynaktan alır: (a) çalışan motorun `/news` (RAM) ucu — varsayılan; (b) `--db botpy.db` ile **kalıcı SQLite arşivi** (motor çalışmasa da olur). `news_bot` güçlü sinyalleri arşive yazdığı için (`_archive_signal` → `storage.add_signal`, restart'a dayanıklı), günlerce biriken veriyle backtest yapılabilir. Her sinyal için Binance geçmiş 1dk klines indirip SL/TP çıkışını simüle eder (komisyon dahil). `--grid` ile en kârlı SL/TP kombinasyonunu arar (klines sinyal başına bir kez `prefetch` edilir). `published` (RFC822/ISO) veya `fetched_at` zamanı kullanılır, çok yeni sinyaller (<30dk) atlanır.
 
 ### `bot.py` — FastAPI Market Tarayıcı (eski Polymarket)
 

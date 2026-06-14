@@ -36,6 +36,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import storage
 import trader
 from notify import Notifier
 
@@ -45,6 +46,17 @@ load_dotenv()  # .env dosyasındaki ANTHROPIC_API_KEY'i okur
 # winotify (masaüstü) yalnızca bilgisayar başındayken işe yarar; bu kanal güçlü
 # haber + oto-işlem olaylarını telefona/uzağa ulaştırır.
 _notifier = Notifier.from_env()
+
+# Sinyal arşivi: güçlü haberleri SQLite'a kalıcı yazar (restart'a dayanıklı).
+# Lazy — yalnızca ilk kullanımda açılır (import'ta dosya yaratma yan etkisi yok).
+_store: storage.Store | None = None
+
+
+def get_store() -> storage.Store:
+    global _store
+    if _store is None:
+        _store = storage.Store()
+    return _store
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
@@ -667,6 +679,7 @@ def process_items(
 
     if allow_notify:
         for it in alerts:
+            _archive_signal(it)
             notify(it)
             pos = trader.maybe_auto_trade(it)
             if pos:
@@ -674,6 +687,14 @@ def process_items(
                 notify_remote(_fmt_trade_msg(pos, opened=True))
 
     return len(new_items), len(alerts)
+
+
+def _archive_signal(item: NewsItem) -> None:
+    """Güçlü sinyali kalıcı arşive yaz (backtest için). Hata akışı bozmaz."""
+    try:
+        get_store().add_signal(item.to_dict())
+    except Exception as e:
+        log.warning("Sinyal arşivleme hatası: %s", e)
 
 
 # ── Arka plan döngüsü (RSS + Binance polling) ────────────────────────────
@@ -895,6 +916,14 @@ def get_alerts(limit: int = 50) -> NewsResponse:
 def health() -> dict[str, Any]:
     with _cache_lock:
         return {"ok": _status["error"] is None, **_status}
+
+
+@app.get("/signals")
+def get_signals(limit: int = 500, min_impact: int = 0) -> dict[str, Any]:
+    """Kalıcı arşivdeki güçlü haber sinyalleri (restart'tan bağımsız, backtest için)."""
+    store = get_store()
+    return {"signals": store.list_signals(limit=limit, min_impact=min_impact),
+            **store.signal_span()}
 
 
 # ── İşlem endpoint'leri ──────────────────────────────────────────────────

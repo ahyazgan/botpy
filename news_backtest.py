@@ -7,16 +7,18 @@ SL mi TP mi önce vururdu, sonuç ne olurdu" diye simüle eder. Komisyon dahil.
 
 Ayrıca grid search: hangi stop-loss / take-profit kombinasyonu en kârlı olurdu.
 
-NOT (dürüstlük): geçmiş haber arşivi tutmuyoruz; bu yüzden backtest yalnızca
-motorun ŞU AN belleğindeki sinyalleri kapsar (motoru ne kadar uzun çalıştırırsan
-o kadar çok veri birikir). Gerçek ileri-test için paper modda biriken /performance
-istatistikleri esastır. Mum içi SL+TP aynı anda olursa kötümser (SL önce) sayılır.
+Sinyal kaynağı: çalışan motorun /news (RAM) ucu VEYA kalıcı SQLite arşivi
+(--db). Motor güçlü sinyalleri arşive yazdığı için (news_bot._archive_signal),
+restart'tan bağımsız, günlerce biriken veriyle backtest yapılabilir — motorun
+o an çalışıyor olması gerekmez. Mum içi SL+TP aynı anda olursa kötümser (SL
+önce) sayılır.
 
 Kullanım:
-  python backtest.py                      # varsayılan SL=3 TP=6, 4 saat pencere
-  python backtest.py --sl 2 --tp 5 --hours 6
-  python backtest.py --grid               # en iyi SL/TP kombinasyonunu ara
-  python backtest.py --min-impact 8 --fee 0.2 --usdt 100
+  python news_backtest.py                      # çalışan motordan (/news, RAM)
+  python news_backtest.py --db botpy.db        # kalıcı arşivden (motor gerekmez)
+  python news_backtest.py --sl 2 --tp 5 --hours 6
+  python news_backtest.py --grid               # en iyi SL/TP kombinasyonunu ara
+  python news_backtest.py --min-impact 8 --fee 0.2 --usdt 100
 """
 
 from __future__ import annotations
@@ -47,20 +49,17 @@ def _to_ms(s: str | None) -> int | None:
         return None
 
 
-def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
-    r = requests.get(f"{api_base}/news", params={"limit": 300, "min_impact": min_impact}, timeout=15)
-    r.raise_for_status()
+def _signals_from_rows(rows: list[dict]) -> list[dict]:
+    """Ham sinyal kayıtlarını backtest biçimine süz (ortak filtre)."""
     out = []
-    for n in r.json().get("news", []):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    for n in rows:
         if not n.get("symbol") or n.get("direction") not in ("bullish", "bearish"):
             continue
-        t = _to_ms(n.get("published"))
-        if t is None:
-            t = _to_ms(n.get("fetched_at"))
+        t = _to_ms(n.get("published")) or _to_ms(n.get("fetched_at"))
         if t is None:
             continue
         # Arkasında en az ~30 dk fiyat verisi olmayan (çok yeni) sinyalleri atla
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         if now_ms - t < 30 * 60 * 1000:
             continue
         out.append({
@@ -68,6 +67,23 @@ def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
             "impact": n["impact"], "title": n["title"][:60],
         })
     return out
+
+
+def fetch_signals(api_base: str, min_impact: int) -> list[dict]:
+    """Çalışan motorun /news (RAM) ucundan sinyalleri çek."""
+    r = requests.get(f"{api_base}/news", params={"limit": 300, "min_impact": min_impact}, timeout=15)
+    r.raise_for_status()
+    return _signals_from_rows(r.json().get("news", []))
+
+
+def fetch_signals_from_db(db_path: str, min_impact: int) -> list[dict]:
+    """Kalıcı SQLite arşivinden sinyalleri çek (motor çalışmasa da olur)."""
+    from storage import Store
+    store = Store(db_path)
+    try:
+        return _signals_from_rows(store.list_signals(limit=5000, min_impact=min_impact))
+    finally:
+        store.close()
 
 
 def fetch_klines(symbol: str, start_ms: int, minutes: int) -> list[list]:
@@ -159,6 +175,8 @@ def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verb
 def main() -> None:
     ap = argparse.ArgumentParser(description="Haber sinyali backtest")
     ap.add_argument("--api", default="http://127.0.0.1:8000")
+    ap.add_argument("--db", default=None,
+                    help="SQLite arşivinden oku (motor çalışmasa da olur). Örn: botpy.db")
     ap.add_argument("--min-impact", type=int, default=7)
     ap.add_argument("--sl", type=float, default=3.0)
     ap.add_argument("--tp", type=float, default=6.0)
@@ -170,12 +188,20 @@ def main() -> None:
     args = ap.parse_args()
 
     minutes = int(args.hours * 60)
-    print(f"Sinyaller çekiliyor ({args.api}, güç ≥ {args.min_impact})...")
-    try:
-        signals = fetch_signals(args.api, args.min_impact)
-    except Exception as e:
-        print(f"HATA: motora bağlanılamadı ({e}). Motor çalışıyor mu?")
-        return
+    if args.db:
+        print(f"Sinyaller arşivden çekiliyor ({args.db}, güç ≥ {args.min_impact})...")
+        try:
+            signals = fetch_signals_from_db(args.db, args.min_impact)
+        except Exception as e:
+            print(f"HATA: arşiv okunamadı ({e}). Yol doğru mu?")
+            return
+    else:
+        print(f"Sinyaller çekiliyor ({args.api}, güç ≥ {args.min_impact})...")
+        try:
+            signals = fetch_signals(args.api, args.min_impact)
+        except Exception as e:
+            print(f"HATA: motora bağlanılamadı ({e}). Motor çalışıyor mu? (veya --db ile arşivden oku)")
+            return
     print(f"{len(signals)} aday sinyal — fiyat verisi indiriliyor...")
     signals = prefetch(signals, minutes)
     print(f"{len(signals)} sinyal test edilebilir (yeterli fiyat verisi olan).")

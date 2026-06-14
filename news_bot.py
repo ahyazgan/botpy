@@ -1099,11 +1099,13 @@ def run_backtest(
         return {"ok": True, "mode": "grid", "tested": len(signals),
                 "rows": grid, "best": grid[0] if grid else None}
 
-    summary = nbt.run(signals, sl, tp, fee, usdt, False)
+    results = nbt.simulate_all(signals, sl, tp, fee)
+    summary = nbt._summarize(results, usdt)
     summary["ok"] = True
     summary["mode"] = "simple"
     summary["tested"] = len(signals)
     summary["candidates"] = len(candidates)
+    summary["breakdown"] = nbt.breakdown(results, usdt)
     return summary
 
 

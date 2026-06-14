@@ -178,7 +178,15 @@ type BacktestResult = {
   // grid
   rows?: Array<{ sl: number; tp: number; n: number; win_rate: number; avg_net_pct: number; total_pnl_usdt: number }>;
   best?: { sl: number; tp: number; total_pnl_usdt: number } | null;
+  // simple breakdown (edge kalibrasyonu)
+  breakdown?: {
+    by_impact: Record<string, BucketStat>;
+    by_direction: Record<string, BucketStat>;
+    by_source: Record<string, BucketStat>;
+  };
 };
+
+type BucketStat = { n: number; win_rate: number; avg_net_pct: number; total_pnl_usdt: number };
 
 type BacktestMode = "simple" | "grid" | "walk";
 
@@ -1156,15 +1164,24 @@ export default function App() {
                   )}
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
-                  <Stat label="Sinyal" value={String(btResult.n ?? 0)} />
-                  <Stat label="Kazanma" value={`%${btResult.win_rate ?? 0}`} />
-                  <Stat label="TP / SL / timeout" value={`${btResult.tp ?? 0} / ${btResult.sl ?? 0} / ${btResult.timeout ?? 0}`} />
-                  <Stat
-                    label="Toplam P&L"
-                    value={`${(btResult.total_pnl_usdt ?? 0) >= 0 ? "+" : ""}${(btResult.total_pnl_usdt ?? 0).toFixed(2)} USDT`}
-                    accent={(btResult.total_pnl_usdt ?? 0) >= 0 ? "pos" : "neg"}
-                  />
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                    <Stat label="Sinyal" value={String(btResult.n ?? 0)} />
+                    <Stat label="Kazanma" value={`%${btResult.win_rate ?? 0}`} />
+                    <Stat label="TP / SL / timeout" value={`${btResult.tp ?? 0} / ${btResult.sl ?? 0} / ${btResult.timeout ?? 0}`} />
+                    <Stat
+                      label="Toplam P&L"
+                      value={`${(btResult.total_pnl_usdt ?? 0) >= 0 ? "+" : ""}${(btResult.total_pnl_usdt ?? 0).toFixed(2)} USDT`}
+                      accent={(btResult.total_pnl_usdt ?? 0) >= 0 ? "pos" : "neg"}
+                    />
+                  </div>
+                  {btResult.breakdown && (btResult.n ?? 0) > 0 && (
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                      <BreakdownTable title="Güce göre" rows={btResult.breakdown.by_impact} />
+                      <BreakdownTable title="Yöne göre" rows={btResult.breakdown.by_direction} />
+                      <BreakdownTable title="Kaynağa göre" rows={btResult.breakdown.by_source} />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1308,6 +1325,38 @@ function EquityChart({ points }: { points: Array<{ cumulative: number }> }) {
       <path d={area} fill={color} fillOpacity={0.12} />
       <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
     </svg>
+  );
+}
+
+function BreakdownTable({ title, rows }: { title: string; rows: Record<string, BucketStat> }) {
+  const entries = Object.entries(rows);
+  if (entries.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-white/10 bg-zinc-800/40 p-3">
+      <p className="mb-2 text-xs uppercase text-zinc-500">{title}</p>
+      <table className="w-full text-left text-xs">
+        <thead>
+          <tr className="text-zinc-600">
+            <th className="pb-1 font-normal">grup</th>
+            <th className="pb-1 text-right font-normal">n</th>
+            <th className="pb-1 text-right font-normal">kazanma</th>
+            <th className="pb-1 text-right font-normal">P&L</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map(([k, v]) => (
+            <tr key={k} className="text-zinc-300">
+              <td className="py-0.5">{k}</td>
+              <td className="py-0.5 text-right tabular-nums text-zinc-400">{v.n}</td>
+              <td className="py-0.5 text-right tabular-nums">%{v.win_rate}</td>
+              <td className={`py-0.5 text-right tabular-nums ${v.total_pnl_usdt >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                {v.total_pnl_usdt >= 0 ? "+" : ""}{v.total_pnl_usdt.toFixed(1)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

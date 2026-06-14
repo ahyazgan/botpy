@@ -65,6 +65,7 @@ def _signals_from_rows(rows: list[dict]) -> list[dict]:
         out.append({
             "symbol": n["symbol"], "direction": n["direction"], "time": t,
             "impact": n["impact"], "title": n["title"][:60],
+            "source": n.get("source", "?"),
         })
     return out
 
@@ -150,17 +151,23 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
     return {"outcome": outcome, "net_pct": net, **sig}
 
 
-def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verbose: bool) -> dict:
-    results = []
+def simulate_all(signals: list[dict], sl: float, tp: float, fee: float) -> list[dict]:
+    """Tüm sinyalleri simüle et; geçerli sonuçların listesini döndür."""
+    out = []
     for s in signals:
         r = simulate(s, sl, tp, fee)
         if r:
-            results.append(r)
+            out.append(r)
+    return out
+
+
+def _summarize(results: list[dict], usdt: float) -> dict:
+    """Simülasyon sonuçlarından özet istatistik (saf)."""
     if not results:
         return {"n": 0}
     wins = [r for r in results if r["net_pct"] > 0]
     total_pct = sum(r["net_pct"] for r in results)
-    summary = {
+    return {
         "n": len(results),
         "win_rate": round(len(wins) / len(results) * 100, 1),
         "tp": sum(1 for r in results if r["outcome"] == "tp"),
@@ -169,7 +176,31 @@ def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verb
         "avg_net_pct": round(total_pct / len(results), 3),
         "total_pnl_usdt": round(total_pct / 100 * usdt, 2),
     }
-    if verbose:
+
+
+def breakdown(results: list[dict], usdt: float = 100.0) -> dict:
+    """Sonuçları güç-dilimi / yön / kaynağa göre kır (edge kalibrasyonu için, saf).
+
+    Her grup: {n, win_rate, avg_net_pct, total_pnl_usdt}. Güç dilimleri ayrı
+    incelenince auto_min_impact/eşik veriyle ayarlanabilir.
+    """
+    def _group(key_fn) -> dict:
+        buckets: dict[str, list[dict]] = {}
+        for r in results:
+            buckets.setdefault(str(key_fn(r)), []).append(r)
+        return {k: _summarize(v, usdt) for k, v in sorted(buckets.items())}
+
+    return {
+        "by_impact": _group(lambda r: r.get("impact", "?")),
+        "by_direction": _group(lambda r: r.get("direction", "?")),
+        "by_source": _group(lambda r: r.get("source", "?")),
+    }
+
+
+def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verbose: bool) -> dict:
+    results = simulate_all(signals, sl, tp, fee)
+    summary = _summarize(results, usdt)
+    if verbose and results:
         for r in sorted(results, key=lambda x: x["net_pct"], reverse=True):
             print(f"  [{r['impact']}/10] {r['symbol']:<10} {r['direction']:<8} "
                   f"{r['outcome']:<7} net%={r['net_pct']:+.2f} | {r['title']}")

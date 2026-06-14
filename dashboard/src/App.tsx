@@ -71,6 +71,7 @@ type Performance = {
   by_source: Record<string, { count: number; pnl: number; wins: number }>;
   by_symbol: Record<string, { count: number; pnl: number; wins: number }>;
   recent: Array<{ symbol: string; side: string; pnl: number | null; pnl_pct: number | null; close_reason?: string; source: string }>;
+  equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
 };
 
 type Position = {
@@ -739,6 +740,17 @@ export default function App() {
               </p>
             </div>
           </div>
+          {perf.equity.length >= 2 && (
+            <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-xs uppercase text-zinc-500">Kümülatif P&L eğrisi ({perf.equity.length} işlem)</p>
+                <p className={`text-sm font-semibold tabular-nums ${perf.total_pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                  {perf.total_pnl >= 0 ? "+" : ""}{perf.total_pnl} USDT
+                </p>
+              </div>
+              <EquityChart points={perf.equity} />
+            </div>
+          )}
           {Object.keys(perf.by_source).length > 0 && (
             <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
               <p className="mb-2 text-xs uppercase text-zinc-500">Kaynağa göre (hangisi kazandırıyor?)</p>
@@ -903,6 +915,31 @@ export default function App() {
         </div>
       </section>
     </div>
+  );
+}
+
+function EquityChart({ points }: { points: Array<{ cumulative: number }> }) {
+  if (points.length < 2) return null;
+  const W = 600;
+  const H = 120;
+  const pad = 6;
+  const vals = points.map((p) => p.cumulative);
+  const min = Math.min(0, ...vals);
+  const max = Math.max(0, ...vals);
+  const range = max - min || 1;
+  const x = (i: number) => pad + (i / (points.length - 1)) * (W - 2 * pad);
+  const y = (v: number) => pad + (1 - (v - min) / range) * (H - 2 * pad);
+  const line = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.cumulative).toFixed(1)}`).join(" ");
+  const last = vals[vals.length - 1];
+  const color = last >= 0 ? "#34d399" : "#f87171";
+  const area = `${line} L${x(points.length - 1).toFixed(1)},${y(min).toFixed(1)} L${x(0).toFixed(1)},${y(min).toFixed(1)} Z`;
+  const zeroY = y(0);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="h-28 w-full" preserveAspectRatio="none" role="img" aria-label="Kümülatif P&L eğrisi">
+      <line x1={pad} y1={zeroY} x2={W - pad} y2={zeroY} stroke="#3f3f46" strokeWidth={1} strokeDasharray="3 3" />
+      <path d={area} fill={color} fillOpacity={0.12} />
+      <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+    </svg>
   );
 }
 

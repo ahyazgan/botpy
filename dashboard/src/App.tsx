@@ -137,6 +137,18 @@ type Risk = {
   auto_trade: boolean;
 };
 
+type DailySummary = {
+  date: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  realized: number;
+  best: number;
+  worst: number;
+  open_positions: number;
+  open_exposure_usdt: number;
+};
+
 type Health = {
   ok: boolean;
   uptime_sec: number;
@@ -295,6 +307,7 @@ export default function App() {
   const [showArchive, setShowArchive] = useState(false);
   const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
   const [risk, setRisk] = useState<Risk | null>(null);
+  const [daily, setDaily] = useState<DailySummary | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [closed, setClosed] = useState<ClosedTrade[]>([]);
   const [showJournal, setShowJournal] = useState(false);
@@ -317,7 +330,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -327,6 +340,7 @@ export default function App() {
         fetch(`${API_BASE}/risk`),
         fetch(`${API_BASE}/health`),
         fetch(`${API_BASE}/trades/closed?limit=100`),
+        fetch(`${API_BASE}/summary`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -349,6 +363,7 @@ export default function App() {
       if (riskRes.ok) setRisk(await riskRes.json());
       if (healthRes.ok) setHealth(await healthRes.json());
       if (closedRes.ok) setClosed((await closedRes.json()).trades ?? []);
+      if (sumRes.ok) setDaily(await sumRes.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
     } finally {
@@ -919,13 +934,23 @@ export default function App() {
       {/* Risk / maruziyet */}
       {risk && (
         <section className="mx-auto mt-10 max-w-5xl">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-lg font-semibold text-white">Risk &amp; maruziyet</h2>
-            {risk.trading_halted && (
-              <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200">
-                ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
-              </span>
-            )}
+            <div className="flex items-center gap-3">
+              {daily && (
+                <span className="text-xs text-zinc-400" title={`Günün özeti (${daily.date})`}>
+                  Bugün: <strong className="text-zinc-200">{daily.trades}</strong> işlem ·{" "}
+                  <span className={daily.realized >= 0 ? "text-emerald-400" : "text-red-400"}>
+                    {daily.realized >= 0 ? "+" : ""}{daily.realized} USDT
+                  </span>
+                </span>
+              )}
+              {risk.trading_halted && (
+                <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200">
+                  ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
+                </span>
+              )}
+            </div>
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <RiskMeter label="Toplam maruziyet" used={risk.total_exposure_usdt} cap={risk.max_total_exposure_usdt} />

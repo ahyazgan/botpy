@@ -90,3 +90,49 @@ def test_signals_from_rows_filters():
     ]
     out = nbt._signals_from_rows(rows)
     assert len(out) == 1 and out[0]["symbol"] == "FOOUSDT"
+
+
+# ── /backtest endpoint'i (ağsız: prefetch monkeypatch'lenir) ───────────────
+def _winning_candles():
+    # entry=100, büyük yukarı hareket → her TP vurur, SL vurmaz
+    return [[0, 100, 100, 100, 100, 0], [60_000, 100, 130, 99, 125, 0]]
+
+
+def _populate(store, n=10):
+    for i in range(n):
+        store.add_signal(_item(f"s{i}", impact=8, symbol=f"C{i}USDT",
+                               published=_old_iso(120)).to_dict())
+
+
+def _fake_prefetch(signals, minutes):
+    for s in signals:
+        s["candles"] = _winning_candles()
+    return signals
+
+
+def test_backtest_endpoint_simple(monkeypatch, store):
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nbt, "prefetch", _fake_prefetch)
+    _populate(store, 6)
+    res = nb.run_backtest(sl=3, tp=6, walk=False)
+    assert res["ok"] is True and res["mode"] == "simple"
+    assert res["n"] == 6 and res["tested"] == 6
+    assert res["win_rate"] == 100.0          # hepsi TP
+    assert res["total_pnl_usdt"] > 0
+
+
+def test_backtest_endpoint_walk(monkeypatch, store):
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nbt, "prefetch", _fake_prefetch)
+    _populate(store, 10)
+    res = nb.run_backtest(walk=True, train_frac=0.7)
+    assert res["mode"] == "walk" and res["ok"] is True
+    assert res["params"]["tp"] == 10
+    assert res["in_sample"]["n"] == 7 and res["out_of_sample"]["n"] == 3
+    assert isinstance(res["verdict"], str)
+
+
+def test_backtest_endpoint_empty_archive(monkeypatch, store):
+    monkeypatch.setattr(nb, "_store", store)
+    res = nb.run_backtest()
+    assert res["ok"] is False and res["n"] == 0

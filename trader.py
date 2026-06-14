@@ -59,6 +59,7 @@ class Settings:
     order_type: str = "market"       # "market" | "limit"
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
+    size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
 
 
 S = Settings()
@@ -75,7 +76,7 @@ _PERSIST_KEYS = (
     "max_positions", "auto_min_impact", "auto_require_confirm", "cooldown_sec",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
-    "order_type", "slippage_guard_pct", "min_orderbook_usd",
+    "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
 )
 
 
@@ -439,6 +440,11 @@ def _can_auto_trade(symbol: str) -> bool:
     return True
 
 
+def _size_multiplier(impact: int) -> float:
+    """Conviction çarpanı: yüksek güç = büyük pozisyon. 8'de 1.0x, [0.5x, 1.5x] arası."""
+    return max(0.5, min(1.5, 1.0 + (impact - 8) * 0.25))
+
+
 def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
@@ -459,8 +465,11 @@ def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
         return None
     if not _can_auto_trade(symbol):
         return None
+    usdt = None
+    if S.size_by_impact:
+        usdt = round(S.trade_usdt * _size_multiplier(int(item.impact)), 2)
     try:
-        return place_trade(symbol, side, source="auto", reason=getattr(item, "reason", ""))
+        return place_trade(symbol, side, usdt=usdt, source="auto", reason=getattr(item, "reason", ""))
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", symbol, e)
         return None
@@ -480,6 +489,26 @@ def _equity_from(closed: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cum = round(cum + c["pnl"], 2)
         curve.append({"closed_at": c.get("closed_at"), "pnl": c["pnl"], "cumulative": cum})
     return curve
+
+
+def _max_drawdown(equity: list[dict[str, Any]]) -> float:
+    """Kümülatif eğride en büyük tepe-dip düşüş (<= 0). Saf fonksiyon."""
+    peak = 0.0
+    mdd = 0.0
+    for p in equity:
+        c = p["cumulative"]
+        peak = max(peak, c)
+        mdd = min(mdd, c - peak)
+    return round(mdd, 2)
+
+
+def _profit_factor(scored: list[dict[str, Any]]) -> float | None:
+    """Brüt kâr / brüt zarar. Zarar yoksa None (tanımsız). Saf fonksiyon."""
+    gross_win = sum(c["pnl"] for c in scored if c["pnl"] > 0)
+    gross_loss = -sum(c["pnl"] for c in scored if c["pnl"] < 0)
+    if gross_loss <= 0:
+        return None
+    return round(gross_win / gross_loss, 2)
 
 
 def equity_curve() -> list[dict[str, Any]]:
@@ -527,6 +556,7 @@ def get_performance() -> dict[str, Any]:
     wins = [c for c in scored if c["pnl"] > 0]
     losses = [c for c in scored if c["pnl"] < 0]
     total = round(sum(c["pnl"] for c in scored), 2)
+    equity = _equity_from(closed)
 
     def _agg(key: str) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -553,7 +583,9 @@ def get_performance() -> dict[str, Any]:
         "by_symbol": _agg("symbol"),
         "by_reason": _agg("close_reason"),
         "recent": list(reversed(closed[-30:])),
-        "equity": _equity_from(closed),
+        "equity": equity,
+        "max_drawdown": _max_drawdown(equity),
+        "profit_factor": _profit_factor(scored),
     }
 
 

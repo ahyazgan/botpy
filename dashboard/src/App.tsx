@@ -53,6 +53,7 @@ type Settings = {
   order_type: "market" | "limit";
   slippage_guard_pct: number;
   min_orderbook_usd: number;
+  size_by_impact: boolean;
   has_live_keys: boolean;
   open_exposure_usdt: number;
   realized_today: number;
@@ -72,6 +73,8 @@ type Performance = {
   by_symbol: Record<string, { count: number; pnl: number; wins: number }>;
   recent: Array<{ symbol: string; side: string; pnl: number | null; pnl_pct: number | null; close_reason?: string; source: string }>;
   equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
+  max_drawdown: number;
+  profit_factor: number | null;
 };
 
 type Position = {
@@ -502,6 +505,18 @@ export default function App() {
             >
               Oto-işlem: {settings.auto_trade ? "AÇIK" : "kapalı"}
             </button>
+            <button
+              type="button"
+              onClick={() => void patchSettings({ size_by_impact: !settings.size_by_impact })}
+              title="Conviction sizing: güç 8'de taban, 10'da 1.5x, 7'de 0.75x (oto-işlem boyutu güce göre)"
+              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                settings.size_by_impact
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+              }`}
+            >
+              📊 Güce göre boyut: {settings.size_by_impact ? "AÇIK" : "kapalı"}
+            </button>
             <div className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-1">
               {(["spot", "futures"] as const).map((m) => (
                 <button
@@ -908,7 +923,7 @@ export default function App() {
       {perf && perf.total_trades > 0 && (
         <section className="mx-auto mt-10 max-w-5xl">
           <h2 className="mb-3 text-lg font-semibold text-white">Performans <span className="ml-1 text-sm font-normal text-zinc-500">(kapanmış {perf.total_trades} işlem)</span></h2>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
               <p className="text-xs uppercase text-zinc-500">Kazanma oranı</p>
               <p className="font-display mt-1 text-2xl font-semibold tabular-nums text-white">%{perf.win_rate}</p>
@@ -929,6 +944,16 @@ export default function App() {
               <p className="text-xs uppercase text-zinc-500">Bugünkü P&L</p>
               <p className={`font-display mt-1 text-2xl font-semibold tabular-nums ${perf.realized_today >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                 {perf.realized_today >= 0 ? "+" : ""}{perf.realized_today}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4" title="En büyük tepe-dip düşüş (kümülatif P&L)">
+              <p className="text-xs uppercase text-zinc-500">Max düşüş</p>
+              <p className="font-display mt-1 text-2xl font-semibold tabular-nums text-red-400">{perf.max_drawdown}</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4" title="Brüt kâr / brüt zarar — &gt;1 kârlı, profesyonel eşik ~1.5+">
+              <p className="text-xs uppercase text-zinc-500">Profit factor</p>
+              <p className={`font-display mt-1 text-2xl font-semibold tabular-nums ${perf.profit_factor === null ? "text-zinc-400" : perf.profit_factor >= 1 ? "text-emerald-400" : "text-red-400"}`}>
+                {perf.profit_factor === null ? "∞" : perf.profit_factor}
               </p>
             </div>
           </div>

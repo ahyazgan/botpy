@@ -1108,6 +1108,7 @@ class SettingsPatch(BaseModel):
     order_type: str | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
+    size_by_impact: bool | None = None
 
 
 @app.get("/settings")

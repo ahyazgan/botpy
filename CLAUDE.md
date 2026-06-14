@@ -75,11 +75,11 @@ npm run preview
 
 CCXT ile Binance işlem. **paper** (varsayılan, simülasyon) + **canlı** (`.env`'de `BINANCE_API_KEY`/`BINANCE_SECRET`). Ayarlar `Settings` sınıfında, `/settings` (GET+PATCH) ile değişir, **`trade_state.json`'a kaydedilir** (restart'ı atlatır — `load_state` modül import'unda çağrılır).
 
-- **Manuel:** `place_trade`. **Otomatik:** `maybe_auto_trade` (güç ≥ `auto_min_impact` + `confirmed` + cooldown + limitler + spot-short-yok).
+- **Manuel:** `place_trade`. **Otomatik:** `maybe_auto_trade` (güç ≥ `auto_min_impact` + `confirmed` + cooldown + limitler + spot-short-yok). **Conviction sizing** (`size_by_impact`): açıksa oto-işlem boyutu güce göre ölçeklenir (`_size_multiplier`: güç 8→1.0x, 10→1.5x, 7→0.75x, [0.5x,1.5x]).
 - **Otomatik çıkış:** `monitor_positions` (news_bot `_monitor_loop`, 8s) — SL (`stop_loss_pct`), TP (`take_profit_pct`), trailing (`trailing_stop_pct`) kontrol eder, tetiklenince kapatır.
 - **Risk limitleri:** günlük zarar freni (`daily_loss_limit_usdt`, `_daily` realized takibi), toplam (`max_total_exposure_usdt`) + coin (`max_per_coin_usdt`) maruziyet — `_check_risk` ile `place_trade`'de uygulanır.
 - **Emir kalitesi:** `_estimate_fill` (orderbook `/depth`) ile slippage tahmini (`slippage_guard_pct`) + likidite kontrolü (`min_orderbook_usd`); `order_type` market/limit.
-- **Performans:** `_closed` işlem günlüğü + `get_performance` (kazanma oranı, P&L, kaynak/coin/sebep kırılımı + `equity` kümülatif P&L eğrisi via `_equity_from`). `closed_trades` (işlem günlüğü, /trades/closed + CSV) ve `get_risk` (anlık maruziyet/limit/günlük zarar/kill-switch, /risk). Endpoint'ler: `/performance`, `/risk`, `/trades/closed[.csv]`.
+- **Performans:** `_closed` işlem günlüğü + `get_performance` (kazanma oranı, P&L, kaynak/coin/sebep kırılımı + `equity` kümülatif P&L eğrisi via `_equity_from` + `max_drawdown` (`_max_drawdown`) + `profit_factor` (`_profit_factor`)). `closed_trades` (işlem günlüğü, /trades/closed + CSV) ve `get_risk` (anlık maruziyet/limit/günlük zarar/kill-switch, /risk). Endpoint'ler: `/performance`, `/risk`, `/trades/closed[.csv]`.
 
 Güvenli varsayılan: `paper_trading=True`, `auto_trade=False`, SL=3% TP=6%.
 

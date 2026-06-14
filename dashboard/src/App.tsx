@@ -100,6 +100,12 @@ type SignalSpan = {
 
 type ArchivedSignal = NewsItem & { ts: string };
 
+type NewsSettings = {
+  alert_threshold: number;
+  remote_notify: boolean;
+  remote_channels_available: boolean;
+};
+
 type BacktestResult = {
   ok: boolean;
   mode?: "simple" | "grid" | "walk";
@@ -200,6 +206,7 @@ export default function App() {
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
+  const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -219,12 +226,13 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
         fetch(`${API_BASE}/performance`),
         fetch(`${API_BASE}/signals?limit=50`),
+        fetch(`${API_BASE}/news-settings`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -243,6 +251,7 @@ export default function App() {
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
         setArchive(sig.signals ?? []);
       }
+      if (nsRes.ok) setNewsSettings(await nsRes.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Yükleme hatası");
     } finally {
@@ -270,6 +279,22 @@ export default function App() {
       setSettings(await r.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Ayar değişmedi");
+    }
+  };
+
+  const patchNewsSettings = async (patch: Partial<NewsSettings>) => {
+    try {
+      const r = await fetch(`${API_BASE}/news-settings`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      const ns: NewsSettings = await r.json();
+      setNewsSettings(ns);
+      setMeta((m) => ({ ...m, alert_threshold: ns.alert_threshold }));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Haber ayarı değişmedi");
     }
   };
 
@@ -494,6 +519,38 @@ export default function App() {
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
             </div>
+          </div>
+        )}
+
+        {/* Haber ayarları (uyarı eşiği + uzak bildirim) */}
+        {newsSettings && (
+          <div className="mt-3 flex flex-wrap items-center gap-4 rounded-2xl border border-white/10 bg-zinc-900/60 p-3 text-sm">
+            <label className="flex items-center gap-2 text-zinc-400">
+              <span>Uyarı eşiği</span>
+              <input
+                type="range" min={1} max={10} value={newsSettings.alert_threshold}
+                onChange={(e) => void patchNewsSettings({ alert_threshold: Number(e.target.value) })}
+                className="accent-amber-500"
+              />
+              <span className="w-6 text-center font-semibold tabular-nums text-amber-300">{newsSettings.alert_threshold}</span>
+            </label>
+            <button
+              type="button"
+              disabled={!newsSettings.remote_channels_available}
+              onClick={() => void patchNewsSettings({ remote_notify: !newsSettings.remote_notify })}
+              title={newsSettings.remote_channels_available
+                ? "Telegram/Discord'a güçlü haber + işlem bildirimi gönder"
+                : "Uzak kanal yok — .env'de TELEGRAM_BOT_TOKEN/CHAT_ID veya DISCORD_WEBHOOK_URL tanımla"}
+              className={`h-8 rounded-lg border px-3 text-xs font-semibold transition disabled:opacity-40 ${
+                newsSettings.remote_notify && newsSettings.remote_channels_available
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-400"
+              }`}
+            >
+              {newsSettings.remote_channels_available
+                ? `📲 Uzak bildirim ${newsSettings.remote_notify ? "açık" : "kapalı"}`
+                : "📲 Uzak bildirim (env yok)"}
+            </button>
           </div>
         )}
 

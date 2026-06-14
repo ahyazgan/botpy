@@ -187,6 +187,52 @@ _status: dict[str, Any] = {
     "alert_threshold": ALERT_THRESHOLD,
 }
 
+# ── Çalışma zamanı ayarları (panelden değişir, store'da kalıcı) ───────────
+_news_settings: dict[str, Any] = {
+    "alert_threshold": ALERT_THRESHOLD,   # bu güç (1-10) ve üstü = uyarı/işlem
+    "remote_notify": True,                # Telegram/Discord push aç/kapat (env yoksa zaten sessiz)
+}
+_settings_loaded = False
+
+
+def _load_news_settings() -> None:
+    """Kalıcı ayarları store'dan bir kez yükle (restart'a dayanıklı)."""
+    global _settings_loaded
+    if _settings_loaded:
+        return
+    _settings_loaded = True
+    try:
+        st = get_store()
+        t = st.get_setting("news_alert_threshold")
+        if t is not None:
+            _news_settings["alert_threshold"] = int(t)
+        rn = st.get_setting("news_remote_notify")
+        if rn is not None:
+            _news_settings["remote_notify"] = rn == "1"
+    except Exception as e:
+        log.warning("Haber ayarları yüklenemedi: %s", e)
+    _status["alert_threshold"] = _news_settings["alert_threshold"]
+
+
+def get_news_settings() -> dict[str, Any]:
+    _load_news_settings()
+    return {**_news_settings, "remote_channels_available": getattr(_notifier, "enabled", False)}
+
+
+def update_news_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    _load_news_settings()
+    st = get_store()
+    if patch.get("alert_threshold") is not None:
+        v = max(1, min(10, int(patch["alert_threshold"])))
+        _news_settings["alert_threshold"] = v
+        _status["alert_threshold"] = v
+        st.set_setting("news_alert_threshold", str(v))
+    if patch.get("remote_notify") is not None:
+        v = bool(patch["remote_notify"])
+        _news_settings["remote_notify"] = v
+        st.set_setting("news_remote_notify", "1" if v else "0")
+    return get_news_settings()
+
 
 # ── Kaynak çekiciler ─────────────────────────────────────────────────────
 def fetch_rss(name: str, url: str) -> list[NewsItem]:
@@ -559,7 +605,9 @@ def _fmt_trade_msg(pos: dict[str, Any], opened: bool) -> str:
 
 
 def notify_remote(text: str) -> None:
-    """Telegram/Discord'a gönder (env tanımlı değilse sessizce atlanır)."""
+    """Telegram/Discord'a gönder (kapalıysa veya env tanımsızsa sessizce atlanır)."""
+    if not _news_settings.get("remote_notify", True):
+        return
     try:
         _notifier.send(text)
     except Exception as e:
@@ -662,7 +710,9 @@ def process_items(
             score_item(it)
 
     # Güçlü haberleri Binance fiyat hareketiyle teyit et
-    alerts = [it for it in new_items if it.impact >= ALERT_THRESHOLD]
+    _load_news_settings()
+    threshold = _news_settings["alert_threshold"]
+    alerts = [it for it in new_items if it.impact >= threshold]
     for it in alerts:
         try:
             confirm_with_price(session, it)
@@ -851,6 +901,7 @@ _mon_thread: threading.Thread | None = None
 async def lifespan(app: FastAPI):
     global _bg_thread, _ws_thread, _mon_thread
     setup_logging()
+    _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
     _stop_event.clear()
     _bg_thread = threading.Thread(target=_background_loop, args=(_stop_event,), daemon=True)
     _bg_thread.start()
@@ -909,13 +960,28 @@ def get_news(limit: int = 100, min_impact: int = 0) -> NewsResponse:
 
 @app.get("/alerts", response_model=NewsResponse)
 def get_alerts(limit: int = 50) -> NewsResponse:
-    return get_news(limit=limit, min_impact=ALERT_THRESHOLD)
+    return get_news(limit=limit, min_impact=get_news_settings()["alert_threshold"])
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     with _cache_lock:
         return {"ok": _status["error"] is None, **_status}
+
+
+class NewsSettingsPatch(BaseModel):
+    alert_threshold: int | None = None   # 1-10; bu güç ve üstü = uyarı/işlem
+    remote_notify: bool | None = None    # Telegram/Discord push aç/kapat
+
+
+@app.get("/news-settings")
+def news_settings_get() -> dict[str, Any]:
+    return get_news_settings()
+
+
+@app.patch("/news-settings")
+def news_settings_patch(body: NewsSettingsPatch) -> dict[str, Any]:
+    return update_news_settings(body.model_dump(exclude_none=True))
 
 
 @app.get("/signals")

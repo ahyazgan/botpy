@@ -240,7 +240,7 @@ type ClosedTrade = {
 
 type BacktestResult = {
   ok: boolean;
-  mode?: "simple" | "grid" | "walk";
+  mode?: "simple" | "grid" | "walk" | "smart";
   reason?: string;
   n?: number;
   tested?: number;
@@ -249,6 +249,9 @@ type BacktestResult = {
   tp?: number;
   sl?: number;
   timeout?: number;
+  time_stop?: number;
+  be_stop?: number;
+  partial?: number;
   avg_net_pct?: number;
   total_pnl_usdt?: number;
   // walk-forward
@@ -282,7 +285,7 @@ type BacktestRun = {
   note: string | null;
 };
 
-type BacktestMode = "simple" | "grid" | "walk";
+type BacktestMode = "simple" | "grid" | "walk" | "smart";
 
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
@@ -1515,12 +1518,12 @@ export default function App() {
             <div className="flex flex-col gap-1 text-xs text-zinc-400">
               <span>Mod</span>
               <div className="flex overflow-hidden rounded-lg border border-zinc-700">
-                {([["simple", "Basit"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
+                {([["simple", "Basit"], ["smart", "Akıllı çıkış"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
                   <button
                     key={m}
                     type="button"
                     onClick={() => setBtMode(m)}
-                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : "Tek SL/TP ile backtest"}
+                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : m === "smart" ? "Mevcut çıkış ayarlarını (breakeven+kısmi TP+trailing+time-stop / preset) arşivde simüle et" : "Tek SL/TP ile backtest"}
                     className={`h-9 px-3 text-sm font-semibold transition ${
                       btMode === m ? "bg-emerald-900/50 text-emerald-200" : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
                     }`}
@@ -1647,6 +1650,11 @@ export default function App() {
                       accent={(btResult.total_pnl_usdt ?? 0) >= 0 ? "pos" : "neg"}
                     />
                   </div>
+                  {btResult.mode === "smart" && (
+                    <p className="text-xs text-zinc-500">
+                      Mevcut çıkış ayarlarıyla (preset dahil) simüle edildi · kısmi: {btResult.partial ?? 0} · time-stop: {btResult.time_stop ?? 0} · breakeven-stop: {btResult.be_stop ?? 0}
+                    </p>
+                  )}
                   {btResult.breakdown && (btResult.n ?? 0) > 0 && (
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                       <BreakdownTable title="Güce göre" rows={btResult.breakdown.by_impact} />

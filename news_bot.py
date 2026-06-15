@@ -1555,6 +1555,26 @@ def _run_backtest_impl(
         return {"ok": True, "mode": "grid", "tested": len(signals),
                 "rows": grid, "best": best}
 
+    if mode == "smart":
+        # Mevcut çıkış ayarlarını (preset dahil) arşiv üzerinde simüle et
+        params = {
+            "sl_pct": trader.S.stop_loss_pct, "tp_pct": trader.S.take_profit_pct,
+            "breakeven_pct": trader.S.breakeven_pct, "partial_tp_pct": trader.S.partial_tp_pct,
+            "partial_tp_frac": trader.S.partial_tp_frac, "trailing_stop_pct": trader.S.trailing_stop_pct,
+            "time_stop_min": trader.S.time_stop_min,
+        }
+        results = nbt.simulate_smart_all(signals, params, fee)
+        summary = nbt._summarize(results, usdt)
+        summary["ok"] = True
+        summary["mode"] = "smart"
+        summary["tested"] = len(signals)
+        summary["params"] = params
+        summary["breakdown"] = nbt.breakdown(results, usdt)
+        if summary.get("n"):
+            _persist_backtest("smart", sl=params["sl_pct"], tp=params["tp_pct"],
+                              stats=summary, note="akıllı çıkış (mevcut ayarlar)", **common)
+        return summary
+
     results = nbt.simulate_all(signals, sl, tp, fee)
     summary = nbt._summarize(results, usdt)
     summary["ok"] = True

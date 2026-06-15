@@ -60,6 +60,8 @@ Arşivlenmiş güçlü sinyaller üzerinde (motor çalışmasa da) geçmiş fiya
 python news_backtest.py --db botpy.db                # basit (SL=3 TP=6)
 python news_backtest.py --db botpy.db --grid         # en kârlı SL/TP araması
 python news_backtest.py --db botpy.db --walk         # walk-forward (overfit testi)
+# Panelden "Akıllı çıkış" modu: mevcut ayarları/preset'i (breakeven+kısmi TP+
+# trailing+time-stop) arşivde simüle eder — haber-trade preset'ini canlıdan önce doğrula.
 ```
 
 Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak kırılımıyla `auto_min_impact`/eşik veriyle ayarlanır.

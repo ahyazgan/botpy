@@ -148,6 +148,101 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
     return {"outcome": outcome, "net_pct": net, **sig}
 
 
+def simulate_smart(sig: dict, params: dict, fee_pct: float) -> dict | None:
+    """Akıllı-çıkış zincirini mum serisi üzerinde simüle et (trader.monitor_positions
+    mantığının backtest karşılığı): breakeven → kısmi TP → trailing → time-stop + SL/TP.
+
+    params: {sl_pct, tp_pct, breakeven_pct, partial_tp_pct, partial_tp_frac,
+             trailing_stop_pct, time_stop_min}. Mum-içi belirsizlikte KÖTÜMSER
+     (önce ters uç = SL/adverse kontrol edilir). Pozisyonun ağırlıklı net %'sini döndürür.
+    """
+    candles = sig.get("candles") or []
+    if len(candles) < 2:
+        return None
+    is_long = sig["direction"] == "bullish"
+    entry = float(candles[0][1])
+    if entry <= 0:
+        return None
+
+    sl_pct = float(params.get("sl_pct", 3.0))
+    tp_pct = float(params.get("tp_pct", 6.0))
+    be_pct = float(params.get("breakeven_pct", 0.0))
+    ptp_pct = float(params.get("partial_tp_pct", 0.0))
+    ptp_frac = float(params.get("partial_tp_frac", 0.5))
+    trail = float(params.get("trailing_stop_pct", 0.0))
+    tstop = int(params.get("time_stop_min", 0))
+
+    def gain_at(price: float) -> float:
+        return ((price - entry) / entry * 100) * (1 if is_long else -1)
+
+    def price_for_gain(g: float) -> float:
+        return entry * (1 + g / 100) if is_long else entry * (1 - g / 100)
+
+    sl_price = price_for_gain(-sl_pct)
+    tp_price = price_for_gain(tp_pct)
+    remaining = 1.0
+    realized = 0.0           # kısmi kapanışlardan kilitlenen ağırlıklı gross %
+    partial_done = be_done = False
+    outcome = "timeout"
+
+    for idx, c in enumerate(candles[1:], start=1):
+        high, low, close = float(c[2]), float(c[3]), float(c[4])
+        adverse = low if is_long else high   # en kötü fiyat
+        favor = high if is_long else low     # en iyi fiyat
+
+        # 1) SL (kötümser: önce ters uç)
+        if (is_long and adverse <= sl_price) or (not is_long and adverse >= sl_price):
+            realized += remaining * gain_at(sl_price)
+            outcome = "be-stop" if be_done and gain_at(sl_price) >= -0.01 else "sl"
+            remaining = 0.0
+            break
+        # 2) Tam TP
+        if (is_long and favor >= tp_price) or (not is_long and favor <= tp_price):
+            realized += remaining * tp_pct
+            outcome = "tp"
+            remaining = 0.0
+            break
+        # 3) Kısmi TP (bir kez)
+        if not partial_done and ptp_pct > 0 and ptp_frac > 0 and gain_at(favor) >= ptp_pct:
+            realized += remaining * ptp_frac * ptp_pct
+            remaining = round(remaining * (1 - ptp_frac), 6)
+            partial_done = True
+        # 4) Breakeven: SL'i girişe çek
+        if not be_done and be_pct > 0 and gain_at(favor) >= be_pct:
+            be_done = True
+            if (is_long and entry > sl_price) or (not is_long and entry < sl_price):
+                sl_price = entry
+        # 5) Trailing: kârı takip eden stop
+        if trail > 0:
+            cand = price_for_gain(gain_at(favor) - trail)
+            if (is_long and cand > sl_price) or (not is_long and cand < sl_price):
+                sl_price = cand
+        # 6) Time-stop: süre dolduysa piyasada kapat
+        if tstop > 0 and idx >= tstop:
+            realized += remaining * gain_at(close)
+            outcome = "time-stop"
+            remaining = 0.0
+            break
+
+    if remaining > 0:   # timeout: kalanı son kapanışta kapat
+        realized += remaining * gain_at(float(candles[-1][4]))
+
+    # Komisyon: tam tur + kısmi olduysa fazladan bir bacak (frac kadar)
+    fee_total = fee_pct + (fee_pct / 2 * ptp_frac if partial_done else 0.0)
+    net = realized - fee_total
+    return {"outcome": outcome, "net_pct": round(net, 4), "partial": partial_done, **sig}
+
+
+def simulate_smart_all(signals: list[dict], params: dict, fee: float) -> list[dict]:
+    """Tüm sinyalleri akıllı-çıkışla simüle et; geçerli sonuçları döndür."""
+    out = []
+    for s in signals:
+        r = simulate_smart(s, params, fee)
+        if r:
+            out.append(r)
+    return out
+
+
 def _directional_move(sig: dict) -> float | None:
     """Sinyalin haber yönünde gerçekleşen % hareketi (pencere sonu kapanış).
 
@@ -215,7 +310,7 @@ def _summarize(results: list[dict], usdt: float) -> dict:
         return {"n": 0}
     wins = [r for r in results if r["net_pct"] > 0]
     total_pct = sum(r["net_pct"] for r in results)
-    return {
+    summary = {
         "n": len(results),
         "win_rate": round(len(wins) / len(results) * 100, 1),
         "tp": sum(1 for r in results if r["outcome"] == "tp"),
@@ -224,6 +319,15 @@ def _summarize(results: list[dict], usdt: float) -> dict:
         "avg_net_pct": round(total_pct / len(results), 3),
         "total_pnl_usdt": round(total_pct / 100 * usdt, 2),
     }
+    # Akıllı-çıkış sonuç tipleri (varsa) — basit modda hep 0
+    smart = {
+        "time_stop": sum(1 for r in results if r["outcome"] == "time-stop"),
+        "be_stop": sum(1 for r in results if r["outcome"] == "be-stop"),
+        "partial": sum(1 for r in results if r.get("partial")),
+    }
+    if any(smart.values()):
+        summary.update(smart)
+    return summary
 
 
 def breakdown(results: list[dict], usdt: float = 100.0) -> dict:

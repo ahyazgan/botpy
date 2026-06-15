@@ -1756,9 +1756,35 @@ def get_performance() -> dict[str, Any]:
 
 @app.get("/tuning")
 def get_tuning() -> dict[str, Any]:
-    """Öğrenen beyin (öneri modu): kapanan işlemlerden eşik ayarı önerileri.
+    """Öğrenen beyin (öneri modu): kapanan GERÇEK işlemlerden eşik ayarı önerileri.
     Otomatik UYGULAMAZ — kaynak-tier eşlemesi için `_source_tier` geçirilir."""
     return trader.suggest_tuning(tier_of=_source_tier)
+
+
+@app.get("/tuning/pretrade")
+def get_tuning_pretrade(
+    hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 1000,
+    fee: float = 0.2, slip: float = 0.1, entry_delay: int = 1,
+) -> dict[str, Any]:
+    """İşlemsiz ÖN-BİLGİ: arşivlenmiş sinyalleri gerçekçi maliyetlerle (slippage +
+    gecikmeli giriş) backtest edip eşik önerileri çıkarır — gerçek para riske atmadan
+    kalibrasyon, sistem ilk işlemden itibaren akıllı. Ağ-yoğun (aynı anda tek koşar)."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ready": False, "reason": "arşiv boş veya sinyaller çok yeni",
+                    "samples": 0, "suggestions": [], "pretrade": True}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ready": False, "reason": "fiyat verisi indirilemedi (Binance)",
+                    "samples": 0, "suggestions": [], "pretrade": True}
+        results = nbt.simulate_all(signals, trader.S.stop_loss_pct, trader.S.take_profit_pct,
+                                   fee, slip_pct=slip, entry_delay_min=entry_delay)
+        out = trader.suggest_from_backtest(results, tier_of=_source_tier)
+        out["tested"] = len(signals)
+        return out
 
 
 class PositionPatch(BaseModel):

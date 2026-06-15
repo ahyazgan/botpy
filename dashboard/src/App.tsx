@@ -394,6 +394,8 @@ export default function App() {
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
   const [tuning, setTuning] = useState<Tuning | null>(null);
+  const [pretrade, setPretrade] = useState<(Tuning & { reason?: string; tested?: number }) | null>(null);
+  const [pretradeRunning, setPretradeRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
@@ -541,6 +543,19 @@ export default function App() {
       setSettings(await r.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Ayar değişmedi");
+    }
+  };
+
+  const runPretrade = async () => {
+    setPretradeRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/tuning/pretrade`);
+      if (!r.ok) throw new Error(`pretrade ${r.status}`);
+      setPretrade(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ön-bilgi hatası");
+    } finally {
+      setPretradeRunning(false);
     }
   };
 
@@ -1363,33 +1378,73 @@ export default function App() {
       )}
 
       {/* Öğrenen beyin — öneriler (otomatik uygulanmaz) */}
-      {tuning && tuning.ready && tuning.suggestions.length > 0 && (
-        <section className="mx-auto mt-10 max-w-5xl">
-          <h2 className="mb-1 text-lg font-semibold text-white">
+      <section className="mx-auto mt-10 max-w-5xl">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-lg font-semibold text-white">
             🧠 Öğrenen beyin
-            <span className="ml-2 text-sm font-normal text-zinc-500">({tuning.samples} kapanmış işlemden öneri — otomatik uygulanmaz)</span>
+            <span className="ml-2 text-sm font-normal text-zinc-500">(öneri — otomatik uygulanmaz)</span>
           </h2>
+          <button
+            type="button"
+            onClick={() => void runPretrade()}
+            disabled={pretradeRunning}
+            title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
+            className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
+          >
+            {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
+          </button>
+        </div>
+
+        {/* Canlı: kapanan gerçek işlemlerden */}
+        {tuning && tuning.ready && tuning.suggestions.length > 0 && (
           <div className="space-y-2">
-            {tuning.suggestions.map((s, i) => {
-              const canApply = s.type === "auto_min_impact" && typeof s.suggested === "number";
-              return (
-                <div key={i} className="flex items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-950/20 px-4 py-3">
-                  <p className="text-sm text-amber-100/90">{s.message}</p>
-                  {canApply && (
-                    <button
-                      type="button"
-                      onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
-                      className="shrink-0 rounded-md border border-amber-500/40 bg-amber-900/40 px-3 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/50"
-                    >
+            <p className="text-xs uppercase text-zinc-500">Canlı işlemlerden ({tuning.samples} kapanmış)</p>
+            {tuning.suggestions.map((s, i) => (
+              <div key={`live-${i}`} className="flex items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-950/20 px-4 py-3">
+                <p className="text-sm text-amber-100/90">{s.message}</p>
+                {s.type === "auto_min_impact" && typeof s.suggested === "number" && (
+                  <button type="button" onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
+                    className="shrink-0 rounded-md border border-amber-500/40 bg-amber-900/40 px-3 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/50">
+                    Uygula → {s.suggested}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Ön-bilgi: işlemsiz, arşiv backtest'inden */}
+        {pretrade && (
+          <div className="mt-3 space-y-2">
+            <p className="text-xs uppercase text-sky-400/70">
+              İşlemsiz ön-bilgi {pretrade.ready ? `(${pretrade.samples} arşiv sinyali backtest)` : ""}
+            </p>
+            {!pretrade.ready ? (
+              <p className="rounded-2xl border border-white/10 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-500">{pretrade.reason ?? "Yeterli arşiv yok — motoru bir süre çalıştır."}</p>
+            ) : pretrade.suggestions.length === 0 ? (
+              <p className="rounded-2xl border border-emerald-500/20 bg-emerald-950/10 px-4 py-3 text-sm text-emerald-300/80">Arşiv backtest'i mevcut eşiklerle uyumlu — değişiklik önerilmiyor.</p>
+            ) : (
+              pretrade.suggestions.map((s, i) => (
+                <div key={`pre-${i}`} className="flex items-center justify-between gap-3 rounded-2xl border border-sky-500/30 bg-sky-950/20 px-4 py-3">
+                  <p className="text-sm text-sky-100/90">{s.message}</p>
+                  {s.type === "auto_min_impact" && typeof s.suggested === "number" && (
+                    <button type="button" onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
+                      className="shrink-0 rounded-md border border-sky-500/40 bg-sky-900/40 px-3 py-1 text-xs font-semibold text-sky-100 hover:bg-sky-800/50">
                       Uygula → {s.suggested}
                     </button>
                   )}
                 </div>
-              );
-            })}
+              ))
+            )}
           </div>
-        </section>
-      )}
+        )}
+
+        {(!tuning || !tuning.ready || tuning.suggestions.length === 0) && !pretrade && (
+          <p className="rounded-2xl border border-white/10 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-500">
+            Henüz canlı öneri yok. Gerçek para riske atmadan kalibrasyon için <strong className="text-sky-300">İşlemsiz ön-bilgi</strong>'yi çalıştır — arşivdeki sinyalleri backtest edip eşik önerir.
+          </p>
+        )}
+      </section>
 
       {/* Performans */}
       {perf && perf.total_trades > 0 && (

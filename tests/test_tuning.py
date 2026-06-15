@@ -66,3 +66,40 @@ def test_tuning_endpoint(env, monkeypatch):
     c = TestClient(nb.app)
     out = c.get("/tuning").json()
     assert out["ready"] is True and "by_impact" in out and "by_tier" in out
+
+
+# ── İşlemsiz ön-bilgi: backtest sonuçlarından öneri (suggest_from_backtest) ──
+def _bt(net_pct, impact=9, source="Binance"):
+    return {"net_pct": net_pct, "impact": impact, "source": source,
+            "symbol": "FOOUSDT", "direction": "bullish", "outcome": "tp"}
+
+
+def test_pretrade_not_ready_below_min(env):
+    out = trader.suggest_from_backtest([_bt(1.0) for _ in range(5)])
+    assert out["ready"] is False and out["pretrade"] is True
+
+
+def test_pretrade_suggests_from_backtest(env):
+    # güç 7 backtest'te negatif, güç 9 pozitif → eşik 7→9 yükselt (gerçek işlem YOK)
+    results = [_bt(-2.0, impact=7) for _ in range(6)] + [_bt(4.0, impact=9) for _ in range(6)]
+    out = trader.suggest_from_backtest(results)
+    s = [x for x in out["suggestions"] if x["type"] == "auto_min_impact"]
+    assert out["ready"] is True and s and s[0]["suggested"] == 9
+    assert "%" in s[0]["message"]   # birim % (USDT değil)
+
+
+def test_pretrade_tier_from_backtest(env):
+    results = [_bt(-1.5, impact=9, source="⚡Twitter") for _ in range(12)]
+    out = trader.suggest_from_backtest(results, tier_of=nb._source_tier)
+    tiers = [x for x in out["suggestions"] if x["type"] == "suppress_tier"]
+    assert tiers and tiers[0]["tier"] == "sosyal"
+
+
+def test_pretrade_endpoint_empty_archive(env, monkeypatch):
+    class _FakeStore:
+        def list_signals(self, **kw):
+            return []
+    monkeypatch.setattr(nb, "get_store", lambda: _FakeStore())
+    c = TestClient(nb.app)
+    out = c.get("/tuning/pretrade").json()
+    assert out["ready"] is False and out["pretrade"] is True and out["samples"] == 0

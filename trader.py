@@ -922,37 +922,38 @@ MIN_LEARN_SAMPLES = 10   # öneri üretmek için gereken min kapanmış işlem
 _MIN_BUCKET_SAMPLES = 4  # bir dilimi/kaynağı yargılamak için min örnek
 
 
-def _bucket_stats(closed: list[dict[str, Any]],
-                  key_fn: Any) -> dict[str, dict[str, Any]]:
-    """closed'ı key_fn'e göre grupla: {key: {count, pnl, avg_pnl, win_rate}}."""
+def _bucket_stats(trades: list[dict[str, Any]], key_fn: Any,
+                  value_key: str = "pnl") -> dict[str, dict[str, Any]]:
+    """trades'i key_fn'e göre grupla: {key: {count, pnl, avg_pnl, win_rate}}.
+    value_key: kâr alanı — canlı işlemde 'pnl' (USDT), backtest'te 'net_pct' (%)."""
     out: dict[str, dict[str, Any]] = {}
-    for c in closed:
+    for c in trades:
         k = key_fn(c)
         if k is None:
             continue
         d = out.setdefault(str(k), {"count": 0, "pnl": 0.0, "wins": 0})
+        v = float(c[value_key])
         d["count"] += 1
-        d["pnl"] = round(d["pnl"] + c["pnl"], 2)
-        if c["pnl"] > 0:
+        d["pnl"] = round(d["pnl"] + v, 3)
+        if v > 0:
             d["wins"] += 1
     for d in out.values():
-        d["avg_pnl"] = round(d["pnl"] / d["count"], 2)
+        d["avg_pnl"] = round(d["pnl"] / d["count"], 3)
         d["win_rate"] = round(d["wins"] / d["count"] * 100, 1)
     return out
 
 
-def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
-    """Kapanan işlemlerden ayar önerileri üret (YAN ETKİSİZ — uygulamaz).
+def _suggest_from_trades(trades: list[dict[str, Any]], *, value_key: str, source_key: str,
+                         tier_of: Any, unit: str) -> dict[str, Any]:
+    """İşlem/sonuç listesinden eşik önerileri üret (saf — canlı VE backtest için ortak).
 
-    tier_of: news_source -> tier eşleyen opsiyonel callable (news_bot._source_tier).
-    Dönen: {ready, samples, min_samples, suggestions[], by_impact, by_tier, by_source}.
+    value_key: kâr alanı; source_key: haber kaynağı alanı; unit: mesaj birimi (' USDT'/'%').
+    YAN ETKİSİZ — yalnızca öneri döndürür, ayar değiştirmez.
     """
-    with _lock:
-        closed = [c for c in _closed if c.get("pnl") is not None]
-    n = len(closed)
-    by_impact = _bucket_stats(closed, lambda c: int(c["impact"]) if c.get("impact") else None)
-    by_source = _bucket_stats(closed, lambda c: c.get("news_source") or None)
-    by_tier = (_bucket_stats(closed, lambda c: tier_of(c.get("news_source") or "") if c.get("news_source") else None)
+    n = len(trades)
+    by_impact = _bucket_stats(trades, lambda c: int(c["impact"]) if c.get("impact") else None, value_key)
+    by_source = _bucket_stats(trades, lambda c: c.get(source_key) or None, value_key)
+    by_tier = (_bucket_stats(trades, lambda c: tier_of(c.get(source_key) or "") if c.get(source_key) else None, value_key)
                if tier_of else {})
 
     suggestions: list[dict[str, Any]] = []
@@ -961,14 +962,14 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
                 "suggestions": [], "by_impact": by_impact, "by_tier": by_tier,
                 "by_source": by_source}
 
-    # 1) auto_min_impact: beklentiyi (o eşik ve üstü ort. P&L) en yükseğe çıkaran eşik
+    # 1) auto_min_impact: beklentiyi (o eşik ve üstü ort. kâr) en yükseğe çıkaran eşik
     impacts = sorted(int(k) for k in by_impact)
     best_t, best_avg = None, None
     for t in impacts:
-        rows = [c for c in closed if c.get("impact") and int(c["impact"]) >= t]
+        rows = [c for c in trades if c.get("impact") and int(c["impact"]) >= t]
         if len(rows) < _MIN_BUCKET_SAMPLES:
             continue
-        avg = round(sum(c["pnl"] for c in rows) / len(rows), 2)
+        avg = round(sum(float(c[value_key]) for c in rows) / len(rows), 3)
         if best_avg is None or avg > best_avg:
             best_t, best_avg = t, avg
     if best_t is not None and best_avg is not None and best_avg > 0 and best_t != S.auto_min_impact:
@@ -976,7 +977,7 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
         suggestions.append({
             "type": "auto_min_impact", "current": S.auto_min_impact, "suggested": best_t,
             "message": f"Oto min. gücü {S.auto_min_impact}→{best_t} {verb}: güç ≥{best_t} "
-                       f"işlemlerin ort. P&L'i +{best_avg} USDT (pozitif beklenti).",
+                       f"ort. {best_avg}{unit} (pozitif beklenti).",
         })
 
     # 2) kaynak-tier: yeterli örnekli ve negatif beklentili tier'i kıs
@@ -984,8 +985,8 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
         if d["count"] >= MIN_LEARN_SAMPLES and d["avg_pnl"] < 0:
             suggestions.append({
                 "type": "suppress_tier", "tier": tier, "avg_pnl": d["avg_pnl"], "count": d["count"],
-                "message": f"'{tier}' kaynak sınıfı negatif beklentili (ort. {d['avg_pnl']} USDT, "
-                           f"{d['count']} işlem) — bu sınıfı kısmayı/güç eşiğini artırmayı düşün.",
+                "message": f"'{tier}' kaynak sınıfı negatif beklentili (ort. {d['avg_pnl']}{unit}, "
+                           f"{d['count']} örnek) — bu sınıfı kısmayı/güç eşiğini artırmayı düşün.",
             })
 
     # 3) tek kaynak: negatif beklentili kaynağı sustur (suppress_losing_sources ile)
@@ -993,13 +994,37 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
         if d["count"] >= S.min_source_samples and d["avg_pnl"] < 0:
             suggestions.append({
                 "type": "suppress_source", "source": src, "avg_pnl": d["avg_pnl"], "count": d["count"],
-                "message": f"Kaynak '{src}' negatif beklentili (ort. {d['avg_pnl']} USDT, "
-                           f"{d['count']} işlem) — 'kaybeden kaynağı sustur' bunu zaten eler.",
+                "message": f"Kaynak '{src}' negatif beklentili (ort. {d['avg_pnl']}{unit}, "
+                           f"{d['count']} örnek) — 'kaybeden kaynağı sustur' bunu zaten eler.",
             })
 
     return {"ready": True, "samples": n, "min_samples": MIN_LEARN_SAMPLES,
             "suggestions": suggestions, "by_impact": by_impact, "by_tier": by_tier,
             "by_source": by_source}
+
+
+def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
+    """Kapanan GERÇEK işlemlerden ayar önerileri üret (YAN ETKİSİZ — uygulamaz).
+
+    tier_of: news_source -> tier eşleyen opsiyonel callable (news_bot._source_tier).
+    """
+    with _lock:
+        closed = [c for c in _closed if c.get("pnl") is not None]
+    return _suggest_from_trades(closed, value_key="pnl", source_key="news_source",
+                                tier_of=tier_of, unit=" USDT")
+
+
+def suggest_from_backtest(results: list[dict[str, Any]], tier_of: Any = None) -> dict[str, Any]:
+    """İşlemsiz ÖN-BİLGİ: backtest sonuçlarından (arşiv simülasyonu) aynı önerileri üret.
+
+    Gerçek para riske atmadan kalibrasyon → sistem ilk işlemden itibaren akıllı. Backtest
+    sonucu net %% (`net_pct`) ve haber kaynağı (`source`) taşır.
+    """
+    trades = [r for r in results if r.get("net_pct") is not None]
+    out = _suggest_from_trades(trades, value_key="net_pct", source_key="source",
+                               tier_of=tier_of, unit="%")
+    out["pretrade"] = True
+    return out
 
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────

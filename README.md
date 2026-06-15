@@ -69,6 +69,19 @@ Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak
 - **Risk tavanları** — toplam/coin maruziyet + açık SL-riski sınırları.
 - **Token koruması** — `API_TOKEN` ile işlem uçları korunur (dışa açık dağıtımlarda zorunlu).
 - **Likidite/slippage** — orderbook derinliği ve tahmini slippage girişte kontrol edilir.
+- **İdempotent emir** — `create_order` sabit `clientOrderId` ile gönderilir; yanıt kaybolsa bile **çift emir oluşmaz**.
+- **Acil flatten** — panelde "⛔ Tümünü kapat" / `POST /positions/close-all` ile tüm pozisyonlar tek tıkla kapatılır.
+
+## Canlı işleme geçmeden — kontrol listesi
+
+Sırayla:
+
+1. **Paper'da doğrula.** Motoru bir süre paper modda çalıştır; `/signals` arşivi birikince `news_backtest --walk` (veya panelde Walk-forward) **pozitif/tutarlı** karar verene kadar auto-trade'i açma. Edge kanıtlanmadan gerçek para riske atma.
+2. **İlk canlı işlem minik.** `BINANCE_API_KEY`/`SECRET` (para çekme KAPALI + IP allowlist) ekledikten sonra `trade_usdt`'yi en düşükte tut, tek işlemle borsa entegrasyonunu (emir/teyit/SL-TP/kapanış) doğrula.
+3. **Risk limitlerini ayarla.** `daily_loss_limit_usdt` (kill-switch), `max_total_exposure_usdt`, `max_per_coin_usdt`, `max_open_risk_usdt`, `reduce_after_losses` — hepsini hesabına göre gir.
+4. **Erişimi kapat.** Sunucu dışa açıksa `API_TOKEN` ayarla; aksi halde mutasyon uçları korumasız.
+5. **Tek örnek çalıştır.** Aynı anda iki motor = çift işlem (süreçler-arası kilit yok). Tek instance kuralına uy.
+6. **İzle.** `/health` (WS bağlı mı, son mesaj yaşı) ve `/metrics` (rate-limit/retry) ile gerçek-zamanlı kaynağın ve Binance entegrasyonunun sağlığını gözle; sorun olursa **acil flatten** hazırda.
 
 ## Geliştirme
 

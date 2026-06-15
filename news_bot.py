@@ -1625,6 +1625,21 @@ def patch_position(pid: str, body: PositionPatch) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.post("/positions/close-all", dependencies=[Depends(require_token)])
+def close_all_positions() -> dict[str, Any]:
+    """ACİL: tüm açık pozisyonları kapat (flatten). Detaylı rapor döner."""
+    report = trader.close_all(reason="acil-toplu")
+    for c in report["closed"]:
+        _persist_closed(c)
+    if report["closed"]:
+        notify_remote(
+            f"⛔ TÜMÜ KAPATILDI: {report['count']} pozisyon · P&L "
+            f"{report['total_pnl']:+.2f} USDT"
+            + (f" · {report['failed']} hata" if report["failed"] else "")
+        )
+    return report
+
+
 @app.delete("/positions/{pid}", dependencies=[Depends(require_token)])
 def delete_position(pid: str) -> dict[str, Any]:
     try:

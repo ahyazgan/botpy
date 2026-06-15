@@ -385,6 +385,7 @@ export default function App() {
   const [showJournal, setShowJournal] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const [search, setSearch] = useState("");
@@ -559,6 +560,22 @@ export default function App() {
       await load();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Kapatılamadı");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const closeAll = async () => {
+    if (!window.confirm("TÜM açık pozisyonlar kapatılsın mı? Bu işlem geri alınamaz.")) return;
+    setBusy("close-all");
+    try {
+      const r = await fetch(`${API_BASE}/positions/close-all`, { method: "POST" });
+      if (!r.ok) throw new Error(String(r.status));
+      const rep = await r.json();
+      setNotice(`⛔ ${rep.count} pozisyon kapatıldı · P&L ${rep.total_pnl >= 0 ? "+" : ""}${rep.total_pnl} USDT${rep.failed ? ` · ${rep.failed} hata` : ""}`);
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Toplu kapatma başarısız");
     } finally {
       setBusy(null);
     }
@@ -955,6 +972,12 @@ export default function App() {
             {err}
           </div>
         )}
+        {notice && (
+          <div className="mt-4 flex items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-950/40 px-4 py-3 text-sm text-emerald-200">
+            <span>{notice}</span>
+            <button type="button" onClick={() => setNotice(null)} className="text-emerald-400 hover:text-emerald-200">✕</button>
+          </div>
+        )}
 
         <div className="mt-6 flex flex-wrap items-center gap-3">
           <input
@@ -1133,9 +1156,20 @@ export default function App() {
             <h2 className="text-lg font-semibold text-white">
               Açık pozisyonlar <span className="ml-2 text-sm font-normal text-zinc-500">({positions.length})</span>
             </h2>
-            <span className={`text-sm font-semibold ${totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-              Toplam P&L: {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)} USDT
-            </span>
+            <div className="flex items-center gap-3">
+              <span className={`text-sm font-semibold ${totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                Toplam P&L: {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)} USDT
+              </span>
+              <button
+                type="button"
+                disabled={busy === "close-all"}
+                onClick={() => void closeAll()}
+                title="ACİL: tüm açık pozisyonları kapat (flatten)"
+                className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200 transition hover:bg-red-900/60 disabled:opacity-40"
+              >
+                {busy === "close-all" ? "Kapatılıyor…" : "⛔ Tümünü kapat"}
+              </button>
+            </div>
           </div>
           <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
             <div className="overflow-x-auto">

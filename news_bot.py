@@ -1293,6 +1293,7 @@ def health() -> dict[str, Any]:
         "treenews": USE_TREENEWS,
         "ws_connected": _ws_state["connected"],
         "ws_last_msg_age_sec": _ws_last_msg_age(),
+        "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
     }
 

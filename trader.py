@@ -279,6 +279,43 @@ def _check_risk(symbol: str, usdt: float) -> None:
 
 
 # ── İşlem açma ───────────────────────────────────────────────────────────
+def _find_order(ex: Any, symbol: str, coid: str) -> dict[str, Any] | None:
+    """clientOrderId ile borsadaki emri getir (yoksa/hata None)."""
+    try:
+        return ex.fetch_order(coid, symbol, {"origClientOrderId": coid})
+    except Exception:
+        return None
+
+
+def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount: float,
+                             *, price: float | None = None, params: dict[str, Any] | None = None,
+                             retries: int = 3, sleep: Any = time.sleep) -> dict[str, Any]:
+    """create_order — ÇİFT EMİR'e karşı idempotent.
+
+    Sabit `newClientOrderId` tüm denemelerde aynı kalır → borsa (Binance) aynı
+    clientOrderId'li ikinci emri reddeder; yani yanıt kaybolup retry edilse bile
+    çift emir oluşmaz. Hata sonrası emir borsada varsa onu döndürür, yoksa dener.
+    """
+    params = dict(params or {})
+    coid = params.get("newClientOrderId") or ("botpy" + uuid.uuid4().hex[:20])
+    params["newClientOrderId"] = coid
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            return ex.create_order(symbol, otype, side, amount, price, params)
+        except Exception as e:
+            last_exc = e
+            # Yanıt alınamamış olabilir ya da duplicate reddi gelmiş olabilir →
+            # bu coid ile emir borsada oluştuysa onu kullan (tekrar gönderme).
+            found = _find_order(ex, symbol, coid)
+            if found is not None:
+                log.warning("create_order tekrar gönderilmedi — emir borsada mevcut (%s)", coid)
+                return found
+            if attempt < retries - 1:
+                sleep(0.5 * (2 ** attempt))
+    raise last_exc if last_exc else RuntimeError("emir gönderilemedi")
+
+
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
                 news_source: str = "", impact: int | None = None) -> dict[str, Any]:
@@ -320,9 +357,9 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
             except Exception as e:
                 log.warning("Kaldıraç ayarlanamadı (%s): %s", csym, e)
         if S.order_type == "limit":
-            order = ex.create_order(csym, "limit", ex_side, amount, price)
+            order = _create_order_idempotent(ex, csym, "limit", ex_side, amount, price=price)
         else:
-            order = ex.create_order(csym, "market", ex_side, amount)
+            order = _create_order_idempotent(ex, csym, "market", ex_side, amount)
         if order.get("average"):
             price = float(order["average"])
         if order.get("filled"):
@@ -403,7 +440,7 @@ def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
             csym = _ccxt_symbol(pos["symbol"])
             ex_side = "sell" if pos["side"] == "long" else "buy"
             params = {"reduceOnly": True} if pos["market"] == "futures" else {}
-            ex.create_order(csym, "market", ex_side, pos["amount"], None, params)
+            _create_order_idempotent(ex, csym, "market", ex_side, pos["amount"], params=params)
         except Exception as e:
             log.warning("Canlı kapatma hatası (%s): %s", pos["symbol"], e)
 
@@ -505,7 +542,7 @@ def _partial_close(p: dict[str, Any], frac: float, reason: str, cur: float) -> d
             csym = _ccxt_symbol(p["symbol"])
             ex_side = "sell" if p["side"] == "long" else "buy"
             params = {"reduceOnly": True} if p["market"] == "futures" else {}
-            ex.create_order(csym, "market", ex_side, close_amt, None, params)
+            _create_order_idempotent(ex, csym, "market", ex_side, close_amt, params=params)
         except Exception as e:
             log.warning("Kısmi kapatma hatası (%s): %s", p["symbol"], e)
             return None

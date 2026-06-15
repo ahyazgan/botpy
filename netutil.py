@@ -22,6 +22,14 @@ RETRY_AFTER_MAX = 120.0   # Retry-After başlığına uyulurken üst sınır (sa
 
 SleepFn = Callable[[float], None]
 
+# Gözlemlenebilirlik sayaçları (monoton; /metrics ile dışa verilir)
+_stats: dict[str, int] = {"retries": 0, "rate_limited": 0}
+
+
+def get_stats() -> dict[str, int]:
+    """Toplam yeniden-deneme ve rate-limit (429/418) sayaçlarının kopyası."""
+    return dict(_stats)
+
 
 def _retry_after_seconds(resp: Any) -> float | None:
     """`Retry-After` başlığını saniyeye çevir (yalnızca delta-seconds). Saf.
@@ -69,11 +77,14 @@ def get_json(
                     return None
             if r.status_code < 500 and r.status_code not in RETRYABLE_STATUS:
                 return None  # istemci hatası (404 vb.) → retry yok
+            if r.status_code in RETRYABLE_STATUS:
+                _stats["rate_limited"] += 1
             # 5xx veya 429/418 (rate-limit) → yeniden dene; sunucu Retry-After verdiyse ona uy
             ra = _retry_after_seconds(r)
             if ra is not None:
                 wait = min(ra, RETRY_AFTER_MAX)
             log.debug("get_json yeniden denenebilir durum (%s): HTTP %d (bekleme %.1fs)", url, r.status_code, wait)
         if attempt < retries - 1:
+            _stats["retries"] += 1
             sleep(wait)
     return None

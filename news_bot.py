@@ -43,7 +43,7 @@ from pydantic import BaseModel
 
 import storage
 import trader
-from netutil import get_json
+from netutil import get_json, get_stats
 from notify import Notifier
 
 load_dotenv()  # .env dosyasındaki ANTHROPIC_API_KEY'i okur
@@ -1231,6 +1231,8 @@ _METRIC_META = {
     "botpy_signals_archived": ("gauge", "Arşivlenmiş sinyal sayısı"),
     "botpy_ws_connected": ("gauge", "TreeNews WS bağlı mı (1/0)"),
     "botpy_ws_last_msg_age_seconds": ("gauge", "Son WS mesajından bu yana saniye"),
+    "botpy_rate_limited_total": ("counter", "Binance 429/418 rate-limit yanıtı"),
+    "botpy_http_retries_total": ("counter", "Dış API yeniden deneme sayısı"),
 }
 
 
@@ -1269,6 +1271,9 @@ def metrics() -> PlainTextResponse:
     age = _ws_last_msg_age()
     if age is not None:
         values["botpy_ws_last_msg_age_seconds"] = age
+    net = get_stats()
+    values["botpy_rate_limited_total"] = net["rate_limited"]
+    values["botpy_http_retries_total"] = net["retries"]
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
 
 

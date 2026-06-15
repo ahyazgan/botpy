@@ -18,9 +18,9 @@
 
 ## Next (Now bitince)
 
-- [ ] Sinyal detay paneli (şeffaflık: gerekçe/coin/teyit kırılımı)
+- [x] Sinyal detay paneli (şeffaflık: gerekçe/coin/teyit kırılımı)  (fd31844)
   Done when: haber kartına tıkla → detay (puanlayıcı/gerekçe/24s-15dk-1s/teyit); tsc+build yeşil; commit.
-- [ ] Bağlantı/onboarding durumu (Telegram/Claude/Binance bağlı mı)
+- [x] Bağlantı/onboarding durumu (Telegram/Claude/Binance bağlı mı)  (d90ce71)
   Done when: footer/health'te env-kaynak rozetleri (scorer=claude/rule, remote açık, canlı anahtar); commit.
 
 -----

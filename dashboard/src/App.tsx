@@ -284,6 +284,15 @@ function fmtUptime(sec: number): string {
   return `${Math.floor(h / 24)}g ${h % 24}sa`;
 }
 
+function ConnDot({ ok, label, offLabel }: { ok: boolean; label: string; offLabel: string }) {
+  return (
+    <span title={`${label}: ${ok ? "bağlı" : "yapılandırılmamış"}`} className="inline-flex items-center gap-1">
+      <span className={ok ? "text-emerald-400" : "text-zinc-600"}>●</span>
+      <span className={ok ? "text-zinc-400" : "text-zinc-600"}>{ok ? label : offLabel}</span>
+    </span>
+  );
+}
+
 function RiskMeter({ label, used, cap, suffix = "USDT" }: { label: string; used: number; cap: number; suffix?: string }) {
   const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
   const color = pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
@@ -383,6 +392,7 @@ export default function App() {
     typeof localStorage !== "undefined" && localStorage.getItem("notifyBrowser") === "1");
   const notifiedRef = useRef<Set<string>>(new Set());
   const notifyPrimedRef = useRef(false);
+  const [expandedNews, setExpandedNews] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -878,6 +888,12 @@ export default function App() {
               </span>
             </>
           )}
+          <span className="text-zinc-700">|</span>
+          <span className="flex items-center gap-1.5" title="Bağlantı durumu: yeşil = yapılandırılmış">
+            <ConnDot ok={health?.scorer === "claude"} label="Claude" offLabel="kural" />
+            <ConnDot ok={!!newsSettings?.remote_channels_available} label="Telegram/Discord" offLabel="uzak yok" />
+            <ConnDot ok={!!settings?.has_live_keys} label="Binance canlı" offLabel="paper" />
+          </span>
         </div>
 
         {err && (
@@ -965,7 +981,28 @@ export default function App() {
                       <span className="text-zinc-700">·</span>
                       <span>{timeAgo(n.published ?? n.fetched_at)}</span>
                       {n.reason && (<><span className="text-zinc-700">·</span><span className="italic text-zinc-500">{n.reason}</span></>)}
+                      <button
+                        type="button"
+                        onClick={() => setExpandedNews((v) => (v === n.id ? null : n.id))}
+                        className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline"
+                      >
+                        {expandedNews === n.id ? "detayı gizle ▴" : "detay ▾"}
+                      </button>
                     </div>
+
+                    {expandedNews === n.id && (
+                      <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 rounded-lg border border-white/10 bg-zinc-800/40 p-3 text-xs sm:grid-cols-3">
+                        <div><span className="text-zinc-500">Puanlayıcı:</span> <span className="text-zinc-300">{n.scorer === "claude" ? "Claude" : "kural"}</span></div>
+                        <div><span className="text-zinc-500">Parite:</span> <span className="text-zinc-300">{n.symbol ?? "—"}</span></div>
+                        <div><span className="text-zinc-500">Teyit:</span> <span className={n.confirmed ? "text-emerald-400" : "text-zinc-400"}>{n.confirmed ? "✅ teyitli" : "⏳ yok"}</span></div>
+                        <div><span className="text-zinc-500">24s:</span> <span className="text-zinc-300">{n.price_24h_pct !== null ? `${n.price_24h_pct > 0 ? "+" : ""}${n.price_24h_pct}%` : "—"}</span></div>
+                        <div><span className="text-zinc-500">15dk:</span> <span className="text-zinc-300">{n.price_15m_pct !== null ? `${n.price_15m_pct > 0 ? "+" : ""}${n.price_15m_pct}%` : "—"}</span></div>
+                        <div><span className="text-zinc-500">1s:</span> <span className="text-zinc-300">{n.price_60m_pct !== null ? `${n.price_60m_pct > 0 ? "+" : ""}${n.price_60m_pct}%` : "—"}</span></div>
+                        <div className="col-span-2 sm:col-span-3"><span className="text-zinc-500">Hacim:</span> <span className="text-zinc-300">{fmtUsd(n.volume_usd)}</span></div>
+                        {n.price_note && <div className="col-span-2 italic text-zinc-400 sm:col-span-3">{n.price_note}</div>}
+                        {n.reason && <div className="col-span-2 text-zinc-400 sm:col-span-3"><span className="text-zinc-500">Gerekçe:</span> {n.reason}</div>}
+                      </div>
+                    )}
 
                     {/* Fiyat teyidi + işlem (yalnızca güçlü haberlerde) */}
                     {strong && (

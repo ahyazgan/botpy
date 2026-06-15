@@ -206,6 +206,13 @@ _status: dict[str, Any] = {
 }
 _started_at = time.time()   # uptime hesabı için
 
+# Gözlemlenebilirlik sayaçları (monoton artan; /metrics ile dışa verilir)
+_metrics: dict[str, int] = {
+    "alerts_total": 0,          # eşik üstü güçlü haber sayısı
+    "trades_opened_total": 0,   # otomatik açılan pozisyon sayısı
+    "scan_errors_total": 0,     # arka plan tarama hatası sayısı
+}
+
 # ── Çalışma zamanı ayarları (panelden değişir, store'da kalıcı) ───────────
 _news_settings: dict[str, Any] = {
     "alert_threshold": ALERT_THRESHOLD,   # bu güç (1-10) ve üstü = uyarı/işlem
@@ -775,6 +782,7 @@ def process_items(
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
     alerts = [it for it in new_items if it.impact >= threshold]
+    _metrics["alerts_total"] += len(alerts)
     for it in alerts:
         try:
             confirm_with_price(session, it)
@@ -795,6 +803,7 @@ def process_items(
             notify(it)
             pos = trader.maybe_auto_trade(it)
             if pos:
+                _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
 
@@ -837,6 +846,7 @@ def refresh(session: requests.Session) -> None:
         )
     except Exception as e:
         log.exception("Tarama hatası: %s", e)
+        _metrics["scan_errors_total"] += 1
         with _cache_lock:
             _status["error"] = str(e)
             _status["updated_at"] = _now_iso()
@@ -935,6 +945,18 @@ def parse_tree_message(raw: str) -> NewsItem | None:
     return item
 
 
+_WS_BACKOFF_BASE = 2.0
+_WS_BACKOFF_MAX = 60.0
+_WS_STABLE_SEC = 30.0   # bu kadar bağlı kaldıysa backoff sıfırlanır
+
+
+def _next_backoff(prev: float) -> float:
+    """Üstel backoff: 0/negatiften taban, aksi halde iki katı, tavanla sınırlı. Saf."""
+    if prev <= 0:
+        return _WS_BACKOFF_BASE
+    return min(_WS_BACKOFF_MAX, prev * 2)
+
+
 def _tree_ws_loop(stop: threading.Event) -> None:
     import websocket
 
@@ -962,15 +984,20 @@ def _tree_ws_loop(stop: threading.Event) -> None:
     def on_error(ws: Any, err: Any) -> None:
         log.warning("TreeNews WS hatası: %s", err)
 
+    backoff = 0.0
     while not stop.is_set():
+        started = time.monotonic()
         try:
             ws = websocket.WebSocketApp(
                 TREE_WS, on_open=on_open, on_message=on_message, on_error=on_error,
             )
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            log.warning("TreeNews WS yeniden bağlanıyor: %s", e)
-        if stop.wait(5):
+            log.warning("TreeNews WS hatası: %s", e)
+        # Uzun süre bağlı kaldıysa backoff'u sıfırla; yoksa üstel büyüt (flood koruması)
+        backoff = _WS_BACKOFF_BASE if time.monotonic() - started >= _WS_STABLE_SEC else _next_backoff(backoff)
+        log.info("TreeNews WS yeniden bağlanılıyor (%.0fs)...", backoff)
+        if stop.wait(backoff):
             break
 
 
@@ -1075,6 +1102,52 @@ def get_alerts(limit: int = 50) -> NewsResponse:
 def healthz() -> dict[str, bool]:
     """Liveness probe — süreç ayakta mı. Her zaman 200; bağımlılık kontrolü yok."""
     return {"ok": True}
+
+
+_METRIC_META = {
+    "botpy_uptime_seconds": ("gauge", "Süreç uptime (saniye)"),
+    "botpy_news_seen_total": ("counter", "Görülen toplam haber (dedupe sonrası)"),
+    "botpy_news_in_feed": ("gauge", "Bellekteki haber sayısı"),
+    "botpy_alerts_total": ("counter", "Eşik üstü güçlü haber"),
+    "botpy_trades_opened_total": ("counter", "Otomatik açılan pozisyon"),
+    "botpy_scan_errors_total": ("counter", "Arka plan tarama hatası"),
+    "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
+    "botpy_signals_archived": ("gauge", "Arşivlenmiş sinyal sayısı"),
+}
+
+
+def _render_metrics(values: dict[str, int | float]) -> str:
+    """Prometheus exposition formatı (saf)."""
+    lines = []
+    for name, (mtype, help_text) in _METRIC_META.items():
+        if name not in values:
+            continue
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {mtype}")
+        lines.append(f"{name} {values[name]}")
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/metrics")
+def metrics() -> PlainTextResponse:
+    """Prometheus-uyumlu sayaç/gauge metrikleri (gözlemlenebilirlik)."""
+    with _cache_lock:
+        seen, in_feed = len(_seen_ids), len(_news)
+    try:
+        archived = get_store().signal_span()["count"]
+    except Exception:
+        archived = 0
+    values: dict[str, int | float] = {
+        "botpy_uptime_seconds": int(time.time() - _started_at),
+        "botpy_news_seen_total": seen,
+        "botpy_news_in_feed": in_feed,
+        "botpy_alerts_total": _metrics["alerts_total"],
+        "botpy_trades_opened_total": _metrics["trades_opened_total"],
+        "botpy_scan_errors_total": _metrics["scan_errors_total"],
+        "botpy_open_positions": len(trader._positions),
+        "botpy_signals_archived": archived,
+    }
+    return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/health")

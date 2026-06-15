@@ -100,3 +100,20 @@ def test_security_headers(client):
     assert h["X-Frame-Options"] == "DENY"
     assert "default-src 'none'" in h["Content-Security-Policy"]
     assert "max-age" in h["Strict-Transport-Security"]
+
+
+def test_metrics_endpoint(client):
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    body = r.text
+    assert "# TYPE botpy_alerts_total counter" in body
+    assert "botpy_uptime_seconds " in body
+    assert "botpy_open_positions " in body
+
+
+def test_render_metrics_pure():
+    out = nb._render_metrics({"botpy_alerts_total": 3, "botpy_uptime_seconds": 10})
+    assert "# HELP botpy_alerts_total" in out
+    assert "botpy_alerts_total 3" in out
+    assert out.endswith("\n")

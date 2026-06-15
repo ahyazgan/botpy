@@ -17,9 +17,9 @@
 
 ## Next (Now bitince)
 
-- [ ] TreeNews WS reconnect/backoff sağlamlaştırma + parse testi
+- [x] TreeNews WS reconnect/backoff sağlamlaştırma + parse testi  (e643516)
   Done when: WS kopuşunda üstel backoff ile yeniden bağlanır; `parse_tree_message` birim testleri (borsa/twitter/site biçimleri); commit.
-- [ ] /metrics gözlemlenebilirlik (sayaçlar: taranan/uyarı/işlem/hata)
+- [x] /metrics gözlemlenebilirlik (sayaçlar: taranan/uyarı/işlem/hata)  (e6fdeed)
   Done when: `GET /metrics` basit sayaç/gauge metni döner; test; commit.
 
 -----

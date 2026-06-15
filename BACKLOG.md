@@ -21,7 +21,7 @@
 
 - [x] Liveness/readiness ayrımı `/health` (hafif liveness + zengin readiness)  (7126997)
   Done when: `/healthz` (her zaman 200) + `/health` (kaynak/uptime); test; commit.
-- [ ] Pozisyon bazında güç attribution (impact'i pozisyonda sakla → live `by_impact`)
+- [x] Pozisyon bazında güç attribution (impact pozisyonda saklanır → live by_impact)  (a954b66)
   Done when: place_trade impact saklar; get_performance `by_impact`; test; commit.
 - [ ] Güvenlik başlıkları (CSP/HSTS/X-Frame-Options/X-Content-Type-Options)
   Done when: FastAPI middleware başlıkları ekler; test; commit.

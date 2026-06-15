@@ -281,7 +281,7 @@ def _check_risk(symbol: str, usdt: float) -> None:
 # ── İşlem açma ───────────────────────────────────────────────────────────
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
-                news_source: str = "") -> dict[str, Any]:
+                news_source: str = "", impact: int | None = None) -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -359,6 +359,7 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "opened_at": _now(),
         "source": source,
         "news_source": news_source,
+        "impact": impact,
         "reason": reason,
     }
     with _lock:
@@ -615,7 +616,8 @@ def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
         return None
     try:
         return place_trade(item.symbol, d["side"], usdt=d["usdt"], source="auto",
-                           news_source=d["news_source"], reason=getattr(item, "reason", ""))
+                           news_source=d["news_source"], impact=int(item.impact),
+                           reason=getattr(item, "reason", ""))
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
         return None
@@ -774,6 +776,7 @@ def get_performance() -> dict[str, Any]:
         "realized_today": realized_today,
         "by_source": _agg("source"),
         "by_news_source": _agg("news_source"),
+        "by_impact": _agg("impact"),
         "by_symbol": _agg("symbol"),
         "by_reason": _agg("close_reason"),
         "recent": list(reversed(closed[-30:])),

@@ -935,6 +935,18 @@ def parse_tree_message(raw: str) -> NewsItem | None:
     return item
 
 
+_WS_BACKOFF_BASE = 2.0
+_WS_BACKOFF_MAX = 60.0
+_WS_STABLE_SEC = 30.0   # bu kadar bağlı kaldıysa backoff sıfırlanır
+
+
+def _next_backoff(prev: float) -> float:
+    """Üstel backoff: 0/negatiften taban, aksi halde iki katı, tavanla sınırlı. Saf."""
+    if prev <= 0:
+        return _WS_BACKOFF_BASE
+    return min(_WS_BACKOFF_MAX, prev * 2)
+
+
 def _tree_ws_loop(stop: threading.Event) -> None:
     import websocket
 
@@ -962,15 +974,20 @@ def _tree_ws_loop(stop: threading.Event) -> None:
     def on_error(ws: Any, err: Any) -> None:
         log.warning("TreeNews WS hatası: %s", err)
 
+    backoff = 0.0
     while not stop.is_set():
+        started = time.monotonic()
         try:
             ws = websocket.WebSocketApp(
                 TREE_WS, on_open=on_open, on_message=on_message, on_error=on_error,
             )
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            log.warning("TreeNews WS yeniden bağlanıyor: %s", e)
-        if stop.wait(5):
+            log.warning("TreeNews WS hatası: %s", e)
+        # Uzun süre bağlı kaldıysa backoff'u sıfırla; yoksa üstel büyüt (flood koruması)
+        backoff = _WS_BACKOFF_BASE if time.monotonic() - started >= _WS_STABLE_SEC else _next_backoff(backoff)
+        log.info("TreeNews WS yeniden bağlanılıyor (%.0fs)...", backoff)
+        if stop.wait(backoff):
             break
 
 

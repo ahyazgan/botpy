@@ -8,10 +8,11 @@ from netutil import get_json
 
 
 class _Resp:
-    def __init__(self, status, payload=None, bad_json=False):
+    def __init__(self, status, payload=None, bad_json=False, headers=None):
         self.status_code = status
         self._payload = payload
         self._bad = bad_json
+        self.headers = headers or {}
 
     def json(self):
         if self._bad:
@@ -98,3 +99,30 @@ def test_404_still_no_retry():
     s = _Session([_Resp(404), _Resp(200, {"ok": 1})])
     assert get_json("u", session=s, retries=3, sleep=_no_sleep) is None
     assert s.calls == 1                              # diğer 4xx → tek deneme
+
+
+# ── Retry-After başlığı ──────────────────────────────────────────────────
+def test_retry_after_parse():
+    from netutil import _retry_after_seconds
+
+    class R:
+        def __init__(self, h):
+            self.headers = h
+    assert _retry_after_seconds(R({"Retry-After": "5"})) == 5.0
+    assert _retry_after_seconds(R({})) is None
+    assert _retry_after_seconds(R({"Retry-After": "abc"})) is None
+    assert _retry_after_seconds(R({"Retry-After": "-3"})) is None
+
+
+def test_honors_retry_after_over_backoff():
+    s = _Session([_Resp(429, headers={"Retry-After": "5"}), _Resp(200, {"ok": 1})])
+    slept = []
+    assert get_json("u", session=s, retries=3, backoff=0.4, sleep=slept.append) == {"ok": 1}
+    assert slept == [5.0]                    # backoff (0.4) yerine Retry-After (5)
+
+
+def test_retry_after_capped():
+    s = _Session([_Resp(429, headers={"Retry-After": "999"}), _Resp(200, {"ok": 1})])
+    slept = []
+    get_json("u", session=s, retries=3, sleep=slept.append)
+    assert slept == [120.0]                  # RETRY_AFTER_MAX ile sınırlı

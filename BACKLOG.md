@@ -27,7 +27,7 @@
 ## Later (düşük öncelik)
 
 - [ ] Canlı pozisyonları başlangıçta borsa ile mutabakat (Binance)
-- [ ] Yapılandırılabilir RSS kaynakları (ayarlardan)
+- [x] Yapılandırılabilir RSS kaynakları (ayarlardan)  (09ff6c6)
 
 -----
 

@@ -137,6 +137,18 @@ type Risk = {
   auto_trade: boolean;
 };
 
+type AutoPreviewRow = {
+  id: string;
+  title: string;
+  symbol: string | null;
+  impact: number;
+  direction: Direction;
+  would_trade: boolean;
+  reason: string;
+  side: string | null;
+  usdt: number | null;
+};
+
 type DailySummary = {
   date: string;
   trades: number;
@@ -306,6 +318,8 @@ export default function App() {
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
   const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
+  const [preview, setPreview] = useState<AutoPreviewRow[] | null>(null);
+  const [previewOn, setPreviewOn] = useState(false);
   const [risk, setRisk] = useState<Risk | null>(null);
   const [daily, setDaily] = useState<DailySummary | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -440,6 +454,18 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Kapatılamadı");
     } finally {
       setBusy(null);
+    }
+  };
+
+  const runPreview = async () => {
+    setPreviewOn((v) => !v);
+    if (preview === null) {
+      try {
+        const r = await fetch(`${API_BASE}/auto-preview`);
+        if (r.ok) setPreview((await r.json()).preview ?? []);
+      } catch {
+        setPreview([]);
+      }
     }
   };
 
@@ -1231,6 +1257,57 @@ export default function App() {
             </div>
           )}
         </div>
+      </section>
+
+      {/* Oto-işlem önizleme (dry-run) */}
+      <section className="mx-auto mt-10 max-w-5xl">
+        <button
+          type="button"
+          onClick={() => void runPreview()}
+          className="mb-3 text-lg font-semibold text-white transition hover:text-zinc-300"
+        >
+          Oto-işlem önizleme <span className="ml-1 text-sm font-normal text-zinc-500">(dry-run) {previewOn ? "▾" : "▸"}</span>
+        </button>
+        {previewOn && (
+          preview === null ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Yükleniyor…</p>
+          ) : preview.length === 0 ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Eşik üstü güçlü haber yok.</p>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/40 shadow-xl backdrop-blur">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[640px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/10 bg-zinc-900/90 text-xs uppercase text-zinc-500">
+                      <th className="px-4 py-3">Karar</th>
+                      <th className="px-4 py-3">Güç</th>
+                      <th className="px-4 py-3">Coin</th>
+                      <th className="px-4 py-3">Boyut</th>
+                      <th className="px-4 py-3">Gerekçe</th>
+                      <th className="px-4 py-3">Başlık</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.map((p) => (
+                      <tr key={p.id} className="border-b border-white/5 hover:bg-white/[0.03]">
+                        <td className="px-4 py-3">
+                          <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${p.would_trade ? "bg-emerald-950/60 text-emerald-300" : "bg-zinc-800/60 text-zinc-500"}`}>
+                            {p.would_trade ? `${p.side === "long" ? "LONG" : "SHORT"} açar` : "atlar"}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-400">{p.impact}/10</td>
+                        <td className="px-4 py-3 font-semibold text-zinc-200">{p.symbol ?? "—"}</td>
+                        <td className="px-4 py-3 tabular-nums text-zinc-400">{p.usdt !== null ? `$${p.usdt}` : "—"}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{p.reason}</td>
+                        <td className="px-4 py-3 max-w-xs truncate text-xs text-zinc-500" title={p.title}>{p.title}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )
+        )}
       </section>
 
       {/* İşlem günlüğü (kapanan işlemler + CSV) */}

@@ -1,0 +1,94 @@
+"""auto_decision (yan etkisiz oto-işlem kararı) + /auto-preview endpoint."""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+import news_bot as nb
+import trader
+from news_bot import NewsItem
+from storage import Store
+
+
+@pytest.fixture()
+def env(monkeypatch):
+    monkeypatch.setattr(trader, "_positions", [])
+    monkeypatch.setattr(trader, "_closed", [])
+    for k, v in {
+        "auto_min_impact": 7, "auto_require_confirm": True, "market": "spot",
+        "trade_usdt": 100.0, "size_by_impact": False, "skip_already_priced_pct": 0.0,
+        "suppress_losing_sources": False, "reduce_after_losses": 0, "cooldown_sec": 0,
+        "max_positions": 20, "auto_trade": False,
+    }.items():
+        setattr(trader.S, k, v)
+    monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
+    yield
+
+
+class _Item:
+    def __init__(self, impact=9, direction="bullish", confirmed=True, symbol="FOOUSDT",
+                 source="TreeNews", price_24h_pct=None):
+        self.impact = impact
+        self.direction = direction
+        self.confirmed = confirmed
+        self.symbol = symbol
+        self.source = source
+        self.price_24h_pct = price_24h_pct
+        self.reason = ""
+
+
+def test_decision_passes(env):
+    d = trader.auto_decision(_Item(impact=9))
+    assert d["would_trade"] is True and d["side"] == "long" and d["usdt"] == 100.0
+
+
+def test_decision_low_impact(env):
+    d = trader.auto_decision(_Item(impact=5))
+    assert d["would_trade"] is False and "eşik" in d["reason"]
+
+
+def test_decision_unconfirmed(env):
+    d = trader.auto_decision(_Item(confirmed=False))
+    assert d["would_trade"] is False and "teyid" in d["reason"]
+
+
+def test_decision_neutral_and_spot_short(env):
+    assert trader.auto_decision(_Item(direction="neutral"))["would_trade"] is False
+    d = trader.auto_decision(_Item(direction="bearish"))
+    assert d["would_trade"] is False and "short" in d["reason"]
+
+
+def test_decision_already_priced(env):
+    trader.S.skip_already_priced_pct = 15.0
+    d = trader.auto_decision(_Item(price_24h_pct=20.0))
+    assert d["would_trade"] is False and "fiyatlanmış" in d["reason"]
+
+
+def test_decision_conviction_size(env):
+    trader.S.size_by_impact = True
+    assert trader.auto_decision(_Item(impact=10))["usdt"] == 150.0
+
+
+def test_decision_is_side_effect_free(env):
+    """auto_decision pozisyon açmamalı."""
+    trader.auto_decision(_Item(impact=10))
+    assert trader._positions == []
+
+
+def test_auto_preview_endpoint(monkeypatch, tmp_path, env):
+    store = Store(str(tmp_path / "ap.db"))
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nb, "_settings_loaded", True)
+    monkeypatch.setattr(nb, "_news_settings", {"alert_threshold": 7, "remote_notify": True})
+    monkeypatch.setattr(nb, "_news", [
+        NewsItem(id="a", source="TreeNews", title="strong", url="u", published=None,
+                 fetched_at="2026-06-14T00:00:00+00:00", coins=["FOO"], impact=9,
+                 direction="bullish", symbol="FOOUSDT", confirmed=True),
+    ])
+    c = TestClient(nb.app)
+    d = c.get("/auto-preview").json()
+    assert d["auto_trade_on"] is False
+    assert len(d["preview"]) == 1
+    assert d["preview"][0]["would_trade"] is True and d["preview"][0]["usdt"] == 100.0
+    store.close()

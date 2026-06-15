@@ -227,6 +227,18 @@ type BacktestResult = {
 
 type BucketStat = { n: number; win_rate: number; avg_net_pct: number; total_pnl_usdt: number };
 
+type BacktestRun = {
+  id: number;
+  ts: string;
+  mode: string;
+  sl: number | null;
+  tp: number | null;
+  n: number | null;
+  win_rate: number | null;
+  total_pnl_usdt: number | null;
+  note: string | null;
+};
+
 type BacktestMode = "simple" | "grid" | "walk";
 
 function timeAgo(iso: string | null): string {
@@ -353,6 +365,7 @@ export default function App() {
   const [btMode, setBtMode] = useState<BacktestMode>("simple");
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
+  const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
 
   const load = useCallback(async () => {
     setErr(null);
@@ -507,6 +520,8 @@ export default function App() {
       const r = await fetch(`${API_BASE}/backtest?${qs.toString()}`);
       if (!r.ok) throw new Error(`backtest ${r.status}`);
       setBtResult(await r.json());
+      const rr = await fetch(`${API_BASE}/backtest/runs?limit=10`);
+      if (rr.ok) setBtRuns((await rr.json()).runs ?? []);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Backtest hatası");
     } finally {
@@ -1292,6 +1307,39 @@ export default function App() {
                   )}
                 </div>
               )}
+            </div>
+          )}
+          {btRuns.length > 0 && (
+            <div className="mt-4 border-t border-white/10 pt-4">
+              <p className="mb-2 text-xs uppercase text-zinc-500">Geçmiş çalıştırmalar (karşılaştır)</p>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[480px] text-left text-xs">
+                  <thead>
+                    <tr className="text-zinc-600">
+                      <th className="pb-1 font-normal">zaman</th>
+                      <th className="pb-1 font-normal">mod</th>
+                      <th className="pb-1 text-right font-normal">SL/TP</th>
+                      <th className="pb-1 text-right font-normal">n</th>
+                      <th className="pb-1 text-right font-normal">kazanma</th>
+                      <th className="pb-1 text-right font-normal">P&L</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {btRuns.map((r) => (
+                      <tr key={r.id} className="text-zinc-300">
+                        <td className="py-0.5 text-zinc-500">{timeAgo(r.ts)}</td>
+                        <td className="py-0.5">{r.mode}</td>
+                        <td className="py-0.5 text-right tabular-nums text-zinc-400">{r.sl ?? "—"}/{r.tp ?? "—"}</td>
+                        <td className="py-0.5 text-right tabular-nums text-zinc-400">{r.n ?? "—"}</td>
+                        <td className="py-0.5 text-right tabular-nums">%{r.win_rate ?? "—"}</td>
+                        <td className={`py-0.5 text-right tabular-nums ${(r.total_pnl_usdt ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                          {(r.total_pnl_usdt ?? 0) >= 0 ? "+" : ""}{(r.total_pnl_usdt ?? 0).toFixed(1)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
         </div>

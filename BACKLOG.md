@@ -30,8 +30,8 @@
 
 ## Later (düşük öncelik)
 
-- [ ] Backtest sonuçlarını kalıcı kaydet + karşılaştırma
-- [ ] Çoklu zaman dilimli teyit (15dk + 1s uyumu)
+- [x] Backtest sonuçlarını kalıcı kaydet + karşılaştırma  (c677689)
+- [x] Çoklu zaman dilimli teyit (15dk + 1s uyumu)  (a144af7)
 
 -----
 

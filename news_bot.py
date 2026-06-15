@@ -219,6 +219,7 @@ _news_settings: dict[str, Any] = {
     "remote_notify": True,                # Telegram/Discord push aç/kapat (env yoksa zaten sessiz)
 }
 _settings_loaded = False
+_rss_feeds: dict[str, str] | None = None   # store'dan lazy yüklenen efektif RSS listesi
 
 
 def _load_news_settings() -> None:
@@ -314,10 +315,36 @@ def fetch_binance_announcements(session: requests.Session) -> list[NewsItem]:
     return items
 
 
+def get_rss_feeds() -> dict[str, str]:
+    """Efektif RSS kaynakları (store'da kalıcı; yoksa RSS_FEEDS varsayılanı)."""
+    global _rss_feeds
+    if _rss_feeds is None:
+        try:
+            raw = get_store().get_setting("news_rss_feeds")
+            _rss_feeds = json.loads(raw) if raw else dict(RSS_FEEDS)
+        except Exception as e:
+            log.warning("RSS ayarı yüklenemedi: %s", e)
+            _rss_feeds = dict(RSS_FEEDS)
+    return _rss_feeds
+
+
+def set_rss_feeds(feeds: dict[str, str]) -> dict[str, str]:
+    """RSS kaynaklarını ayarla (yalnızca http(s); store'a kalıcı yaz)."""
+    global _rss_feeds
+    clean = {str(k): str(v) for k, v in feeds.items()
+             if str(v).startswith(("http://", "https://"))}
+    _rss_feeds = clean
+    try:
+        get_store().set_setting("news_rss_feeds", json.dumps(clean))
+    except Exception as e:
+        log.warning("RSS ayarı yazılamadı: %s", e)
+    return clean
+
+
 def fetch_all(session: requests.Session) -> list[NewsItem]:
     """Tüm kaynakları çek; biri patlarsa diğerleri devam etsin."""
     out: list[NewsItem] = []
-    for name, url in RSS_FEEDS.items():
+    for name, url in get_rss_feeds().items():
         try:
             out.extend(fetch_rss(name, url))
         except Exception as e:
@@ -1017,6 +1044,10 @@ async def lifespan(app: FastAPI):
         store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
         for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
             store.add_closed_news_trade(t)
+        rec = trader.reconcile_positions()         # canlı modda borsayla mutabakat (read-only)
+        if rec.get("checked") and rec.get("orphans"):
+            log.warning("Mutabakat: borsada bulunmayan %d yerel pozisyon (orphan): %s",
+                        len(rec["orphans"]), [o["symbol"] for o in rec["orphans"]])
     except Exception as e:
         log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
@@ -1180,6 +1211,12 @@ def summary(date: str | None = None) -> dict[str, Any]:
     return trader.daily_summary(date)
 
 
+@app.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    """Yerel açık pozisyonları borsayla karşılaştır (canlı; read-only, auto-close yok)."""
+    return trader.reconcile_positions()
+
+
 @app.get("/auto-preview")
 def auto_preview(limit: int = 20) -> dict[str, Any]:
     """Mevcut güçlü haberler için oto-işlem kararı önizlemesi (çalıştırmadan).
@@ -1250,6 +1287,22 @@ def news_settings_get() -> dict[str, Any]:
 @app.patch("/news-settings", dependencies=[Depends(require_token)])
 def news_settings_patch(body: NewsSettingsPatch) -> dict[str, Any]:
     return update_news_settings(body.model_dump(exclude_none=True))
+
+
+class RssFeedsPatch(BaseModel):
+    feeds: dict[str, str]    # {ad: url} — yalnızca http(s) kabul edilir
+
+
+@app.get("/news-sources")
+def news_sources() -> dict[str, Any]:
+    """Efektif RSS haber kaynakları (ad → url)."""
+    return {"rss_feeds": get_rss_feeds()}
+
+
+@app.patch("/news-sources", dependencies=[Depends(require_token)])
+def news_sources_patch(body: RssFeedsPatch) -> dict[str, Any]:
+    """RSS kaynaklarını değiştir (store'da kalıcı; yalnızca http(s))."""
+    return {"rss_feeds": set_rss_feeds(body.feeds)}
 
 
 @app.get("/signals")

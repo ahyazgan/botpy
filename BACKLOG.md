@@ -28,7 +28,7 @@
 ## Later (düşük öncelik)
 
 - [x] Gerçek zamanlı SSE push (15s polling yerine)  (dc23ea9)
-- [ ] Mobil duyarlılık denetimi + drawer
+- [x] Mobil duyarlılık denetimi + drawer  (11d54e5)
 - [ ] Koyu/açık tema
 
 -----

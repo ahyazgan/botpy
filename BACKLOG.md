@@ -33,6 +33,8 @@
 
 -----
 
+- [x] Hız: kural-önce/Claude-sonra puanlama (anında heads-up bildirim)  (PR pending)
+
 ## Done (son ~10)
 
 - [x] Canlı pozisyon mutabakatı (/reconcile)  (PR #25)

@@ -394,6 +394,8 @@ export default function App() {
   const notifyPrimedRef = useRef(false);
   const [expandedNews, setExpandedNews] = useState<string | null>(null);
   const [showTradeBar, setShowTradeBar] = useState(false);   // mobilde ayar çubuğu drawer'ı
+  const [lightTheme, setLightTheme] = useState(() =>
+    typeof localStorage !== "undefined" && localStorage.getItem("theme") === "light");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -472,6 +474,11 @@ export default function App() {
     const id = window.setInterval(() => void load(), POLL_MS);
     return () => window.clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("light", lightTheme);
+    localStorage.setItem("theme", lightTheme ? "light" : "dark");
+  }, [lightTheme]);
 
   // Gerçek zamanlıya yakın haber akışı (SSE). 15s poll diğer verileri (pozisyon/
   // ayar/performans) tazeler; haberler buradan ~2s'de gelir. EventSource oto-reconnect.
@@ -679,13 +686,23 @@ export default function App() {
               <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">Güçlü uyarı</p>
               <p className="font-display mt-1 text-3xl font-semibold tabular-nums text-amber-300">{alertCount}</p>
             </div>
-            <button
-              type="button"
-              onClick={() => void load()}
-              className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
-            >
-              Şimdi yenile
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => void load()}
+                className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
+              >
+                Şimdi yenile
+              </button>
+              <button
+                type="button"
+                onClick={() => setLightTheme((v) => !v)}
+                title="Koyu/açık tema"
+                className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
+              >
+                {lightTheme ? "🌙" : "☀️"}
+              </button>
+            </div>
           </div>
         </div>
 

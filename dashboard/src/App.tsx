@@ -20,6 +20,7 @@ type NewsItem = {
   symbol: string | null;
   price_24h_pct: number | null;
   price_15m_pct: number | null;
+  price_60m_pct: number | null;
   volume_usd: number | null;
   confirmed: boolean;
   price_note: string;
@@ -357,6 +358,7 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [minImpact, setMinImpact] = useState(0);
   const [onlyAlerts, setOnlyAlerts] = useState(false);
+  const [onlyConfirmed, setOnlyConfirmed] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -534,6 +536,7 @@ export default function App() {
     const floor = onlyAlerts ? Math.max(minImpact, meta.alert_threshold) : minImpact;
     return news.filter((n) => {
       if (n.impact < floor) return false;
+      if (onlyConfirmed && !n.confirmed) return false;
       if (q === "") return true;
       return (
         n.title.toLowerCase().includes(q) ||
@@ -541,7 +544,7 @@ export default function App() {
         n.source.toLowerCase().includes(q)
       );
     });
-  }, [news, search, minImpact, onlyAlerts, meta.alert_threshold]);
+  }, [news, search, minImpact, onlyAlerts, onlyConfirmed, meta.alert_threshold]);
 
   const alertCount = useMemo(
     () => news.filter((n) => n.impact >= meta.alert_threshold).length,
@@ -828,6 +831,16 @@ export default function App() {
           >
             Sadece güçlü uyarılar
           </button>
+          <button
+            type="button"
+            onClick={() => setOnlyConfirmed((v) => !v)}
+            title="Yalnızca fiyatla teyitli (15dk+1s uyumlu) haberler"
+            className={`h-10 rounded-xl border px-4 text-sm font-semibold transition ${
+              onlyConfirmed ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+            }`}
+          >
+            Sadece teyitli
+          </button>
         </div>
       </header>
 
@@ -884,6 +897,21 @@ export default function App() {
                             15dk <span className={n.price_15m_pct >= 0 ? "text-emerald-400" : "text-red-400"}>{n.price_15m_pct > 0 ? "+" : ""}{n.price_15m_pct}%</span>
                           </span>
                         )}
+                        {n.price_60m_pct !== null && (
+                          <span className="text-xs text-zinc-500" title="Çoklu zaman dilimi: ~1 saatlik hareket">
+                            1s <span className={n.price_60m_pct >= 0 ? "text-emerald-400" : "text-red-400"}>{n.price_60m_pct > 0 ? "+" : ""}{n.price_60m_pct}%</span>
+                          </span>
+                        )}
+                        {n.price_15m_pct !== null && n.price_60m_pct !== null && n.direction !== "neutral" && (() => {
+                          const aligned = n.direction === "bullish"
+                            ? n.price_15m_pct >= 0 && n.price_60m_pct >= 0
+                            : n.price_15m_pct <= 0 && n.price_60m_pct <= 0;
+                          return (
+                            <span className={`text-xs ${aligned ? "text-emerald-400" : "text-amber-400"}`} title="15dk ve 1s yön uyumu">
+                              {aligned ? "✓ tf uyumlu" : "⚠ tf ayrık"}
+                            </span>
+                          );
+                        })()}
                         {n.volume_usd !== null && <span className="text-xs text-zinc-600">hacim {fmtUsd(n.volume_usd)}</span>}
                         {n.price_note && <span className="text-xs italic text-zinc-500">· {n.price_note}</span>}
 

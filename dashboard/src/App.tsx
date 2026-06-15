@@ -284,6 +284,15 @@ function fmtUptime(sec: number): string {
   return `${Math.floor(h / 24)}g ${h % 24}sa`;
 }
 
+function ConnDot({ ok, label, offLabel }: { ok: boolean; label: string; offLabel: string }) {
+  return (
+    <span title={`${label}: ${ok ? "bağlı" : "yapılandırılmamış"}`} className="inline-flex items-center gap-1">
+      <span className={ok ? "text-emerald-400" : "text-zinc-600"}>●</span>
+      <span className={ok ? "text-zinc-400" : "text-zinc-600"}>{ok ? label : offLabel}</span>
+    </span>
+  );
+}
+
 function RiskMeter({ label, used, cap, suffix = "USDT" }: { label: string; used: number; cap: number; suffix?: string }) {
   const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
   const color = pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
@@ -879,6 +888,12 @@ export default function App() {
               </span>
             </>
           )}
+          <span className="text-zinc-700">|</span>
+          <span className="flex items-center gap-1.5" title="Bağlantı durumu: yeşil = yapılandırılmış">
+            <ConnDot ok={health?.scorer === "claude"} label="Claude" offLabel="kural" />
+            <ConnDot ok={!!newsSettings?.remote_channels_available} label="Telegram/Discord" offLabel="uzak yok" />
+            <ConnDot ok={!!settings?.has_live_keys} label="Binance canlı" offLabel="paper" />
+          </span>
         </div>
 
         {err && (

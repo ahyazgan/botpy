@@ -25,7 +25,7 @@ import re
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -856,10 +856,19 @@ def _background_loop(stop: threading.Event) -> None:
 MONITOR_INTERVAL_SEC = 8
 
 
+def _persist_closed(pos: dict[str, Any]) -> None:
+    """Kapanan işlemi kalıcı deftere yaz (trade_state.json 500 sınırı dışı). Hata akışı bozmaz."""
+    try:
+        get_store().add_closed_news_trade(pos)
+    except Exception as e:
+        log.warning("Kapanan işlem arşivlenemedi: %s", e)
+
+
 def _monitor_loop(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             for pos in trader.monitor_positions():
+                _persist_closed(pos)
                 notify_remote(_fmt_trade_msg(pos, opened=False))
         except Exception as e:
             log.warning("Pozisyon izleme hatası: %s", e)
@@ -977,9 +986,12 @@ async def lifespan(app: FastAPI):
     setup_logging()
     _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
     try:
-        get_store().prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
+        store = get_store()
+        store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
+        for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
+            store.add_closed_news_trade(t)
     except Exception as e:
-        log.warning("Arşiv budama hatası: %s", e)
+        log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
     _bg_thread = threading.Thread(target=_background_loop, args=(_stop_event,), daemon=True)
     _bg_thread.start()
@@ -1117,10 +1129,21 @@ def auto_preview(limit: int = 20) -> dict[str, Any]:
     return {"preview": preview, "auto_trade_on": trader.S.auto_trade}
 
 
+def _closed_trades(limit: int) -> list[dict[str, Any]]:
+    """Kalıcı arşivden kapanan işlemler; arşiv boşsa in-memory deftere düş."""
+    try:
+        rows = get_store().list_closed_news_trades(limit)
+        if rows:
+            return rows
+    except Exception as e:
+        log.warning("Kapanan işlem arşivi okunamadı: %s", e)
+    return trader.closed_trades(limit)
+
+
 @app.get("/trades/closed")
 def trades_closed(limit: int = 200) -> dict[str, Any]:
-    """Kapanan işlemler (işlem günlüğü), en yeniden eskiye."""
-    return {"trades": trader.closed_trades(limit)}
+    """Kapanan işlemler (kalıcı defter, en yeniden eskiye)."""
+    return {"trades": _closed_trades(limit)}
 
 
 _CSV_FIELDS = (
@@ -1135,7 +1158,7 @@ def trades_closed_csv(limit: int = 1000) -> PlainTextResponse:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS, extrasaction="ignore")
     writer.writeheader()
-    for t in trader.closed_trades(limit):
+    for t in _closed_trades(limit):
         writer.writerow(t)
     headers = {"Content-Disposition": 'attachment; filename="closed_trades.csv"'}
     return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers=headers)
@@ -1164,6 +1187,21 @@ def get_signals(limit: int = 500, min_impact: int = 0) -> dict[str, Any]:
             **store.signal_span()}
 
 
+# Ağ-yoğun uçlar (backtest/scorecard) aynı anda tek koşsun — Binance'i yormamak
+# ve istek yığılmasını önlemek için. İkinci eşzamanlı istek 409 alır.
+_heavy_lock = threading.Lock()
+
+
+@contextmanager
+def _heavy_guard() -> Any:
+    if not _heavy_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Ağır işlem (backtest/scorecard) zaten çalışıyor — bekleyin")
+    try:
+        yield
+    finally:
+        _heavy_lock.release()
+
+
 @app.get("/scorecard")
 def scorecard(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300) -> dict[str, Any]:
     """Ham sinyal kalitesi: arşiv sinyallerinin gerçekleşen yön isabeti (SL/TP'siz).
@@ -1172,19 +1210,18 @@ def scorecard(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int 
     haber yönünün fiyatla uyumunu kaynak/güç bazında ölçer.
     """
     import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        return {"ok": True, **nbt.signal_scorecard(signals)}
 
-    rows = get_store().list_signals(limit=limit, min_impact=min_impact)
-    candidates = nbt._signals_from_rows(rows)
-    if not candidates:
-        return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
-    signals = nbt.prefetch(candidates, int(hours * 60))
-    if not signals:
-        return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
-    return {"ok": True, **nbt.signal_scorecard(signals)}
 
-
-@app.get("/backtest")
-def run_backtest(
+def _run_backtest_impl(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
     mode: str = "simple", train_frac: float = 0.7,
@@ -1237,6 +1274,19 @@ def run_backtest(
     if summary.get("n"):
         _persist_backtest("simple", sl=sl, tp=tp, stats=summary, note="", **common)
     return summary
+
+
+@app.get("/backtest")
+def run_backtest(
+    sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
+    hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
+    mode: str = "simple", train_frac: float = 0.7,
+) -> dict[str, Any]:
+    """Backtest çalıştır (ağ-yoğun; aynı anda tek koşar — bkz `_heavy_guard`)."""
+    with _heavy_guard():
+        return _run_backtest_impl(sl=sl, tp=tp, fee=fee, usdt=usdt, hours=hours,
+                                  min_impact=min_impact, limit=limit, mode=mode,
+                                  train_frac=train_frac)
 
 
 def _persist_backtest(mode: str, *, sl: float | None, tp: float | None, fee: float,
@@ -1339,9 +1389,11 @@ def get_performance() -> dict[str, Any]:
 @app.delete("/positions/{pid}", dependencies=[Depends(require_token)])
 def delete_position(pid: str) -> dict[str, Any]:
     try:
-        return trader.close_position(pid)
+        closed = trader.close_position(pid)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+    _persist_closed(closed)
+    return closed
 
 
 def main() -> None:

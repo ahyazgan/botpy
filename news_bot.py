@@ -15,6 +15,7 @@ Claude API ile daha akıllı puanlama (score_with_claude — sonraki adımda).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import hashlib
 import io
@@ -36,7 +37,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import storage
@@ -1133,6 +1134,44 @@ def get_alerts(limit: int = 50) -> NewsResponse:
 def healthz() -> dict[str, bool]:
     """Liveness probe — süreç ayakta mı. Her zaman 200; bağımlılık kontrolü yok."""
     return {"ok": True}
+
+
+STREAM_INTERVAL_SEC = 2.0   # SSE sunucu-tarafı tarama aralığı (gerçek zamanlıya yakın)
+
+
+def _stream_diff(snapshot: list[dict[str, Any]], seen: set[str]) -> list[dict[str, Any]]:
+    """Snapshot'ta daha önce gönderilmemiş (id'si seen'de olmayan) haberleri döndür.
+
+    Saf fonksiyon — `seen` mutasyona uğratılmaz (çağıran günceller). En eskiden
+    yeniye sırayla döner ki SSE istemcisi doğru sırada eklesin.
+    """
+    fresh = [n for n in snapshot if n.get("id") not in seen]
+    return list(reversed(fresh))   # snapshot en-yeni-başta; istemciye en-eski-önce
+
+
+@app.get("/stream")
+async def stream() -> StreamingResponse:
+    """Yeni güçlü haberleri SSE ile push'la (15s polling yerine gerçek zamanlıya yakın)."""
+    async def gen() -> Any:
+        seen: set[str] = set()
+        primed = False
+        while True:
+            with _cache_lock:
+                snapshot = [n.to_dict() for n in _news[:50]]
+            if not primed:
+                seen = {n["id"] for n in snapshot}
+                primed = True
+                yield ": bağlandı\n\n"
+            else:
+                fresh = _stream_diff(snapshot, seen)
+                for n in fresh:
+                    seen.add(n["id"])
+                    yield f"data: {json.dumps(n, ensure_ascii=False)}\n\n"
+                if not fresh:
+                    yield ": ping\n\n"   # bağlantıyı canlı tut
+            await asyncio.sleep(STREAM_INTERVAL_SEC)
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 _METRIC_META = {

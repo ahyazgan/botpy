@@ -393,6 +393,9 @@ export default function App() {
   const notifiedRef = useRef<Set<string>>(new Set());
   const notifyPrimedRef = useRef(false);
   const [expandedNews, setExpandedNews] = useState<string | null>(null);
+  const [showTradeBar, setShowTradeBar] = useState(false);   // mobilde ayar çubuğu drawer'ı
+  const [lightTheme, setLightTheme] = useState(() =>
+    typeof localStorage !== "undefined" && localStorage.getItem("theme") === "light");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -471,6 +474,26 @@ export default function App() {
     const id = window.setInterval(() => void load(), POLL_MS);
     return () => window.clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("light", lightTheme);
+    localStorage.setItem("theme", lightTheme ? "light" : "dark");
+  }, [lightTheme]);
+
+  // Gerçek zamanlıya yakın haber akışı (SSE). 15s poll diğer verileri (pozisyon/
+  // ayar/performans) tazeler; haberler buradan ~2s'de gelir. EventSource oto-reconnect.
+  useEffect(() => {
+    const es = new EventSource(`${API_BASE}/stream`);
+    es.onmessage = (e) => {
+      try {
+        const item = JSON.parse(e.data) as NewsItem;
+        setNews((prev) => (prev.some((n) => n.id === item.id) ? prev : [item, ...prev].slice(0, 200)));
+      } catch {
+        /* bozuk olay — yoksay */
+      }
+    };
+    return () => es.close();
+  }, []);
 
   const patchSettings = async (patch: Partial<Settings>) => {
     try {
@@ -663,19 +686,38 @@ export default function App() {
               <p className="text-xs font-medium uppercase tracking-wider text-zinc-500">Güçlü uyarı</p>
               <p className="font-display mt-1 text-3xl font-semibold tabular-nums text-amber-300">{alertCount}</p>
             </div>
-            <button
-              type="button"
-              onClick={() => void load()}
-              className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
-            >
-              Şimdi yenile
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => void load()}
+                className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
+              >
+                Şimdi yenile
+              </button>
+              <button
+                type="button"
+                onClick={() => setLightTheme((v) => !v)}
+                title="Koyu/açık tema"
+                className="rounded-xl border border-zinc-700 bg-zinc-800/80 px-3 py-2 text-sm font-medium text-zinc-200 transition hover:border-emerald-500/40 hover:bg-zinc-800"
+              >
+                {lightTheme ? "🌙" : "☀️"}
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* İşlem ayar çubuğu */}
+        {/* İşlem ayar çubuğu — mobilde drawer (toggle), sm+ her zaman açık */}
         {settings && (
-          <div className="mt-6 flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-zinc-900/60 p-3">
+          <button
+            type="button"
+            onClick={() => setShowTradeBar((v) => !v)}
+            className="mt-6 w-full rounded-xl border border-zinc-700 bg-zinc-800/80 px-4 py-2 text-sm font-semibold text-zinc-300 sm:hidden"
+          >
+            ⚙ İşlem ayarları {showTradeBar ? "▴" : "▾"}
+          </button>
+        )}
+        {settings && (
+          <div className={`mt-3 ${showTradeBar ? "flex" : "hidden"} flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-zinc-900/60 p-3 sm:mt-6 sm:flex`}>
             <button
               type="button"
               onClick={() => void patchSettings({ paper_trading: !settings.paper_trading })}
@@ -1758,6 +1800,7 @@ function ScoreTable({ title, rows }: { title: string; rows: Record<string, Score
   return (
     <div className="rounded-lg border border-white/10 bg-zinc-800/40 p-3">
       <p className="mb-2 text-xs uppercase text-zinc-500">{title}</p>
+      <div className="overflow-x-auto">
       <table className="w-full text-left text-xs">
         <thead>
           <tr className="text-zinc-600">
@@ -1778,6 +1821,7 @@ function ScoreTable({ title, rows }: { title: string; rows: Record<string, Score
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
@@ -1788,6 +1832,7 @@ function BreakdownTable({ title, rows }: { title: string; rows: Record<string, B
   return (
     <div className="rounded-lg border border-white/10 bg-zinc-800/40 p-3">
       <p className="mb-2 text-xs uppercase text-zinc-500">{title}</p>
+      <div className="overflow-x-auto">
       <table className="w-full text-left text-xs">
         <thead>
           <tr className="text-zinc-600">
@@ -1810,6 +1855,7 @@ function BreakdownTable({ title, rows }: { title: string; rows: Record<string, B
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

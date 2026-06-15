@@ -11,7 +11,7 @@
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.
 - [x] Açık pozisyonda canlı SL/TP düzenleme  (da9ffd6)
   Done when: `PATCH /positions/{id}` sl/tp günceller (trader.update_position); panelde pozisyon satırında düzenleme; testler; tsc+build yeşil; commit.
-- [ ] Backtest "en iyi paramları uygula"
+- [x] Backtest "en iyi paramları uygula"  (8aedc16)
   Done when: grid/walk sonucundaki en iyi SL/TP'yi tek tıkla `/settings`'e yazan buton; tsc+build yeşil; commit.
 
 -----

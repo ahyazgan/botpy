@@ -1347,10 +1347,18 @@ export default function App() {
               ) : btResult.mode === "grid" ? (
                 <div className="space-y-3">
                   {btResult.best && (
-                    <p className="text-sm text-zinc-300">
-                      En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
-                      <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
-                      <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                    <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+                      <span>En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
+                        <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
+                        <span className="ml-2 text-zinc-500">({btResult.tested} sinyal)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void patchSettings({ stop_loss_pct: btResult.best!.sl, take_profit_pct: btResult.best!.tp })}
+                        className="rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-0.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-900/60"
+                      >
+                        Bu SL/TP'yi uygula
+                      </button>
                     </p>
                   )}
                   <div className="overflow-x-auto rounded-lg border border-white/10">
@@ -1386,9 +1394,19 @@ export default function App() {
                 <div className="space-y-3">
                   {btResult.in_sample ? (
                     <>
-                      <p className="text-sm text-zinc-300">
-                        En iyi (in-sample): <strong className="text-emerald-300">SL {btResult.params?.sl}% · TP {btResult.params?.tp}%</strong>
-                        <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                      <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+                        <span>En iyi (in-sample): <strong className="text-emerald-300">SL {btResult.params?.sl}% · TP {btResult.params?.tp}%</strong>
+                          <span className="ml-2 text-zinc-500">({btResult.tested} sinyal)</span>
+                        </span>
+                        {btResult.params && (
+                          <button
+                            type="button"
+                            onClick={() => void patchSettings({ stop_loss_pct: btResult.params!.sl, take_profit_pct: btResult.params!.tp })}
+                            className="rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-0.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-900/60"
+                          >
+                            Bu SL/TP'yi uygula
+                          </button>
+                        )}
                       </p>
                       <div className="grid grid-cols-2 gap-3 text-sm">
                         <div className="rounded-lg bg-zinc-800/50 p-3">

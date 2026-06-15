@@ -87,3 +87,16 @@ def test_prune_signals(tmp_path):
     assert s.signal_span()["count"] == 4
     assert s.prune_signals(0) == 0              # keep<=0 → no-op
     s.close()
+
+
+def test_healthz_liveness(client):
+    r = client.get("/healthz")
+    assert r.status_code == 200 and r.json() == {"ok": True}
+
+
+def test_security_headers(client):
+    h = client.get("/healthz").headers
+    assert h["X-Content-Type-Options"] == "nosniff"
+    assert h["X-Frame-Options"] == "DENY"
+    assert "default-src 'none'" in h["Content-Security-Policy"]
+    assert "max-age" in h["Strict-Transport-Security"]

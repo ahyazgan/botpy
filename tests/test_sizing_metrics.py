@@ -38,9 +38,10 @@ def auto_env(monkeypatch):
     trader.S.trade_usdt = 100.0
     captured = {}
 
-    def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source=""):
+    def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source="", impact=None):
         captured["usdt"] = usdt
         captured["side"] = side
+        captured["impact"] = impact
         return {"id": "x", "symbol": symbol, "side": side, "usdt": usdt, "mode": "paper"}
 
     monkeypatch.setattr(trader, "place_trade", fake_place)
@@ -115,3 +116,14 @@ def test_perf_ratios_edge_cases():
     assert only_win["avg_loss"] is None and only_win["payoff_ratio"] is None
     assert only_win["sharpe"] is None
     assert trader._perf_ratios([]) == {"avg_win": None, "avg_loss": None, "payoff_ratio": None, "sharpe": None}
+
+
+def test_by_impact_attribution(monkeypatch):
+    monkeypatch.setattr(trader, "_closed", [
+        {"pnl": 10.0, "impact": 9, "closed_at": "t1"},
+        {"pnl": -4.0, "impact": 9, "closed_at": "t2"},
+        {"pnl": 6.0, "impact": 7, "closed_at": "t3"},
+    ])
+    bi = trader.get_performance()["by_impact"]
+    assert bi["9"]["count"] == 2 and bi["9"]["pnl"] == 6.0 and bi["9"]["wins"] == 1
+    assert bi["7"]["count"] == 1 and bi["7"]["pnl"] == 6.0

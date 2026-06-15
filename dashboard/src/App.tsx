@@ -80,6 +80,7 @@ type Performance = {
   realized_today: number;
   by_source: Record<string, { count: number; pnl: number; wins: number }>;
   by_news_source: Record<string, { count: number; pnl: number; wins: number }>;
+  by_impact: Record<string, { count: number; pnl: number; wins: number }>;
   by_symbol: Record<string, { count: number; pnl: number; wins: number }>;
   recent: Array<{ symbol: string; side: string; pnl: number | null; pnl_pct: number | null; close_reason?: string; source: string }>;
   equity: Array<{ closed_at: string | null; pnl: number; cumulative: number }>;
@@ -1104,6 +1105,19 @@ export default function App() {
                 {Object.entries(perf.by_source).map(([k, v]) => (
                   <span key={k} className="rounded-lg border border-white/10 bg-zinc-800/60 px-2 py-1 text-xs text-zinc-300">
                     {k}: <span className={v.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>{v.pnl >= 0 ? "+" : ""}{v.pnl}</span>
+                    <span className="text-zinc-500"> ({v.wins}/{v.count})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {Object.keys(perf.by_impact).filter((k) => k !== "?").length > 0 && (
+            <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-900/40 p-4">
+              <p className="mb-2 text-xs uppercase text-zinc-500">Güce göre (hangi güç dilimi kazandırıyor?)</p>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(perf.by_impact).filter(([k]) => k !== "?").map(([k, v]) => (
+                  <span key={k} className="rounded-lg border border-white/10 bg-zinc-800/60 px-2 py-1 text-xs text-zinc-300">
+                    güç {k}: <span className={v.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>{v.pnl >= 0 ? "+" : ""}{v.pnl}</span>
                     <span className="text-zinc-500"> ({v.wins}/{v.count})</span>
                   </span>
                 ))}

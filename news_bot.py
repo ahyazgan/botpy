@@ -998,6 +998,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Güvenlik başlıkları — saf JSON API için sıkı varsayılanlar. HSTS yalnızca
+# HTTPS üzerinde etkilidir (HTTP'de zararsız).
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Any, call_next: Any) -> Any:
+    response = await call_next(request)
+    for k, v in _SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
 
 class NewsResponse(BaseModel):
     news: list[dict[str, Any]]
@@ -1024,6 +1042,12 @@ def get_news(limit: int = 100, min_impact: int = 0) -> NewsResponse:
 @app.get("/alerts", response_model=NewsResponse)
 def get_alerts(limit: int = 50) -> NewsResponse:
     return get_news(limit=limit, min_impact=get_news_settings()["alert_threshold"])
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, bool]:
+    """Liveness probe — süreç ayakta mı. Her zaman 200; bağımlılık kontrolü yok."""
+    return {"ok": True}
 
 
 @app.get("/health")

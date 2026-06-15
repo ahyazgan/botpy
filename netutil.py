@@ -15,6 +15,10 @@ import requests
 
 log = logging.getLogger(__name__)
 
+# Rate-limit / sunucu durumları yeniden denenir. Binance aşımda 429 (Too Many
+# Requests) ve 418 (IP yasağı) döner — bunlar 4xx olsa da retryable'dır.
+RETRYABLE_STATUS = {418, 429}
+
 SleepFn = Callable[[float], None]
 
 
@@ -46,9 +50,10 @@ def get_json(
                     return r.json()
                 except ValueError:
                     return None
-            if r.status_code < 500:
-                return None  # istemci hatası → retry yok
-            log.debug("get_json sunucu hatası (%s): HTTP %d", url, r.status_code)
+            if r.status_code < 500 and r.status_code not in RETRYABLE_STATUS:
+                return None  # istemci hatası (404 vb.) → retry yok
+            # 5xx veya 429/418 (rate-limit) → yeniden dene
+            log.debug("get_json yeniden denenebilir durum (%s): HTTP %d", url, r.status_code)
         if attempt < retries - 1:
             sleep(backoff * (2 ** attempt))
     return None

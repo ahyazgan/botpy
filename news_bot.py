@@ -1191,16 +1191,26 @@ def run_backtest(
     if not signals:
         return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
 
+    common: dict[str, Any] = {"fee": fee, "usdt": usdt, "hours": hours, "min_impact": min_impact}
+
     if mode == "walk":
         wf = nbt.walk_forward(signals, train_frac=train_frac, fee=fee, usdt=usdt, min_trades=3)
         wf["mode"] = "walk"
         wf["tested"] = len(signals)
+        if wf.get("ok") and wf.get("out_of_sample"):
+            p, oos = wf.get("params") or {}, wf["out_of_sample"]
+            _persist_backtest("walk", sl=p.get("sl"), tp=p.get("tp"), stats=oos,
+                              note=wf.get("verdict", ""), **common)
         return wf
 
     if mode == "grid":
         grid = nbt.grid_search(signals, fee, usdt)
+        best = grid[0] if grid else None
+        if best:
+            _persist_backtest("grid", sl=best["sl"], tp=best["tp"], stats=best,
+                              note="grid en kârlı", **common)
         return {"ok": True, "mode": "grid", "tested": len(signals),
-                "rows": grid, "best": grid[0] if grid else None}
+                "rows": grid, "best": best}
 
     results = nbt.simulate_all(signals, sl, tp, fee)
     summary = nbt._summarize(results, usdt)
@@ -1209,7 +1219,31 @@ def run_backtest(
     summary["tested"] = len(signals)
     summary["candidates"] = len(candidates)
     summary["breakdown"] = nbt.breakdown(results, usdt)
+    if summary.get("n"):
+        _persist_backtest("simple", sl=sl, tp=tp, stats=summary, note="", **common)
     return summary
+
+
+def _persist_backtest(mode: str, *, sl: float | None, tp: float | None, fee: float,
+                      usdt: float, hours: float, min_impact: int,
+                      stats: dict[str, Any], note: str) -> None:
+    """Bir backtest özetini arşive yaz (karşılaştırma için). Hata akışı bozmaz."""
+    try:
+        get_store().add_backtest_run({
+            "mode": mode, "sl": sl, "tp": tp, "fee": fee, "usdt": usdt,
+            "hours": hours, "min_impact": min_impact,
+            "n": stats.get("n"), "win_rate": stats.get("win_rate"),
+            "avg_net_pct": stats.get("avg_net_pct"),
+            "total_pnl_usdt": stats.get("total_pnl_usdt"), "note": note,
+        })
+    except Exception as e:
+        log.warning("Backtest kaydı yazılamadı: %s", e)
+
+
+@app.get("/backtest/runs")
+def backtest_runs(limit: int = 50) -> dict[str, Any]:
+    """Geçmiş backtest çalıştırmaları (en yeniden eskiye, karşılaştırma için)."""
+    return {"runs": get_store().list_backtest_runs(limit)}
 
 
 # ── İşlem endpoint'leri ──────────────────────────────────────────────────

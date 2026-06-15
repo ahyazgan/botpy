@@ -148,7 +148,31 @@ CREATE TABLE IF NOT EXISTS news_signals (
 
 CREATE INDEX IF NOT EXISTS idx_signal_ts ON news_signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signal_impact ON news_signals(impact);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    mode           TEXT NOT NULL,         -- simple | grid | walk
+    sl             REAL,
+    tp             REAL,
+    fee            REAL,
+    usdt           REAL,
+    hours          REAL,
+    min_impact     INTEGER,
+    n              INTEGER,
+    win_rate       REAL,
+    avg_net_pct    REAL,
+    total_pnl_usdt REAL,
+    note           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_ts ON backtest_runs(ts);
 """
+
+_BACKTEST_COLUMNS = (
+    "ts", "mode", "sl", "tp", "fee", "usdt", "hours", "min_impact",
+    "n", "win_rate", "avg_net_pct", "total_pnl_usdt", "note",
+)
 
 _TRADE_COLUMNS = (
     "id", "market_id", "question", "side",
@@ -513,6 +537,28 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # ── Backtest çalıştırma geçmişi (karşılaştırma için) ──────────────────
+    def add_backtest_run(self, run: dict[str, Any]) -> int:
+        """Bir backtest özetini kaydet. Eklenen satır id'sini döner."""
+        row = {c: run.get(c) for c in _BACKTEST_COLUMNS}
+        row["ts"] = run.get("ts") or _utcnow()
+        cols = ", ".join(_BACKTEST_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _BACKTEST_COLUMNS)
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO backtest_runs ({cols}) VALUES ({placeholders})", row,
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_backtest_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Backtest çalıştırmaları, en yeniden eskiye (karşılaştırma)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Uygulama ayarları (kalıcı; restart'a dayanıklı) ───────────────────
     def set_setting(self, key: str, value: str) -> None:

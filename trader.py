@@ -45,6 +45,7 @@ class Settings:
     max_positions: int = 20
     auto_min_impact: int = 8
     auto_require_confirm: bool = True
+    tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
     cooldown_sec: int = 1800
     # Otomatik çıkış
     use_sl_tp: bool = True
@@ -84,7 +85,8 @@ _exchange: Any = None
 
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
-    "max_positions", "auto_min_impact", "auto_require_confirm", "cooldown_sec",
+    "max_positions", "auto_min_impact", "auto_require_confirm",
+    "tier1_skip_confirm_impact", "cooldown_sec",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
@@ -695,7 +697,10 @@ def auto_decision(item: Any) -> dict[str, Any]:
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
     if item.impact < S.auto_min_impact:
         return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
-    if S.auto_require_confirm and not getattr(item, "confirmed", False):
+    # Tier-1 "net" haber (hack/ETF/büyük listeleme vb. — yüksek güç): teyit beklemeden
+    # refleksle gir; hareket başlamadan önde ol. Diğer her şey (Tier-2) teyit bekler.
+    tier1 = S.tier1_skip_confirm_impact > 0 and item.impact >= S.tier1_skip_confirm_impact
+    if S.auto_require_confirm and not tier1 and not getattr(item, "confirmed", False):
         return no("fiyat teyidi yok")
     symbol = getattr(item, "symbol", None)
     if not symbol:
@@ -726,8 +731,8 @@ def auto_decision(item: Any) -> dict[str, Any]:
         usdt *= _size_multiplier(int(item.impact))
     if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
         usdt *= 0.5
-    return {"would_trade": True, "reason": "uygun", "side": side,
-            "usdt": round(usdt, 2), "news_source": news_source}
+    return {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
+            "side": side, "usdt": round(usdt, 2), "news_source": news_source}
 
 
 def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
@@ -909,6 +914,119 @@ def get_performance() -> dict[str, Any]:
     }
 
 
+# ── Öğrenen beyin (öneri modu — otomatik UYGULAMAZ) ────────────────────────
+# Kapanan işlemlerden hangi güç-dilimi / kaynak-tier / kaynak gerçekten kâr etti
+# çıkarır ve eşik ayarı önerir. ASLA ayarı kendiliğinden değiştirmez — yalnızca
+# panelde gösterilir; kararı kullanıcı verir (izlenebilirlik).
+MIN_LEARN_SAMPLES = 10   # öneri üretmek için gereken min kapanmış işlem
+_MIN_BUCKET_SAMPLES = 4  # bir dilimi/kaynağı yargılamak için min örnek
+
+
+def _bucket_stats(trades: list[dict[str, Any]], key_fn: Any,
+                  value_key: str = "pnl") -> dict[str, dict[str, Any]]:
+    """trades'i key_fn'e göre grupla: {key: {count, pnl, avg_pnl, win_rate}}.
+    value_key: kâr alanı — canlı işlemde 'pnl' (USDT), backtest'te 'net_pct' (%)."""
+    out: dict[str, dict[str, Any]] = {}
+    for c in trades:
+        k = key_fn(c)
+        if k is None:
+            continue
+        d = out.setdefault(str(k), {"count": 0, "pnl": 0.0, "wins": 0})
+        v = float(c[value_key])
+        d["count"] += 1
+        d["pnl"] = round(d["pnl"] + v, 3)
+        if v > 0:
+            d["wins"] += 1
+    for d in out.values():
+        d["avg_pnl"] = round(d["pnl"] / d["count"], 3)
+        d["win_rate"] = round(d["wins"] / d["count"] * 100, 1)
+    return out
+
+
+def _suggest_from_trades(trades: list[dict[str, Any]], *, value_key: str, source_key: str,
+                         tier_of: Any, unit: str) -> dict[str, Any]:
+    """İşlem/sonuç listesinden eşik önerileri üret (saf — canlı VE backtest için ortak).
+
+    value_key: kâr alanı; source_key: haber kaynağı alanı; unit: mesaj birimi (' USDT'/'%').
+    YAN ETKİSİZ — yalnızca öneri döndürür, ayar değiştirmez.
+    """
+    n = len(trades)
+    by_impact = _bucket_stats(trades, lambda c: int(c["impact"]) if c.get("impact") else None, value_key)
+    by_source = _bucket_stats(trades, lambda c: c.get(source_key) or None, value_key)
+    by_tier = (_bucket_stats(trades, lambda c: tier_of(c.get(source_key) or "") if c.get(source_key) else None, value_key)
+               if tier_of else {})
+
+    suggestions: list[dict[str, Any]] = []
+    if n < MIN_LEARN_SAMPLES:
+        return {"ready": False, "samples": n, "min_samples": MIN_LEARN_SAMPLES,
+                "suggestions": [], "by_impact": by_impact, "by_tier": by_tier,
+                "by_source": by_source}
+
+    # 1) auto_min_impact: beklentiyi (o eşik ve üstü ort. kâr) en yükseğe çıkaran eşik
+    impacts = sorted(int(k) for k in by_impact)
+    best_t, best_avg = None, None
+    for t in impacts:
+        rows = [c for c in trades if c.get("impact") and int(c["impact"]) >= t]
+        if len(rows) < _MIN_BUCKET_SAMPLES:
+            continue
+        avg = round(sum(float(c[value_key]) for c in rows) / len(rows), 3)
+        if best_avg is None or avg > best_avg:
+            best_t, best_avg = t, avg
+    if best_t is not None and best_avg is not None and best_avg > 0 and best_t != S.auto_min_impact:
+        verb = "yükselt" if best_t > S.auto_min_impact else "düşür"
+        suggestions.append({
+            "type": "auto_min_impact", "current": S.auto_min_impact, "suggested": best_t,
+            "message": f"Oto min. gücü {S.auto_min_impact}→{best_t} {verb}: güç ≥{best_t} "
+                       f"ort. {best_avg}{unit} (pozitif beklenti).",
+        })
+
+    # 2) kaynak-tier: yeterli örnekli ve negatif beklentili tier'i kıs
+    for tier, d in by_tier.items():
+        if d["count"] >= MIN_LEARN_SAMPLES and d["avg_pnl"] < 0:
+            suggestions.append({
+                "type": "suppress_tier", "tier": tier, "avg_pnl": d["avg_pnl"], "count": d["count"],
+                "message": f"'{tier}' kaynak sınıfı negatif beklentili (ort. {d['avg_pnl']}{unit}, "
+                           f"{d['count']} örnek) — bu sınıfı kısmayı/güç eşiğini artırmayı düşün.",
+            })
+
+    # 3) tek kaynak: negatif beklentili kaynağı sustur (suppress_losing_sources ile)
+    for src, d in by_source.items():
+        if d["count"] >= S.min_source_samples and d["avg_pnl"] < 0:
+            suggestions.append({
+                "type": "suppress_source", "source": src, "avg_pnl": d["avg_pnl"], "count": d["count"],
+                "message": f"Kaynak '{src}' negatif beklentili (ort. {d['avg_pnl']}{unit}, "
+                           f"{d['count']} örnek) — 'kaybeden kaynağı sustur' bunu zaten eler.",
+            })
+
+    return {"ready": True, "samples": n, "min_samples": MIN_LEARN_SAMPLES,
+            "suggestions": suggestions, "by_impact": by_impact, "by_tier": by_tier,
+            "by_source": by_source}
+
+
+def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
+    """Kapanan GERÇEK işlemlerden ayar önerileri üret (YAN ETKİSİZ — uygulamaz).
+
+    tier_of: news_source -> tier eşleyen opsiyonel callable (news_bot._source_tier).
+    """
+    with _lock:
+        closed = [c for c in _closed if c.get("pnl") is not None]
+    return _suggest_from_trades(closed, value_key="pnl", source_key="news_source",
+                                tier_of=tier_of, unit=" USDT")
+
+
+def suggest_from_backtest(results: list[dict[str, Any]], tier_of: Any = None) -> dict[str, Any]:
+    """İşlemsiz ÖN-BİLGİ: backtest sonuçlarından (arşiv simülasyonu) aynı önerileri üret.
+
+    Gerçek para riske atmadan kalibrasyon → sistem ilk işlemden itibaren akıllı. Backtest
+    sonucu net %% (`net_pct`) ve haber kaynağı (`source`) taşır.
+    """
+    trades = [r for r in results if r.get("net_pct") is not None]
+    out = _suggest_from_trades(trades, value_key="net_pct", source_key="source",
+                               tier_of=tier_of, unit="%")
+    out["pretrade"] = True
+    return out
+
+
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 def get_settings() -> dict[str, Any]:
     _reset_daily_if_needed()
@@ -937,6 +1055,41 @@ def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
     with _lock:
         _save_state()
     return get_settings()
+
+
+# ── Çıkış preset'leri ──────────────────────────────────────────────────────
+# Haber-trade hamlesi öne yüklüdür: hızlı koru, erken kısmi al, kalanı trailing'le
+# sür, süre dolunca kes. "news" preset'i bu davranışı tek tıkla uygular; "safe"
+# muhafazakâr varsayılana döner. Yalnızca giriş/çıkış davranışını değiştirir —
+# risk tavanları/likidite/anahtarlar dokunulmaz.
+PRESETS: dict[str, dict[str, Any]] = {
+    "news": {
+        "stop_loss_pct": 3.0, "take_profit_pct": 6.0,
+        "breakeven_pct": 1.5,                       # +%1.5'te SL girişe (yanlış okumada zararsız çık)
+        "partial_tp_pct": 2.5, "partial_tp_frac": 0.5,  # ilk sıçramada yarısını kasaya al
+        "trailing_stop_pct": 1.5,                   # kalanı trend devam ederse sür
+        "time_stop_min": 60,                        # edge söndüyse 60dk'da kes
+        "size_by_impact": True,                     # conviction sizing
+        "tier1_skip_confirm_impact": 9,             # güç≥9 net haberde refleks giriş
+    },
+    "safe": {
+        "stop_loss_pct": 3.0, "take_profit_pct": 6.0,
+        "breakeven_pct": 0.0,
+        "partial_tp_pct": 0.0, "partial_tp_frac": 0.5,
+        "trailing_stop_pct": 0.0,
+        "time_stop_min": 0,
+        "size_by_impact": False,
+        "tier1_skip_confirm_impact": 0,
+    },
+}
+
+
+def apply_preset(name: str) -> dict[str, Any]:
+    """Adlandırılmış çıkış preset'ini uygula (news | safe)."""
+    preset = PRESETS.get(name)
+    if preset is None:
+        raise ValueError(f"bilinmeyen preset: {name} (geçerli: {', '.join(PRESETS)})")
+    return update_settings(dict(preset))
 
 
 # Modül yüklenince kayıtlı durumu geri yükle

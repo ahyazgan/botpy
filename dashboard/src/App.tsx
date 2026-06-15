@@ -63,6 +63,7 @@ type Settings = {
   max_positions: number;
   auto_min_impact: number;
   auto_require_confirm: boolean;
+  tier1_skip_confirm_impact: number;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -111,6 +112,24 @@ type Performance = {
   avg_loss: number | null;
   payoff_ratio: number | null;
   sharpe: number | null;
+};
+
+type TuningSuggestion = {
+  type: string;
+  message: string;
+  current?: number;
+  suggested?: number;
+  tier?: string;
+  source?: string;
+  avg_pnl?: number;
+  count?: number;
+};
+
+type Tuning = {
+  ready: boolean;
+  samples: number;
+  min_samples: number;
+  suggestions: TuningSuggestion[];
 };
 
 type Position = {
@@ -202,6 +221,7 @@ type Health = {
   updated_at: string | null;
   ws_connected?: boolean;
   ws_last_msg_age_sec?: number | null;
+  feed_stale?: boolean;
   rate_limited?: number;
 };
 
@@ -221,7 +241,7 @@ type ClosedTrade = {
 
 type BacktestResult = {
   ok: boolean;
-  mode?: "simple" | "grid" | "walk";
+  mode?: "simple" | "grid" | "walk" | "smart";
   reason?: string;
   n?: number;
   tested?: number;
@@ -230,6 +250,9 @@ type BacktestResult = {
   tp?: number;
   sl?: number;
   timeout?: number;
+  time_stop?: number;
+  be_stop?: number;
+  partial?: number;
   avg_net_pct?: number;
   total_pnl_usdt?: number;
   // walk-forward
@@ -263,7 +286,7 @@ type BacktestRun = {
   note: string | null;
 };
 
-type BacktestMode = "simple" | "grid" | "walk";
+type BacktestMode = "simple" | "grid" | "walk" | "smart";
 
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
@@ -370,6 +393,9 @@ export default function App() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
+  const [tuning, setTuning] = useState<Tuning | null>(null);
+  const [pretrade, setPretrade] = useState<(Tuning & { reason?: string; tested?: number }) | null>(null);
+  const [pretradeRunning, setPretradeRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
@@ -405,6 +431,8 @@ export default function App() {
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
   const [btSl, setBtSl] = useState(3);
   const [btTp, setBtTp] = useState(6);
+  const [btSlip, setBtSlip] = useState(0);
+  const [btEntryDelay, setBtEntryDelay] = useState(0);
   const [btMode, setBtMode] = useState<BacktestMode>("simple");
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
@@ -413,7 +441,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -424,6 +452,7 @@ export default function App() {
         fetch(`${API_BASE}/health`),
         fetch(`${API_BASE}/trades/closed?limit=100`),
         fetch(`${API_BASE}/summary`),
+        fetch(`${API_BASE}/tuning`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -456,6 +485,7 @@ export default function App() {
         setTotalPnl(pData.total_pnl);
       }
       if (perfRes.ok) setPerf(await perfRes.json());
+      if (tuningRes.ok) setTuning(await tuningRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -513,6 +543,33 @@ export default function App() {
       setSettings(await r.json());
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Ayar değişmedi");
+    }
+  };
+
+  const runPretrade = async () => {
+    setPretradeRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/tuning/pretrade`);
+      if (!r.ok) throw new Error(`pretrade ${r.status}`);
+      setPretrade(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ön-bilgi hatası");
+    } finally {
+      setPretradeRunning(false);
+    }
+  };
+
+  const applyPreset = async (name: "news" | "safe") => {
+    try {
+      const r = await fetch(`${API_BASE}/settings/preset/${name}`, { method: "POST" });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.detail ?? String(r.status));
+      }
+      setSettings(await r.json());
+      setNotice(name === "news" ? "Haber-trade çıkış preset'i uygulandı" : "Muhafazakâr preset'e dönüldü");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Preset uygulanamadı");
     }
   };
 
@@ -647,6 +704,8 @@ export default function App() {
       const qs = new URLSearchParams({
         sl: String(btSl),
         tp: String(btTp),
+        slip: String(btSlip),
+        entry_delay: String(btEntryDelay),
         mode: btMode,
         min_impact: String(meta.alert_threshold),
       });
@@ -844,6 +903,17 @@ export default function App() {
               <NumField label="Breakeven % (0=kapalı)" value={settings.breakeven_pct} onSave={(v) => patchSettings({ breakeven_pct: v })} />
               <NumField label="Kısmi TP % (0=kapalı)" value={settings.partial_tp_pct} onSave={(v) => patchSettings({ partial_tp_pct: v })} />
               <NumField label="Kısmi TP oranı (0-1)" value={settings.partial_tp_frac} onSave={(v) => patchSettings({ partial_tp_frac: v })} />
+              <NumField label="Tier-1 refleks güç (0=kapalı)" value={settings.tier1_skip_confirm_impact} onSave={(v) => patchSettings({ tier1_skip_confirm_impact: v })} />
+              <div className="flex gap-2 pt-1">
+                <button type="button" onClick={() => void applyPreset("news")}
+                  className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/50">
+                  ⚡ Haber-trade preset'i
+                </button>
+                <button type="button" onClick={() => void applyPreset("safe")}
+                  className="rounded-md border border-zinc-700 px-2 py-1 text-xs font-semibold text-zinc-400 hover:bg-zinc-800">
+                  Muhafazakâr
+                </button>
+              </div>
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-amber-400/80">Risk limitleri</p>
@@ -953,6 +1023,9 @@ export default function App() {
                   <span className={health.ws_connected ? "text-emerald-400" : "text-red-400"}>●</span> WS
                   {health.ws_last_msg_age_sec != null ? ` ${Math.round(health.ws_last_msg_age_sec)}s` : ""}
                 </span>
+              )}
+              {health.feed_stale && (
+                <span className="font-semibold text-red-400" title="Haber akışı durdu — WS kopuk veya uzun süredir mesaj yok. Gerçek-zamanlı sinyal alınamıyor olabilir.">⛔ akış durdu</span>
               )}
               {!!health.rate_limited && health.rate_limited > 0 && (
                 <span className="text-amber-400" title="Binance rate-limit (429/418) sayısı">⚠ rate-limit ×{health.rate_limited}</span>
@@ -1304,6 +1377,75 @@ export default function App() {
         </section>
       )}
 
+      {/* Öğrenen beyin — öneriler (otomatik uygulanmaz) */}
+      <section className="mx-auto mt-10 max-w-5xl">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-lg font-semibold text-white">
+            🧠 Öğrenen beyin
+            <span className="ml-2 text-sm font-normal text-zinc-500">(öneri — otomatik uygulanmaz)</span>
+          </h2>
+          <button
+            type="button"
+            onClick={() => void runPretrade()}
+            disabled={pretradeRunning}
+            title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
+            className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
+          >
+            {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
+          </button>
+        </div>
+
+        {/* Canlı: kapanan gerçek işlemlerden */}
+        {tuning && tuning.ready && tuning.suggestions.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-xs uppercase text-zinc-500">Canlı işlemlerden ({tuning.samples} kapanmış)</p>
+            {tuning.suggestions.map((s, i) => (
+              <div key={`live-${i}`} className="flex items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-950/20 px-4 py-3">
+                <p className="text-sm text-amber-100/90">{s.message}</p>
+                {s.type === "auto_min_impact" && typeof s.suggested === "number" && (
+                  <button type="button" onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
+                    className="shrink-0 rounded-md border border-amber-500/40 bg-amber-900/40 px-3 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/50">
+                    Uygula → {s.suggested}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Ön-bilgi: işlemsiz, arşiv backtest'inden */}
+        {pretrade && (
+          <div className="mt-3 space-y-2">
+            <p className="text-xs uppercase text-sky-400/70">
+              İşlemsiz ön-bilgi {pretrade.ready ? `(${pretrade.samples} arşiv sinyali backtest)` : ""}
+            </p>
+            {!pretrade.ready ? (
+              <p className="rounded-2xl border border-white/10 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-500">{pretrade.reason ?? "Yeterli arşiv yok — motoru bir süre çalıştır."}</p>
+            ) : pretrade.suggestions.length === 0 ? (
+              <p className="rounded-2xl border border-emerald-500/20 bg-emerald-950/10 px-4 py-3 text-sm text-emerald-300/80">Arşiv backtest'i mevcut eşiklerle uyumlu — değişiklik önerilmiyor.</p>
+            ) : (
+              pretrade.suggestions.map((s, i) => (
+                <div key={`pre-${i}`} className="flex items-center justify-between gap-3 rounded-2xl border border-sky-500/30 bg-sky-950/20 px-4 py-3">
+                  <p className="text-sm text-sky-100/90">{s.message}</p>
+                  {s.type === "auto_min_impact" && typeof s.suggested === "number" && (
+                    <button type="button" onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
+                      className="shrink-0 rounded-md border border-sky-500/40 bg-sky-900/40 px-3 py-1 text-xs font-semibold text-sky-100 hover:bg-sky-800/50">
+                      Uygula → {s.suggested}
+                    </button>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {(!tuning || !tuning.ready || tuning.suggestions.length === 0) && !pretrade && (
+          <p className="rounded-2xl border border-white/10 bg-zinc-900/40 px-4 py-3 text-sm text-zinc-500">
+            Henüz canlı öneri yok. Gerçek para riske atmadan kalibrasyon için <strong className="text-sky-300">İşlemsiz ön-bilgi</strong>'yi çalıştır — arşivdeki sinyalleri backtest edip eşik önerir.
+          </p>
+        )}
+      </section>
+
       {/* Performans */}
       {perf && perf.total_trades > 0 && (
         <section className="mx-auto mt-10 max-w-5xl">
@@ -1436,15 +1578,31 @@ export default function App() {
                 className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
               />
             </label>
+            <label className="flex flex-col gap-1 text-xs text-zinc-400" title="Bacak başına slippage % — canlı dolum gerçekçiliği (önerilen ~0.1)">
+              <span>Slippage %</span>
+              <input
+                type="number" value={btSlip} step={0.05} min={0}
+                onChange={(e) => setBtSlip(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-zinc-400" title="Kaç dk gecikmeli gir — tespit+teyit+emir gecikmesini modelle (haber spike chase)">
+              <span>Giriş gecikme dk</span>
+              <input
+                type="number" value={btEntryDelay} step={1} min={0}
+                onChange={(e) => setBtEntryDelay(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50"
+              />
+            </label>
             <div className="flex flex-col gap-1 text-xs text-zinc-400">
               <span>Mod</span>
               <div className="flex overflow-hidden rounded-lg border border-zinc-700">
-                {([["simple", "Basit"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
+                {([["simple", "Basit"], ["smart", "Akıllı çıkış"], ["grid", "Grid"], ["walk", "Walk-forward"]] as [BacktestMode, string][]).map(([m, label]) => (
                   <button
                     key={m}
                     type="button"
                     onClick={() => setBtMode(m)}
-                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : "Tek SL/TP ile backtest"}
+                    title={m === "grid" ? "Tüm SL/TP kombinasyonlarını dene, en kârlıyı bul" : m === "walk" ? "İlk %70'te optimize, son %30'da test (overfit ölçer)" : m === "smart" ? "Mevcut çıkış ayarlarını (breakeven+kısmi TP+trailing+time-stop / preset) arşivde simüle et" : "Tek SL/TP ile backtest"}
                     className={`h-9 px-3 text-sm font-semibold transition ${
                       btMode === m ? "bg-emerald-900/50 text-emerald-200" : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
                     }`}
@@ -1571,6 +1729,11 @@ export default function App() {
                       accent={(btResult.total_pnl_usdt ?? 0) >= 0 ? "pos" : "neg"}
                     />
                   </div>
+                  {btResult.mode === "smart" && (
+                    <p className="text-xs text-zinc-500">
+                      Mevcut çıkış ayarlarıyla (preset dahil) simüle edildi · kısmi: {btResult.partial ?? 0} · time-stop: {btResult.time_stop ?? 0} · breakeven-stop: {btResult.be_stop ?? 0}
+                    </p>
+                  )}
                   {btResult.breakdown && (btResult.n ?? 0) > 0 && (
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                       <BreakdownTable title="Güce göre" rows={btResult.breakdown.by_impact} />

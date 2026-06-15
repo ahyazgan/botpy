@@ -38,11 +38,14 @@ cd dashboard && npm install && npm run dev   # http://localhost:5173
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `DISCORD_WEBHOOK_URL` | Uzak bildirim (telefona sinyal) |
 | `BOTPY_DB` | SQLite yolu (varsayılan `botpy.db`) |
 | `API_TOKEN` | Tanımlıysa işlem/ayar uçları `X-API-Token` ister — **sunucuyu dışa açarsan ayarla** |
+| `CONFIRM_INTERVAL` / `CONFIRM_LIMIT` | Fiyat teyit penceresi (varsayılan `15m`×`4`; daha erken/gürültülü teyit için `1m`×`15`) |
+| `WS_STALE_ALERT_SEC` | Ölü-adam anahtarı eşiği: haber akışı bu kadar saniye kopuk/sessizse uzak kanaldan uyar (varsayılan 600) |
 
 ### Çalışma zamanı ayarları (panelden, kalıcı)
 İşlem ayarları `trade_state.json`'a, haber ayarları SQLite'a yazılır; restart'a dayanıklıdır.
 - **İşlem:** paper/canlı, oto-işlem, spot/futures, pozisyon boyutu, conviction sizing (güce göre boyut)
-- **Çıkış:** SL/TP %, trailing, time-stop dk, breakeven %, kısmi TP %/oran
+- **Giriş:** Tier-1 refleks (`tier1_skip_confirm_impact`: net/yüksek-güç haberde teyit beklemeden gir — hareketin önünde ol; altındakiler teyit bekler)
+- **Çıkış:** SL/TP %, trailing, time-stop dk, breakeven %, kısmi TP %/oran — panelde **"⚡ Haber-trade preset'i"** ile tek tıkla optimal düzen (hızlı breakeven + erken kısmi TP + trailing + 60dk time-stop + tier-1), **"Muhafazakâr"** ile geri dön
 - **Risk:** günlük zarar limiti, toplam/coin maruziyet tavanı, max açık risk, kayıp serisi freni
 - **Sinyal kalitesi:** uyarı eşiği, "zaten-fiyatlanmış" atla (chase önleme), kaybeden kaynağı sustur
 
@@ -58,6 +61,11 @@ Arşivlenmiş güçlü sinyaller üzerinde (motor çalışmasa da) geçmiş fiya
 python news_backtest.py --db botpy.db                # basit (SL=3 TP=6)
 python news_backtest.py --db botpy.db --grid         # en kârlı SL/TP araması
 python news_backtest.py --db botpy.db --walk         # walk-forward (overfit testi)
+# Panelden "Akıllı çıkış" modu: mevcut ayarları/preset'i (breakeven+kısmi TP+
+# trailing+time-stop) arşivde simüle eder — haber-trade preset'ini canlıdan önce doğrula.
+# Canlı-gerçekçilik: --slip (bacak başı kayma %) + --entry-delay (gecikmeli giriş dk)
+# ile backtest'i gerçeğe yaklaştır (panelde Slippage % / Giriş gecikme alanları).
+python news_backtest.py --db botpy.db --slip 0.1 --entry-delay 2
 ```
 
 Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak kırılımıyla `auto_min_impact`/eşik veriyle ayarlanır.
@@ -71,6 +79,7 @@ Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak
 - **Likidite/slippage** — orderbook derinliği ve tahmini slippage girişte kontrol edilir.
 - **İdempotent emir** — `create_order` sabit `clientOrderId` ile gönderilir; yanıt kaybolsa bile **çift emir oluşmaz**.
 - **Acil flatten** — panelde "⛔ Tümünü kapat" / `POST /positions/close-all` ile tüm pozisyonlar tek tıkla kapatılır.
+- **Ölü-adam anahtarı** — gerçek-zamanlı haber akışı (WS) `WS_STALE_ALERT_SEC` (vars. 600s) boyunca kopuk/sessiz kalırsa Telegram/Discord'dan **otomatik uyarı**, düzelince toparlama bildirimi (sessiz sinyal-kaybını önler).
 
 ## Canlı işleme geçmeden — kontrol listesi
 

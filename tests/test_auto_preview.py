@@ -19,7 +19,7 @@ def env(monkeypatch):
         "auto_min_impact": 7, "auto_require_confirm": True, "market": "spot",
         "trade_usdt": 100.0, "size_by_impact": False, "skip_already_priced_pct": 0.0,
         "suppress_losing_sources": False, "reduce_after_losses": 0, "cooldown_sec": 0,
-        "max_positions": 20, "auto_trade": False,
+        "max_positions": 20, "auto_trade": False, "tier1_skip_confirm_impact": 0,
     }.items():
         setattr(trader.S, k, v)
     monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
@@ -63,6 +63,26 @@ def test_decision_already_priced(env):
     trader.S.skip_already_priced_pct = 15.0
     d = trader.auto_decision(_Item(price_24h_pct=20.0))
     assert d["would_trade"] is False and "fiyatlanmış" in d["reason"]
+
+
+def test_decision_tier1_skips_confirm(env):
+    """Tier-1: güç ≥ eşik net haberde teyit beklemeden gir (refleks)."""
+    trader.S.tier1_skip_confirm_impact = 9
+    d = trader.auto_decision(_Item(impact=9, confirmed=False))
+    assert d["would_trade"] is True and d["reason"] == "tier1-refleks"
+
+
+def test_decision_tier1_below_threshold_still_needs_confirm(env):
+    """Tier-1 eşiğinin altındaki güç hâlâ teyit bekler (Tier-2)."""
+    trader.S.tier1_skip_confirm_impact = 9
+    d = trader.auto_decision(_Item(impact=8, confirmed=False))
+    assert d["would_trade"] is False and "teyid" in d["reason"]
+
+
+def test_decision_tier1_disabled_by_default(env):
+    """Tier-1 kapalıyken (0) teyitsiz güçlü haber yine girmez."""
+    d = trader.auto_decision(_Item(impact=10, confirmed=False))
+    assert d["would_trade"] is False and "teyid" in d["reason"]
 
 
 def test_decision_conviction_size(env):

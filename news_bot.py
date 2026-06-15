@@ -102,8 +102,13 @@ USE_CLAUDE = bool(os.environ.get("ANTHROPIC_API_KEY"))
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 BINANCE_API = "https://api.binance.com/api/v3"
 MIN_VOLUME_USD = 1_000_000     # bu hacmin altı = düşük likidite (slippage riski)
-CONFIRM_MOVE_PCT = 0.5         # son 15dk'da haber yönünde en az bu % hareket = teyit
+CONFIRM_MOVE_PCT = 0.5         # son penceede haber yönünde en az bu % hareket = teyit
 ALREADY_PRICED_PCT = 25.0      # 24s'te bu % üzeri hareket = büyük kısmı fiyatlanmış
+# Teyit penceresi: kaç dakikalık mum × kaç adet. Varsayılan 15m×4 (son 15dk + ~1s).
+# Daha hızlı/erken teyit için CONFIRM_INTERVAL=1m CONFIRM_LIMIT=15 (son 1dk + 15dk);
+# daha gürültülü ama haberin önünde olur. Backtest'le kalibre et.
+CONFIRM_INTERVAL = os.environ.get("CONFIRM_INTERVAL", "15m")
+CONFIRM_LIMIT = int(os.environ.get("CONFIRM_LIMIT", "4"))
 # Binance USDT paritesi olmayan/olağan dışı coinler için stop listesi
 _NOT_TRADEABLE = {"USDT", "USDC", "USD", "FDUSD", "TRY", "AED", "OPENAI", "ANTHROPIC"}
 
@@ -125,6 +130,10 @@ BINANCE_ANN_BASE = "https://www.binance.com/en/support/announcement/"
 USE_TREENEWS = True
 TREE_WS = "wss://news.treeofalpha.com/ws"
 TREE_BACKFILL_GUARD_SEC = 8   # bağlantının ilk saniyelerindeki mesajlar = geçmiş, bildirme
+
+# Ölü-adam anahtarı: asıl gerçek-zamanlı kaynak (WS) bu kadar saniye kopuk/sessiz
+# kalırsa uzak kanaldan uyar (canlıda sessiz sinyal-kaybını önler), düzelince haber ver.
+WS_STALE_ALERT_SEC = float(os.environ.get("WS_STALE_ALERT_SEC", "600"))
 
 # ── Loglama ──────────────────────────────────────────────────────────────
 def setup_logging() -> None:
@@ -469,6 +478,51 @@ def score_item(item: NewsItem) -> None:
     item.scorer = "rule"
 
 
+# ── Bağlam beyni (kaynak güvenilirliği + haber yorgunluğu) ───────────────
+# Claude'a başlık dışında bağlam ipucu vererek isabeti yükseltir; ek istek/gecikme
+# YOK (sadece prompt'a kısa etiket eklenir). Kaynak tier'i + coin'in son saatlerdeki
+# haber sıklığı puanlamayı kalibre eder.
+_EXCHANGE_SRC = ("binance", "coinbase", "upbit", "okx", "bybit", "kraken",
+                 "kucoin", "bitget", "huobi", "gate", "bitfinex")
+_SOCIAL_SRC = ("twitter", "tweet", "x.com", "telegram", "reddit", "discord")
+_MEDIA_SRC = ("coindesk", "cointelegraph", "theblock", "decrypt", "bmag", "blog",
+              "direct", "reuters", "bloomberg", "wsj", "magazine")
+FATIGUE_WINDOW_HOURS = 6   # bu pencerede coin kaç kez haber oldu = "yorgunluk"
+
+
+def _source_tier(source: str) -> str:
+    """Kaynağı güvenilirlik sınıfına ayır: resmi-borsa > medya > sosyal > diğer."""
+    s = source.lower().lstrip("⚡").strip()
+    if any(x in s for x in _EXCHANGE_SRC):
+        return "resmi-borsa"
+    if any(x in s for x in _SOCIAL_SRC):
+        return "sosyal"
+    if any(x in s for x in _MEDIA_SRC):
+        return "medya"
+    return "diğer"
+
+
+def _coin_fatigue(coin: str, now: datetime, recent: list[NewsItem]) -> int:
+    """Son FATIGUE_WINDOW_HOURS içinde bu coin'i konu alan haber sayısı (yorgunluk)."""
+    cutoff = now - timedelta(hours=FATIGUE_WINDOW_HOURS)
+    n = 0
+    for it in recent:
+        ts = _parse_time(it.published) or _parse_time(it.fetched_at)
+        if ts and ts >= cutoff and coin in it.coins:
+            n += 1
+    return n
+
+
+def _item_context(it: NewsItem, now: datetime, recent: list[NewsItem]) -> str:
+    """Bir haber için Claude'a verilecek bağlam etiketi (kaynak tier + yorgunluk)."""
+    parts = [f"kaynak:{_source_tier(it.source)}"]
+    if it.coins:
+        fat = max(_coin_fatigue(c, now, recent) for c in it.coins)
+        if fat > 1:
+            parts.append(f"son{FATIGUE_WINDOW_HOURS}s:{fat}x (yorgun)")
+    return " · ".join(parts)
+
+
 # ── Puanlama (Claude — opsiyonel, akıllı) ────────────────────────────────
 _anthropic_client: Any = None
 
@@ -495,11 +549,19 @@ class _ScoreBatch(BaseModel):
 
 _SCORE_SYSTEM = (
     "Sen bir kripto haber-trade analistisin. Sana numaralı kripto haber başlıkları "
-    "verilecek. Her başlık için tek bir JSON kaydı üret:\n"
+    "verilecek. Her başlığın köşeli parantezinde kaynak ve bağlam ipuçları var:\n"
+    "- kaynak:resmi-borsa = borsanın kendi duyurusu, en güvenilir (etkiyi tam ver)\n"
+    "- kaynak:medya = haber sitesi, güvenilir\n"
+    "- kaynak:sosyal = doğrulanmamış tweet/söylenti — etkiyi TEMKİNLİ puanla (1-2 düşür)\n"
+    "- kaynak:diğer = belirsiz kaynak — temkinli\n"
+    "- 'sonNs:Mx (yorgun)' = bu coin son N saatte M kez haber oldu; haber zaten "
+    "fiyatlanmış olabilir, ek haberin marjinal etkisi azdır — etkiyi bir miktar düşür\n"
+    "Her başlık için tek bir JSON kaydı üret:\n"
     "- index: başlığın numarası\n"
     "- coins: etkilenen coin ticker'ları (örn. ['BTC','SOL']); net coin yoksa boş liste\n"
     "- impact: 1-10 piyasa etkisi (10 = piyasayı anında sert hareket ettirir: hack, "
-    "iflas, ETF onayı, büyük borsa listelemesi, yasak, dava; 1 = önemsiz/genel yorum)\n"
+    "iflas, ETF onayı, büyük borsa listelemesi, yasak, dava; 1 = önemsiz/genel yorum). "
+    "Kaynak güvenilirliği ve yorgunluğu bu skoru ayarlar.\n"
     "- direction: 'bullish' (fiyatı yukarı), 'bearish' (aşağı) veya 'neutral'\n"
     "- reason: en fazla 12 kelimelik Türkçe gerekçe\n"
     "Sadece istenen yapıyı döndür."
@@ -511,8 +573,13 @@ _SCORE_SYSTEM = (
 CLAUDE_BATCH = 25
 
 
-def _score_chunk(client: Any, chunk: list[NewsItem]) -> None:
-    listing = "\n".join(f"{i}. [{it.source}] {it.title}" for i, it in enumerate(chunk))
+def _score_chunk(client: Any, chunk: list[NewsItem], recent: list[NewsItem] | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    ctx = recent if recent is not None else chunk
+    listing = "\n".join(
+        f"{i}. [{it.source} · {_item_context(it, now, ctx)}] {it.title}"
+        for i, it in enumerate(chunk)
+    )
     resp = client.messages.parse(
         model=CLAUDE_MODEL,
         max_tokens=4000,
@@ -539,10 +606,13 @@ def score_with_claude(items: list[NewsItem]) -> None:
     if not items:
         return
     client = _get_anthropic()
+    # Yorgunluk hesabı için son haberlerin anlık görüntüsü (bağlam beyni)
+    with _cache_lock:
+        recent = list(_news)
     for start in range(0, len(items), CLAUDE_BATCH):
         chunk = items[start:start + CLAUDE_BATCH]
         try:
-            _score_chunk(client, chunk)
+            _score_chunk(client, chunk, recent)
         except Exception as e:
             log.warning("Claude grup puanlama başarısız (kural-tabanlı): %s", e)
             for it in chunk:
@@ -557,10 +627,10 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
                  timeout=REQUEST_TIMEOUT, session=session)
     if not t:
         return None
-    # 15dk'lık 4 mum → hem son ~15dk (son mum) hem ~1s (tüm pencere) hareketi
+    # Yapılandırılabilir pencere → hem son mum (kısa pencere) hem tüm pencere hareketi
     candles = get_json(
         f"{BINANCE_API}/klines",
-        params={"symbol": symbol, "interval": "15m", "limit": "4"},
+        params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(CONFIRM_LIMIT)},
         timeout=REQUEST_TIMEOUT, session=session,
     )
     move15 = move60 = 0.0
@@ -721,6 +791,42 @@ def _maybe_daily_digest() -> None:
                 notify_remote(_fmt_summary_msg(summary))
         except Exception as e:
             log.warning("Günlük özet hatası: %s", e)
+
+
+# Ölü-adam anahtarı durumu (spam önleme: bir kez uyar, düzelince bir kez haber ver)
+_ws_alert_active = False
+
+
+def _ws_feed_stale(now: float | None = None) -> bool:
+    """WS akışı (asıl kaynak) durmuş mu: kopuk VEYA son mesaj eşikten eski. Saf."""
+    if not USE_TREENEWS:
+        return False
+    t = now if now is not None else time.time()
+    if t - _started_at < WS_STALE_ALERT_SEC:
+        return False   # başlangıç grace: ilk bağlantıya süre tanı
+    if not _ws_state.get("connected"):
+        return True
+    age = _ws_last_msg_age(t)
+    return age is not None and age > WS_STALE_ALERT_SEC
+
+
+def _maybe_deadman_alert(now: float | None = None) -> None:
+    """WS uzun süre kopuk/sessizse uzak kanaldan uyar; düzelince haber ver.
+    Arka plan döngüsünden çağrılır (durum-makinesi → tek uyarı, tek toparlama)."""
+    global _ws_alert_active
+    stale = _ws_feed_stale(now)
+    if stale and not _ws_alert_active:
+        _ws_alert_active = True
+        if not _ws_state.get("connected"):
+            detail = "WS bağlantısı kopuk"
+        else:
+            mins = int((_ws_last_msg_age(now) or 0) / 60)
+            detail = f"son mesaj {mins} dk önce"
+        notify_remote(f"⚠️ HABER AKIŞI DURDU: {detail}. Gerçek-zamanlı sinyal "
+                      "alınamıyor olabilir — motoru/bağlantıyı kontrol et.")
+    elif not stale and _ws_alert_active:
+        _ws_alert_active = False
+        notify_remote("✅ Haber akışı geri geldi (WS bağlı, mesaj akıyor).")
 
 
 def notify(item: NewsItem) -> None:
@@ -928,7 +1034,8 @@ def _background_loop(stop: threading.Event) -> None:
     session.headers.setdefault("User-Agent", "kripto-haber-bot/1.0")
     while not stop.is_set():
         refresh(session)
-        _maybe_daily_digest()   # gün dönümünde dünün özetini gönder
+        _maybe_daily_digest()      # gün dönümünde dünün özetini gönder
+        _maybe_deadman_alert()     # haber akışı durduysa uyar (ölü-adam anahtarı)
         if stop.wait(SCAN_INTERVAL_SEC):
             break
 
@@ -1293,6 +1400,7 @@ def health() -> dict[str, Any]:
         "treenews": USE_TREENEWS,
         "ws_connected": _ws_state["connected"],
         "ws_last_msg_age_sec": _ws_last_msg_age(),
+        "feed_stale": _ws_feed_stale(),
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
     }
@@ -1450,13 +1558,15 @@ def _run_backtest_impl(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
     mode: str = "simple", train_frac: float = 0.7,
+    slip: float = 0.0, entry_delay: int = 0,
 ) -> dict[str, Any]:
     """Arşivlenmiş sinyaller üzerinde backtest koşar.
 
-    Her sinyal için Binance geçmiş klines indirip SL/TP çıkışını simüle eder
-    (komisyon dahil). `mode`: "simple" (tek SL/TP), "grid" (en kârlı SL/TP araması),
-    "walk" (walk-forward overfit testi). Ağ gerektirir; senkron çalışır (FastAPI
-    bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
+    Her sinyal için Binance geçmiş klines indirip çıkışı simüle eder (komisyon +
+    `slip` bacak-başı kayma %% + `entry_delay` dk gecikmeli giriş = canlı-gerçekçilik).
+    `mode`: "simple" (tek SL/TP), "smart" (akıllı çıkış / preset), "grid" (en kârlı
+    SL/TP araması), "walk" (walk-forward overfit testi). Ağ gerektirir; senkron çalışır
+    (FastAPI bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
     """
     import news_backtest as nbt
 
@@ -1489,7 +1599,28 @@ def _run_backtest_impl(
         return {"ok": True, "mode": "grid", "tested": len(signals),
                 "rows": grid, "best": best}
 
-    results = nbt.simulate_all(signals, sl, tp, fee)
+    if mode == "smart":
+        # Mevcut çıkış ayarlarını (preset dahil) arşiv üzerinde simüle et
+        params = {
+            "sl_pct": trader.S.stop_loss_pct, "tp_pct": trader.S.take_profit_pct,
+            "breakeven_pct": trader.S.breakeven_pct, "partial_tp_pct": trader.S.partial_tp_pct,
+            "partial_tp_frac": trader.S.partial_tp_frac, "trailing_stop_pct": trader.S.trailing_stop_pct,
+            "time_stop_min": trader.S.time_stop_min,
+            "slip_pct": slip, "entry_delay_min": entry_delay,
+        }
+        results = nbt.simulate_smart_all(signals, params, fee)
+        summary = nbt._summarize(results, usdt)
+        summary["ok"] = True
+        summary["mode"] = "smart"
+        summary["tested"] = len(signals)
+        summary["params"] = params
+        summary["breakdown"] = nbt.breakdown(results, usdt)
+        if summary.get("n"):
+            _persist_backtest("smart", sl=params["sl_pct"], tp=params["tp_pct"],
+                              stats=summary, note="akıllı çıkış (mevcut ayarlar)", **common)
+        return summary
+
+    results = nbt.simulate_all(signals, sl, tp, fee, slip_pct=slip, entry_delay_min=entry_delay)
     summary = nbt._summarize(results, usdt)
     summary["ok"] = True
     summary["mode"] = "simple"
@@ -1506,12 +1637,13 @@ def run_backtest(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
     mode: str = "simple", train_frac: float = 0.7,
+    slip: float = 0.0, entry_delay: int = 0,
 ) -> dict[str, Any]:
     """Backtest çalıştır (ağ-yoğun; aynı anda tek koşar — bkz `_heavy_guard`)."""
     with _heavy_guard():
         return _run_backtest_impl(sl=sl, tp=tp, fee=fee, usdt=usdt, hours=hours,
                                   min_impact=min_impact, limit=limit, mode=mode,
-                                  train_frac=train_frac)
+                                  train_frac=train_frac, slip=slip, entry_delay=entry_delay)
 
 
 def _persist_backtest(mode: str, *, sl: float | None, tp: float | None, fee: float,
@@ -1553,6 +1685,7 @@ class SettingsPatch(BaseModel):
     max_positions: int | None = None
     auto_min_impact: int | None = None
     auto_require_confirm: bool | None = None
+    tier1_skip_confirm_impact: int | None = None
     cooldown_sec: int | None = None
     use_sl_tp: bool | None = None
     stop_loss_pct: float | None = None
@@ -1589,6 +1722,16 @@ def patch_trade_settings(body: SettingsPatch) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/settings/preset/{name}", dependencies=[Depends(require_token)])
+def apply_settings_preset(name: str) -> dict[str, Any]:
+    """Çıkış preset'i uygula: 'news' (haber-trade: hızlı breakeven + erken kısmi TP +
+    trailing + time-stop + tier-1 refleks) veya 'safe' (muhafazakâr varsayılan)."""
+    try:
+        return trader.apply_preset(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/trade", dependencies=[Depends(require_token)])
 def post_trade(body: TradeRequest) -> dict[str, Any]:
     symbol = body.symbol or (f"{body.coin.upper()}USDT" if body.coin else None)
@@ -1609,6 +1752,39 @@ def get_positions() -> dict[str, Any]:
 @app.get("/performance")
 def get_performance() -> dict[str, Any]:
     return trader.get_performance()
+
+
+@app.get("/tuning")
+def get_tuning() -> dict[str, Any]:
+    """Öğrenen beyin (öneri modu): kapanan GERÇEK işlemlerden eşik ayarı önerileri.
+    Otomatik UYGULAMAZ — kaynak-tier eşlemesi için `_source_tier` geçirilir."""
+    return trader.suggest_tuning(tier_of=_source_tier)
+
+
+@app.get("/tuning/pretrade")
+def get_tuning_pretrade(
+    hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 1000,
+    fee: float = 0.2, slip: float = 0.1, entry_delay: int = 1,
+) -> dict[str, Any]:
+    """İşlemsiz ÖN-BİLGİ: arşivlenmiş sinyalleri gerçekçi maliyetlerle (slippage +
+    gecikmeli giriş) backtest edip eşik önerileri çıkarır — gerçek para riske atmadan
+    kalibrasyon, sistem ilk işlemden itibaren akıllı. Ağ-yoğun (aynı anda tek koşar)."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ready": False, "reason": "arşiv boş veya sinyaller çok yeni",
+                    "samples": 0, "suggestions": [], "pretrade": True}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ready": False, "reason": "fiyat verisi indirilemedi (Binance)",
+                    "samples": 0, "suggestions": [], "pretrade": True}
+        results = nbt.simulate_all(signals, trader.S.stop_loss_pct, trader.S.take_profit_pct,
+                                   fee, slip_pct=slip, entry_delay_min=entry_delay)
+        out = trader.suggest_from_backtest(results, tier_of=_source_tier)
+        out["tested"] = len(signals)
+        return out
 
 
 class PositionPatch(BaseModel):

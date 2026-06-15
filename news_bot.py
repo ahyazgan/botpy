@@ -102,8 +102,13 @@ USE_CLAUDE = bool(os.environ.get("ANTHROPIC_API_KEY"))
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 BINANCE_API = "https://api.binance.com/api/v3"
 MIN_VOLUME_USD = 1_000_000     # bu hacmin altı = düşük likidite (slippage riski)
-CONFIRM_MOVE_PCT = 0.5         # son 15dk'da haber yönünde en az bu % hareket = teyit
+CONFIRM_MOVE_PCT = 0.5         # son penceede haber yönünde en az bu % hareket = teyit
 ALREADY_PRICED_PCT = 25.0      # 24s'te bu % üzeri hareket = büyük kısmı fiyatlanmış
+# Teyit penceresi: kaç dakikalık mum × kaç adet. Varsayılan 15m×4 (son 15dk + ~1s).
+# Daha hızlı/erken teyit için CONFIRM_INTERVAL=1m CONFIRM_LIMIT=15 (son 1dk + 15dk);
+# daha gürültülü ama haberin önünde olur. Backtest'le kalibre et.
+CONFIRM_INTERVAL = os.environ.get("CONFIRM_INTERVAL", "15m")
+CONFIRM_LIMIT = int(os.environ.get("CONFIRM_LIMIT", "4"))
 # Binance USDT paritesi olmayan/olağan dışı coinler için stop listesi
 _NOT_TRADEABLE = {"USDT", "USDC", "USD", "FDUSD", "TRY", "AED", "OPENAI", "ANTHROPIC"}
 
@@ -557,10 +562,10 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
                  timeout=REQUEST_TIMEOUT, session=session)
     if not t:
         return None
-    # 15dk'lık 4 mum → hem son ~15dk (son mum) hem ~1s (tüm pencere) hareketi
+    # Yapılandırılabilir pencere → hem son mum (kısa pencere) hem tüm pencere hareketi
     candles = get_json(
         f"{BINANCE_API}/klines",
-        params={"symbol": symbol, "interval": "15m", "limit": "4"},
+        params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(CONFIRM_LIMIT)},
         timeout=REQUEST_TIMEOUT, session=session,
     )
     move15 = move60 = 0.0
@@ -1553,6 +1558,7 @@ class SettingsPatch(BaseModel):
     max_positions: int | None = None
     auto_min_impact: int | None = None
     auto_require_confirm: bool | None = None
+    tier1_skip_confirm_impact: int | None = None
     cooldown_sec: int | None = None
     use_sl_tp: bool | None = None
     stop_loss_pct: float | None = None
@@ -1586,6 +1592,16 @@ def patch_trade_settings(body: SettingsPatch) -> dict[str, Any]:
     try:
         return trader.update_settings(body.model_dump(exclude_none=True))
     except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/settings/preset/{name}", dependencies=[Depends(require_token)])
+def apply_settings_preset(name: str) -> dict[str, Any]:
+    """Çıkış preset'i uygula: 'news' (haber-trade: hızlı breakeven + erken kısmi TP +
+    trailing + time-stop + tier-1 refleks) veya 'safe' (muhafazakâr varsayılan)."""
+    try:
+        return trader.apply_preset(name)
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

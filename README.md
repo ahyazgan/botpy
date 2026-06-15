@@ -38,11 +38,13 @@ cd dashboard && npm install && npm run dev   # http://localhost:5173
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `DISCORD_WEBHOOK_URL` | Uzak bildirim (telefona sinyal) |
 | `BOTPY_DB` | SQLite yolu (varsayılan `botpy.db`) |
 | `API_TOKEN` | Tanımlıysa işlem/ayar uçları `X-API-Token` ister — **sunucuyu dışa açarsan ayarla** |
+| `CONFIRM_INTERVAL` / `CONFIRM_LIMIT` | Fiyat teyit penceresi (varsayılan `15m`×`4`; daha erken/gürültülü teyit için `1m`×`15`) |
 
 ### Çalışma zamanı ayarları (panelden, kalıcı)
 İşlem ayarları `trade_state.json`'a, haber ayarları SQLite'a yazılır; restart'a dayanıklıdır.
 - **İşlem:** paper/canlı, oto-işlem, spot/futures, pozisyon boyutu, conviction sizing (güce göre boyut)
-- **Çıkış:** SL/TP %, trailing, time-stop dk, breakeven %, kısmi TP %/oran
+- **Giriş:** Tier-1 refleks (`tier1_skip_confirm_impact`: net/yüksek-güç haberde teyit beklemeden gir — hareketin önünde ol; altındakiler teyit bekler)
+- **Çıkış:** SL/TP %, trailing, time-stop dk, breakeven %, kısmi TP %/oran — panelde **"⚡ Haber-trade preset'i"** ile tek tıkla optimal düzen (hızlı breakeven + erken kısmi TP + trailing + 60dk time-stop + tier-1), **"Muhafazakâr"** ile geri dön
 - **Risk:** günlük zarar limiti, toplam/coin maruziyet tavanı, max açık risk, kayıp serisi freni
 - **Sinyal kalitesi:** uyarı eşiği, "zaten-fiyatlanmış" atla (chase önleme), kaybeden kaynağı sustur
 

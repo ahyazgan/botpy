@@ -63,6 +63,7 @@ type Settings = {
   max_positions: number;
   auto_min_impact: number;
   auto_require_confirm: boolean;
+  tier1_skip_confirm_impact: number;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -516,6 +517,20 @@ export default function App() {
     }
   };
 
+  const applyPreset = async (name: "news" | "safe") => {
+    try {
+      const r = await fetch(`${API_BASE}/settings/preset/${name}`, { method: "POST" });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        throw new Error(b.detail ?? String(r.status));
+      }
+      setSettings(await r.json());
+      setNotice(name === "news" ? "Haber-trade çıkış preset'i uygulandı" : "Muhafazakâr preset'e dönüldü");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Preset uygulanamadı");
+    }
+  };
+
   const patchNewsSettings = async (patch: Partial<NewsSettings>) => {
     try {
       const r = await fetch(`${API_BASE}/news-settings`, {
@@ -844,6 +859,17 @@ export default function App() {
               <NumField label="Breakeven % (0=kapalı)" value={settings.breakeven_pct} onSave={(v) => patchSettings({ breakeven_pct: v })} />
               <NumField label="Kısmi TP % (0=kapalı)" value={settings.partial_tp_pct} onSave={(v) => patchSettings({ partial_tp_pct: v })} />
               <NumField label="Kısmi TP oranı (0-1)" value={settings.partial_tp_frac} onSave={(v) => patchSettings({ partial_tp_frac: v })} />
+              <NumField label="Tier-1 refleks güç (0=kapalı)" value={settings.tier1_skip_confirm_impact} onSave={(v) => patchSettings({ tier1_skip_confirm_impact: v })} />
+              <div className="flex gap-2 pt-1">
+                <button type="button" onClick={() => void applyPreset("news")}
+                  className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/50">
+                  ⚡ Haber-trade preset'i
+                </button>
+                <button type="button" onClick={() => void applyPreset("safe")}
+                  className="rounded-md border border-zinc-700 px-2 py-1 text-xs font-semibold text-zinc-400 hover:bg-zinc-800">
+                  Muhafazakâr
+                </button>
+              </div>
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-amber-400/80">Risk limitleri</p>

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import csv
 import hashlib
 import io
@@ -786,6 +787,32 @@ def _prune_news() -> None:
 
 
 # ── Ortak işleme: puanla → teyit et → sakla → bildir/oto-işlem ───────────
+MAX_CONFIRM_WORKERS = 8   # çoklu alert'te fiyat teyidi paralelliği (üst sınır)
+
+
+def _confirm_one(session: requests.Session, it: NewsItem) -> None:
+    try:
+        confirm_with_price(session, it)
+    except Exception as e:
+        log.warning("Fiyat teyidi başarısız (%s): %s", it.symbol or it.coins, e)
+
+
+def _confirm_alerts(session: requests.Session, alerts: list[NewsItem]) -> None:
+    """Güçlü haberlerin fiyat teyidini paralel çalıştır (çoklu alert'te hız).
+
+    Tek/sıfır alert'te inline; aksi halde sınırlı thread havuzu. Her teyit kendi
+    item'ını yerinde günceller (paylaşımlı durum yok); hata diğerlerini etkilemez.
+    """
+    if not alerts:
+        return
+    if len(alerts) == 1:
+        _confirm_one(session, alerts[0])
+        return
+    workers = min(len(alerts), MAX_CONFIRM_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(lambda it: _confirm_one(session, it), alerts))
+
+
 def process_items(
     session: requests.Session,
     candidates: list[NewsItem],
@@ -838,11 +865,7 @@ def process_items(
     # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
     alerts = [it for it in new_items if it.impact >= threshold]
     _metrics["alerts_total"] += len(alerts)
-    for it in alerts:
-        try:
-            confirm_with_price(session, it)
-        except Exception as e:
-            log.warning("Fiyat teyidi başarısız (%s): %s", it.symbol or it.coins, e)
+    _confirm_alerts(session, alerts)   # paralel fiyat teyidi (çoklu alert'te hız)
 
     if allow_notify:
         for it in alerts:

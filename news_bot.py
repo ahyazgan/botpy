@@ -1126,6 +1126,25 @@ def get_signals(limit: int = 500, min_impact: int = 0) -> dict[str, Any]:
             **store.signal_span()}
 
 
+@app.get("/scorecard")
+def scorecard(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300) -> dict[str, Any]:
+    """Ham sinyal kalitesi: arşiv sinyallerinin gerçekleşen yön isabeti (SL/TP'siz).
+
+    Binance klines indirir (senkron, threadpool). İşlem simüle etmez — sadece
+    haber yönünün fiyatla uyumunu kaynak/güç bazında ölçer.
+    """
+    import news_backtest as nbt
+
+    rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+    candidates = nbt._signals_from_rows(rows)
+    if not candidates:
+        return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+    signals = nbt.prefetch(candidates, int(hours * 60))
+    if not signals:
+        return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+    return {"ok": True, **nbt.signal_scorecard(signals)}
+
+
 @app.get("/backtest")
 def run_backtest(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,

@@ -793,30 +793,14 @@ def process_items(
     if not new_items:
         return 0, 0
 
-    # Puanla — Claude varsa akıllı, yoksa kural-tabanlı
-    if USE_CLAUDE:
-        try:
-            score_with_claude(new_items)
-        except Exception as e:
-            log.warning("Claude puanlama başarısız, kural-tabanlıya dönülüyor: %s", e)
-            for it in new_items:
-                if it.scorer != "claude":
-                    score_item(it)
-    else:
-        for it in new_items:
-            score_item(it)
-
-    # Güçlü haberleri Binance fiyat hareketiyle teyit et
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
-    alerts = [it for it in new_items if it.impact >= threshold]
-    _metrics["alerts_total"] += len(alerts)
-    for it in alerts:
-        try:
-            confirm_with_price(session, it)
-        except Exception as e:
-            log.warning("Fiyat teyidi başarısız (%s): %s", it.symbol or it.coins, e)
 
+    # Faz 1 — ANINDA kural puanı (Claude'un ağ gecikmesini beklemeden)
+    for it in new_items:
+        score_item(it)
+
+    # Hemen sakla → panel/SSE gecikmesiz göstersin
     with _cache_lock:
         for it in new_items:
             _news.insert(0, it)
@@ -825,10 +809,35 @@ def process_items(
         _status["error"] = None
         _status["total_seen"] = len(_seen_ids)
 
+    # Erken heads-up: Claude gecikme ekleyeceği için kural-güçlülerini şimdi bildir
+    notified: set[str] = set()
+    if allow_notify and USE_CLAUDE:
+        for it in new_items:
+            if it.impact >= threshold:
+                notify(it)
+                notified.add(it.id)
+
+    # Faz 2 — Claude ile rafine et (nihai skor); hata olursa kural skoru geçerli kalır
+    if USE_CLAUDE:
+        try:
+            score_with_claude(new_items)
+        except Exception as e:
+            log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
+
+    # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
+    alerts = [it for it in new_items if it.impact >= threshold]
+    _metrics["alerts_total"] += len(alerts)
+    for it in alerts:
+        try:
+            confirm_with_price(session, it)
+        except Exception as e:
+            log.warning("Fiyat teyidi başarısız (%s): %s", it.symbol or it.coins, e)
+
     if allow_notify:
         for it in alerts:
             _archive_signal(it)
-            notify(it)
+            if it.id not in notified:   # erken bildirilenleri tekrar bildirme
+                notify(it)
             pos = trader.maybe_auto_trade(it)
             if pos:
                 _metrics["trades_opened_total"] += 1

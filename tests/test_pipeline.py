@@ -100,3 +100,61 @@ def test_runtime_threshold_respected(pipeline):
 
 def test_empty_candidates(pipeline):
     assert nb.process_items(None, [], allow_notify=True) == (0, 0)
+
+
+# ── İki-faz: kural-önce (erken bildir) → Claude-sonra (nihai skor) ──────────
+def test_two_phase_early_notify_and_claude_promote(pipeline, monkeypatch):
+    scores, store = pipeline
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    notified: list[str] = []
+    traded: list[str] = []
+    monkeypatch.setattr(nb, "notify", lambda it: notified.append(it.id))
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it: (traded.append(it.id), None)[1])
+    scores.update({"a": 8, "b": 3})   # kural: a güçlü (erken bildir), b zayıf
+
+    def claude(items):
+        cs = {"a": 9, "b": 8}          # Claude: a güçlü kalır, b'yi güçlüye yükseltir
+        for it in items:
+            it.impact = cs[it.id]
+            it.scorer = "claude"
+    monkeypatch.setattr(nb, "score_with_claude", claude)
+
+    n_new, n_alert = nb.process_items(None, [_item("a"), _item("b")], allow_notify=True)
+    assert n_new == 2 and n_alert == 2
+    assert sorted(notified) == ["a", "b"]   # a erken, b Claude-sonrası — her biri 1 kez (a çift değil)
+    assert sorted(traded) == ["a", "b"]     # oto-işlem nihai skorda her ikisi
+
+
+def test_two_phase_claude_downgrade_heads_up_only(pipeline, monkeypatch):
+    scores, store = pipeline
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    notified: list[str] = []
+    traded: list[str] = []
+    monkeypatch.setattr(nb, "notify", lambda it: notified.append(it.id))
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it: (traded.append(it.id), None)[1])
+    scores.update({"a": 9})            # kural güçlü → erken heads-up
+
+    def claude(items):
+        for it in items:
+            it.impact = 2              # Claude düşürür
+            it.scorer = "claude"
+    monkeypatch.setattr(nb, "score_with_claude", claude)
+
+    n_new, n_alert = nb.process_items(None, [_item("a")], allow_notify=True)
+    assert n_alert == 0                # nihai skor zayıf
+    assert notified == ["a"]           # erken heads-up gitti
+    assert traded == []                # ama işlem yok (para yolu nihai skorda)
+    assert store.signal_span()["count"] == 0   # arşivlenmedi
+
+
+def test_two_phase_claude_failure_keeps_rule(pipeline, monkeypatch):
+    scores, store = pipeline
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    scores.update({"a": 8})
+
+    def boom(items):
+        raise RuntimeError("claude down")
+    monkeypatch.setattr(nb, "score_with_claude", boom)
+
+    n_new, n_alert = nb.process_items(None, [_item("a")], allow_notify=True)
+    assert n_alert == 1                # Claude patladı → kural skoru geçerli

@@ -1,4 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+function beep(): void {
+  try {
+    const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.3);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.3);
+  } catch {
+    /* ses çalınamadı — sorun değil */
+  }
+}
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 const POLL_MS = 15_000;
@@ -359,6 +379,10 @@ export default function App() {
   const [minImpact, setMinImpact] = useState(0);
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   const [onlyConfirmed, setOnlyConfirmed] = useState(false);
+  const [notifyBrowser, setNotifyBrowser] = useState(() =>
+    typeof localStorage !== "undefined" && localStorage.getItem("notifyBrowser") === "1");
+  const notifiedRef = useRef<Set<string>>(new Set());
+  const notifyPrimedRef = useRef(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -388,6 +412,25 @@ export default function App() {
       const nData: NewsPayload = await nRes.json();
       setNews(nData.news);
       setMeta({ total_seen: nData.total_seen, alert_threshold: nData.alert_threshold, updated_at: nData.updated_at });
+      // Tarayıcı bildirimi: panel açıkken gelen YENİ güçlü sinyalleri haber ver
+      {
+        const strong = nData.news.filter((n) => n.impact >= nData.alert_threshold);
+        if (!notifyPrimedRef.current) {
+          strong.forEach((n) => notifiedRef.current.add(n.id));   // ilk yük: tohumla, bildirme
+          notifyPrimedRef.current = true;
+        } else {
+          const fresh = strong.filter((n) => !notifiedRef.current.has(n.id));
+          fresh.forEach((n) => notifiedRef.current.add(n.id));
+          const enabled = localStorage.getItem("notifyBrowser") === "1";
+          if (fresh.length > 0 && enabled && "Notification" in window && Notification.permission === "granted") {
+            const top = fresh[0];
+            new Notification(`⚡ Güç ${top.impact}/10 · ${top.coins.join(", ") || "Genel"}`, {
+              body: top.title.slice(0, 140),
+            });
+            beep();
+          }
+        }
+      }
       if (nData.error) setErr(nData.error);
       if (sRes.ok) setSettings(await sRes.json());
       if (pRes.ok) {
@@ -485,6 +528,20 @@ export default function App() {
     }
   };
 
+  const patchPos = async (id: string, patch: { sl_price?: number; tp_price?: number }) => {
+    try {
+      const r = await fetch(`${API_BASE}/positions/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "SL/TP güncellenemedi");
+    }
+  };
+
   const runPreview = async () => {
     setPreviewOn((v) => !v);
     if (preview === null) {
@@ -494,6 +551,27 @@ export default function App() {
       } catch {
         setPreview([]);
       }
+    }
+  };
+
+  const toggleNotify = async () => {
+    if (!notifyBrowser) {
+      if (!("Notification" in window)) {
+        setErr("Tarayıcı bildirim desteklemiyor");
+        return;
+      }
+      if (Notification.permission !== "granted") {
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") {
+          setErr("Bildirim izni verilmedi");
+          return;
+        }
+      }
+      localStorage.setItem("notifyBrowser", "1");
+      setNotifyBrowser(true);
+    } else {
+      localStorage.setItem("notifyBrowser", "0");
+      setNotifyBrowser(false);
     }
   };
 
@@ -841,6 +919,16 @@ export default function App() {
           >
             Sadece teyitli
           </button>
+          <button
+            type="button"
+            onClick={() => void toggleNotify()}
+            title="Panel açıkken güçlü sinyal gelince tarayıcı bildirimi + ses"
+            className={`h-10 rounded-xl border px-4 text-sm font-semibold transition ${
+              notifyBrowser ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+            }`}
+          >
+            {notifyBrowser ? "🔔 Bildirim açık" : "🔕 Bildirim"}
+          </button>
         </div>
       </header>
 
@@ -991,9 +1079,23 @@ export default function App() {
                       <td className="px-4 py-3 tabular-nums text-zinc-300">${p.usdt}</td>
                       <td className="px-4 py-3 tabular-nums text-zinc-400">{p.entry_price}</td>
                       <td className="px-4 py-3 text-xs tabular-nums">
-                        <span className="text-red-400">{p.sl_price ?? "—"}</span>
-                        <span className="text-zinc-600"> / </span>
-                        <span className="text-emerald-400">{p.tp_price ?? "—"}</span>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number" step="any" defaultValue={p.sl_price ?? ""} key={`sl-${p.id}-${p.sl_price}`}
+                            title="Stop-loss fiyatı (0 = kaldır, Enter/blur ile kaydet)"
+                            onBlur={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v !== (p.sl_price ?? NaN)) void patchPos(p.id, { sl_price: v }); }}
+                            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                            className="h-6 w-16 rounded border border-zinc-700 bg-zinc-800/80 px-1 text-right text-red-300 outline-none focus:border-red-500/50"
+                          />
+                          <span className="text-zinc-600">/</span>
+                          <input
+                            type="number" step="any" defaultValue={p.tp_price ?? ""} key={`tp-${p.id}-${p.tp_price}`}
+                            title="Take-profit fiyatı (0 = kaldır, Enter/blur ile kaydet)"
+                            onBlur={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v !== (p.tp_price ?? NaN)) void patchPos(p.id, { tp_price: v }); }}
+                            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                            className="h-6 w-16 rounded border border-zinc-700 bg-zinc-800/80 px-1 text-right text-emerald-300 outline-none focus:border-emerald-500/50"
+                          />
+                        </div>
                       </td>
                       <td className="px-4 py-3 tabular-nums text-zinc-300">{p.current_price ?? "—"}</td>
                       <td className="px-4 py-3 tabular-nums">
@@ -1245,10 +1347,18 @@ export default function App() {
               ) : btResult.mode === "grid" ? (
                 <div className="space-y-3">
                   {btResult.best && (
-                    <p className="text-sm text-zinc-300">
-                      En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
-                      <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
-                      <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                    <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+                      <span>En kârlı: <strong className="text-emerald-300">SL {btResult.best.sl}% · TP {btResult.best.tp}%</strong>
+                        <span className="ml-2 text-emerald-400">{btResult.best.total_pnl_usdt >= 0 ? "+" : ""}{btResult.best.total_pnl_usdt.toFixed(2)} USDT</span>
+                        <span className="ml-2 text-zinc-500">({btResult.tested} sinyal)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void patchSettings({ stop_loss_pct: btResult.best!.sl, take_profit_pct: btResult.best!.tp })}
+                        className="rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-0.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-900/60"
+                      >
+                        Bu SL/TP'yi uygula
+                      </button>
                     </p>
                   )}
                   <div className="overflow-x-auto rounded-lg border border-white/10">
@@ -1284,9 +1394,19 @@ export default function App() {
                 <div className="space-y-3">
                   {btResult.in_sample ? (
                     <>
-                      <p className="text-sm text-zinc-300">
-                        En iyi (in-sample): <strong className="text-emerald-300">SL {btResult.params?.sl}% · TP {btResult.params?.tp}%</strong>
-                        <span className="ml-2 text-zinc-500">({btResult.tested} sinyal test edildi)</span>
+                      <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+                        <span>En iyi (in-sample): <strong className="text-emerald-300">SL {btResult.params?.sl}% · TP {btResult.params?.tp}%</strong>
+                          <span className="ml-2 text-zinc-500">({btResult.tested} sinyal)</span>
+                        </span>
+                        {btResult.params && (
+                          <button
+                            type="button"
+                            onClick={() => void patchSettings({ stop_loss_pct: btResult.params!.sl, take_profit_pct: btResult.params!.tp })}
+                            className="rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-0.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-900/60"
+                          >
+                            Bu SL/TP'yi uygula
+                          </button>
+                        )}
                       </p>
                       <div className="grid grid-cols-2 gap-3 text-sm">
                         <div className="rounded-lg bg-zinc-800/50 p-3">

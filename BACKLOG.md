@@ -31,7 +31,7 @@
 ## Later (düşük öncelik)
 
 - [x] Backtest sonuçlarını kalıcı kaydet + karşılaştırma  (c677689)
-- [ ] Çoklu zaman dilimli teyit (15dk + 1s uyumu)
+- [x] Çoklu zaman dilimli teyit (15dk + 1s uyumu)  (a144af7)
 
 -----
 

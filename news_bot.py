@@ -156,6 +156,7 @@ class NewsItem:
     symbol: str | None = None       # işlem yapılacak parite (örn. BTCUSDT)
     price_24h_pct: float | None = None
     price_15m_pct: float | None = None
+    price_60m_pct: float | None = None   # ~1 saatlik hareket (çoklu zaman dilimi teyidi)
     volume_usd: float | None = None
     confirmed: bool = False         # haber + fiyat hareketi uyumlu mu
     price_note: str = ""            # teyit açıklaması
@@ -176,6 +177,7 @@ class NewsItem:
             "symbol": self.symbol,
             "price_24h_pct": self.price_24h_pct,
             "price_15m_pct": self.price_15m_pct,
+            "price_60m_pct": self.price_60m_pct,
             "volume_usd": self.volume_usd,
             "confirmed": self.confirmed,
             "price_note": self.price_note,
@@ -503,25 +505,31 @@ def score_with_claude(items: list[NewsItem]) -> None:
 
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, float] | None:
-    """Bir parite için 24s değişim, hacim ve son 15dk hareketini döndür."""
+    """Bir parite için 24s değişim, hacim, son ~15dk ve ~1s hareketini döndür."""
     t = get_json(f"{BINANCE_API}/ticker/24hr", params={"symbol": symbol},
                  timeout=REQUEST_TIMEOUT, session=session)
     if not t:
         return None
+    # 15dk'lık 4 mum → hem son ~15dk (son mum) hem ~1s (tüm pencere) hareketi
     candles = get_json(
         f"{BINANCE_API}/klines",
-        params={"symbol": symbol, "interval": "5m", "limit": "3"},
+        params={"symbol": symbol, "interval": "15m", "limit": "4"},
         timeout=REQUEST_TIMEOUT, session=session,
     )
-    move15 = 0.0
+    move15 = move60 = 0.0
     if isinstance(candles, list) and candles:
-        o, c = float(candles[0][1]), float(candles[-1][4])
-        if o:
-            move15 = (c - o) / o * 100
+        last = candles[-1]
+        o15, c15 = float(last[1]), float(last[4])
+        if o15:
+            move15 = (c15 - o15) / o15 * 100
+        o60, c60 = float(candles[0][1]), float(candles[-1][4])
+        if o60:
+            move60 = (c60 - o60) / o60 * 100
     return {
         "pct24": float(t.get("priceChangePercent", 0) or 0),
         "vol": float(t.get("quoteVolume", 0) or 0),
         "move15": move15,
+        "move60": move60,
     }
 
 
@@ -551,28 +559,35 @@ def confirm_with_price(session: requests.Session, item: NewsItem) -> None:
 
     item.price_24h_pct = round(stats["pct24"], 2)
     item.price_15m_pct = round(stats["move15"], 2)
+    item.price_60m_pct = round(stats.get("move60", 0.0), 2)
     item.volume_usd = stats["vol"]
 
     liq_ok = stats["vol"] >= MIN_VOLUME_USD
     move = stats["move15"]
+    move60 = stats.get("move60", 0.0)
     if item.direction == "bullish":
         dir_match = move >= CONFIRM_MOVE_PCT
+        tf_ok = move60 >= -CONFIRM_MOVE_PCT   # 1s belirgin düşüşte değil
     elif item.direction == "bearish":
         dir_match = move <= -CONFIRM_MOVE_PCT
+        tf_ok = move60 <= CONFIRM_MOVE_PCT    # 1s belirgin yükselişte değil
     else:
-        dir_match = False
+        dir_match = tf_ok = False
 
     already_priced = abs(stats["pct24"]) >= ALREADY_PRICED_PCT
-    item.confirmed = bool(dir_match and liq_ok)
+    # Çoklu zaman dilimi: 15dk + 1s yön uyumu (15dk spike ama 1s ters = fade riski)
+    item.confirmed = bool(dir_match and liq_ok and tf_ok)
 
     if not liq_ok:
         item.price_note = f"Düşük likidite (24s hacim ${stats['vol']:,.0f}) — slippage riski"
     elif item.direction == "neutral":
         pass  # not yukarıda set edildi
+    elif dir_match and not tf_ok:
+        item.price_note = f"15dk uyumlu ama 1s ters yönde (%{move60:+.1f}) — fade riski, teyit yok"
     elif item.confirmed and already_priced:
         item.price_note = f"Teyitli ama 24s'te %{stats['pct24']:.0f} oynamış — kısmen fiyatlanmış olabilir"
     elif item.confirmed:
-        item.price_note = f"Haber + fiyat uyumlu (15dk %{move:+.1f})"
+        item.price_note = f"Haber + fiyat uyumlu (15dk %{move:+.1f}, 1s %{move60:+.1f})"
     else:
         item.price_note = f"Fiyat henüz haber yönünde oynamadı (15dk %{move:+.1f})"
 

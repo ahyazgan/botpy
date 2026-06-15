@@ -1057,6 +1057,28 @@ def summary(date: str | None = None) -> dict[str, Any]:
     return trader.daily_summary(date)
 
 
+@app.get("/auto-preview")
+def auto_preview(limit: int = 20) -> dict[str, Any]:
+    """Mevcut güçlü haberler için oto-işlem kararı önizlemesi (çalıştırmadan).
+
+    Her haber için hangi gerekçeyle işlem açılır/açılmaz ve hangi boyutta — config
+    kalibrasyonu için. Global oto-işlem kapalı olsa da değerlendirir (yan etkisiz).
+    """
+    threshold = get_news_settings()["alert_threshold"]
+    with _cache_lock:
+        items = [n for n in _news if n.impact >= threshold][:limit]
+    preview = []
+    for it in items:
+        d = trader.auto_decision(it)
+        preview.append({
+            "id": it.id, "title": it.title[:80], "symbol": it.symbol,
+            "impact": it.impact, "direction": it.direction,
+            "would_trade": d["would_trade"], "reason": d["reason"],
+            "side": d["side"], "usdt": d["usdt"],
+        })
+    return {"preview": preview, "auto_trade_on": trader.S.auto_trade}
+
+
 @app.get("/trades/closed")
 def trades_closed(limit: int = 200) -> dict[str, Any]:
     """Kapanan işlemler (işlem günlüğü), en yeniden eskiye."""

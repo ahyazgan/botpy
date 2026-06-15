@@ -569,53 +569,61 @@ def _size_multiplier(impact: int) -> float:
     return max(0.5, min(1.5, 1.0 + (impact - 8) * 0.25))
 
 
-def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
-    if not S.auto_trade:
-        return None
+def auto_decision(item: Any) -> dict[str, Any]:
+    """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
+
+    Global `auto_trade` anahtarını dikkate almaz (kalibrasyon/önizleme için her
+    sinyali değerlendirir). Dönen: {would_trade, reason, side, usdt, news_source}.
+    """
+    no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
     if item.impact < S.auto_min_impact:
-        return None
+        return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
     if S.auto_require_confirm and not getattr(item, "confirmed", False):
-        return None
+        return no("fiyat teyidi yok")
     symbol = getattr(item, "symbol", None)
     if not symbol:
-        return None
+        return no("parite (symbol) yok")
     if item.direction == "bullish":
         side = "long"
     elif item.direction == "bearish":
         side = "short"
     else:
-        return None
+        return no("yön nötr")
     if S.market == "spot" and side == "short":
-        return None
+        return no("spot'ta short yok")
     if not _can_auto_trade(symbol):
-        return None
-    # Chase önleme: 24s'te haber yönünde çok oynamışsa (zaten fiyatlanmış) girme
+        return no("cooldown / limit / zaten açık pozisyon")
     if S.skip_already_priced_pct > 0:
         m = getattr(item, "price_24h_pct", None)
         if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
                               or (side == "short" and m <= -S.skip_already_priced_pct)):
-            log.info("Atla (zaten fiyatlanmış): %s %s 24s=%%%.1f", side, symbol, m)
-            return None
-    # Kaynak öğrenme: yeterli örnekte negatif beklentili kaynağı sustur
+            return no(f"zaten fiyatlanmış (24s %{m:+.1f})")
     news_source = getattr(item, "source", "") or ""
     if S.suppress_losing_sources and news_source:
         st = source_stats(news_source)
         if st["count"] >= S.min_source_samples and st["avg_pnl"] < 0:
-            log.info("Atla (kaynak negatif beklenti): %s avg=%.2f n=%d",
-                     news_source, st["avg_pnl"], st["count"])
-            return None
+            return no(f"kaynak negatif beklenti ({news_source} avg={st['avg_pnl']})")
     # Boyut: conviction (güce göre) + kayıp serisi freni
     usdt = S.trade_usdt
     if S.size_by_impact:
         usdt *= _size_multiplier(int(item.impact))
     if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
         usdt *= 0.5
-    usdt = round(usdt, 2)
+    return {"would_trade": True, "reason": "uygun", "side": side,
+            "usdt": round(usdt, 2), "news_source": news_source}
+
+
+def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
+    if not S.auto_trade:
+        return None
+    d = auto_decision(item)
+    if not d["would_trade"]:
+        return None
     try:
-        return place_trade(symbol, side, usdt=usdt, source="auto",
-                           news_source=news_source, reason=getattr(item, "reason", ""))
+        return place_trade(item.symbol, d["side"], usdt=d["usdt"], source="auto",
+                           news_source=d["news_source"], reason=getattr(item, "reason", ""))
     except Exception as e:
-        log.warning("Otomatik işlem açılamadı (%s): %s", symbol, e)
+        log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
         return None
 
 

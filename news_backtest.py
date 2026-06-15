@@ -29,6 +29,8 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
+from netutil import get_json
+
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
@@ -88,16 +90,11 @@ def fetch_signals_from_db(db_path: str, min_impact: int) -> list[dict]:
 
 
 def fetch_klines(symbol: str, start_ms: int, minutes: int) -> list[list]:
-    try:
-        r = requests.get(BINANCE_KLINES, params={
-            "symbol": symbol, "interval": "1m",
-            "startTime": str(start_ms), "limit": str(min(minutes, 1000)),
-        }, timeout=15)
-        if r.status_code != 200:
-            return []
-        return r.json()
-    except Exception:
-        return []
+    data = get_json(BINANCE_KLINES, params={
+        "symbol": symbol, "interval": "1m",
+        "startTime": str(start_ms), "limit": str(min(minutes, 1000)),
+    }, timeout=15)
+    return data if isinstance(data, list) else []
 
 
 def prefetch(signals: list[dict], minutes: int) -> list[dict]:

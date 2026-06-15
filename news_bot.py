@@ -41,6 +41,7 @@ from pydantic import BaseModel
 
 import storage
 import trader
+from netutil import get_json
 from notify import Notifier
 
 load_dotenv()  # .env dosyasındaki ANTHROPIC_API_KEY'i okur
@@ -503,22 +504,20 @@ def score_with_claude(items: list[NewsItem]) -> None:
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, float] | None:
     """Bir parite için 24s değişim, hacim ve son 15dk hareketini döndür."""
-    r = session.get(f"{BINANCE_API}/ticker/24hr", params={"symbol": symbol}, timeout=REQUEST_TIMEOUT)
-    if r.status_code != 200:
+    t = get_json(f"{BINANCE_API}/ticker/24hr", params={"symbol": symbol},
+                 timeout=REQUEST_TIMEOUT, session=session)
+    if not t:
         return None
-    t = r.json()
-    k = session.get(
+    candles = get_json(
         f"{BINANCE_API}/klines",
         params={"symbol": symbol, "interval": "5m", "limit": "3"},
-        timeout=REQUEST_TIMEOUT,
+        timeout=REQUEST_TIMEOUT, session=session,
     )
     move15 = 0.0
-    if k.status_code == 200:
-        candles = k.json()
-        if candles:
-            o, c = float(candles[0][1]), float(candles[-1][4])
-            if o:
-                move15 = (c - o) / o * 100
+    if isinstance(candles, list) and candles:
+        o, c = float(candles[0][1]), float(candles[-1][4])
+        if o:
+            move15 = (c - o) / o * 100
     return {
         "pct24": float(t.get("priceChangePercent", 0) or 0),
         "vol": float(t.get("quoteVolume", 0) or 0),

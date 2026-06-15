@@ -406,6 +406,47 @@ def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
     return pos
 
 
+def _fetch_exchange_symbols() -> set[str]:
+    """Borsada açık görünen pariteler (canlı). futures→pozisyonlar, spot→bakiye."""
+    ex = _get_exchange()
+    out: set[str] = set()
+    if S.market == "futures":
+        for p in ex.fetch_positions() or []:
+            amt = float(p.get("contracts") or 0)
+            if amt:
+                sym = str(p.get("symbol", "")).split(":")[0].replace("/", "")
+                if sym:
+                    out.add(sym)
+    else:
+        total = (ex.fetch_balance() or {}).get("total") or {}
+        for asset, amt in total.items():
+            if asset != "USDT" and amt and float(amt) > 0:
+                out.add(f"{asset}USDT")
+    return out
+
+
+def reconcile_positions(exchange_symbols: set[str] | None = None) -> dict[str, Any]:
+    """Yerel açık pozisyonları borsanın bildirdikleriyle karşılaştır (READ-ONLY).
+
+    `exchange_symbols` verilmezse canlı modda ccxt'ten çekilir (paper'da atlanır).
+    Güvenlik: otomatik kapatma YOK — yalnızca uyumsuzlukları (orphan) raporlar.
+    """
+    with _lock:
+        local = [(p["id"], p["symbol"]) for p in _positions]
+    if exchange_symbols is None:
+        if S.paper_trading or not has_live_keys():
+            return {"checked": False, "reason": "paper modu / canlı anahtar yok",
+                    "orphans": [], "matched": []}
+        try:
+            exchange_symbols = _fetch_exchange_symbols()
+        except Exception as e:
+            return {"checked": False, "reason": f"borsa sorgulanamadı: {e}",
+                    "orphans": [], "matched": []}
+    orphans = [{"id": pid, "symbol": s} for pid, s in local if s not in exchange_symbols]
+    matched = [{"id": pid, "symbol": s} for pid, s in local if s in exchange_symbols]
+    return {"checked": True, "orphans": orphans, "matched": matched}
+
+
 def get_positions() -> tuple[list[dict[str, Any]], float]:
     with _lock:
         snap = list(_positions)

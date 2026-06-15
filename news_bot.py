@@ -1044,6 +1044,10 @@ async def lifespan(app: FastAPI):
         store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
         for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
             store.add_closed_news_trade(t)
+        rec = trader.reconcile_positions()         # canlı modda borsayla mutabakat (read-only)
+        if rec.get("checked") and rec.get("orphans"):
+            log.warning("Mutabakat: borsada bulunmayan %d yerel pozisyon (orphan): %s",
+                        len(rec["orphans"]), [o["symbol"] for o in rec["orphans"]])
     except Exception as e:
         log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
@@ -1205,6 +1209,12 @@ def risk() -> dict[str, Any]:
 def summary(date: str | None = None) -> dict[str, Any]:
     """Günlük işlem özeti (varsayılan bugün): işlem sayısı, realized, en iyi/kötü, açık."""
     return trader.daily_summary(date)
+
+
+@app.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    """Yerel açık pozisyonları borsayla karşılaştır (canlı; read-only, auto-close yok)."""
+    return trader.reconcile_positions()
 
 
 @app.get("/auto-preview")

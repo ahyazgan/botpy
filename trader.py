@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import requests
+from netutil import get_json
 
 log = logging.getLogger(__name__)
 
@@ -144,23 +144,17 @@ def has_live_keys() -> bool:
 
 
 def get_price(symbol: str) -> float | None:
+    data = get_json(f"{BINANCE_API}/ticker/price", params={"symbol": symbol}, timeout=10)
     try:
-        r = requests.get(f"{BINANCE_API}/ticker/price", params={"symbol": symbol}, timeout=10)
-        if r.status_code == 200:
-            return float(r.json()["price"])
-    except Exception:
-        pass
-    return None
+        return float(data["price"]) if data else None
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | None:
     """Orderbook'tan bu büyüklükteki emrin ortalama dolum fiyatı + slippage + likidite."""
-    try:
-        r = requests.get(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": "50"}, timeout=10)
-        if r.status_code != 200:
-            return None
-        book = r.json()
-    except Exception:
+    book = get_json(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": "50"}, timeout=10)
+    if not book:
         return None
     levels = book.get("asks") if is_long else book.get("bids")
     if not levels:

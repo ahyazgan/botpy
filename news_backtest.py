@@ -29,6 +29,8 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
+from netutil import get_json
+
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
@@ -88,16 +90,11 @@ def fetch_signals_from_db(db_path: str, min_impact: int) -> list[dict]:
 
 
 def fetch_klines(symbol: str, start_ms: int, minutes: int) -> list[list]:
-    try:
-        r = requests.get(BINANCE_KLINES, params={
-            "symbol": symbol, "interval": "1m",
-            "startTime": str(start_ms), "limit": str(min(minutes, 1000)),
-        }, timeout=15)
-        if r.status_code != 200:
-            return []
-        return r.json()
-    except Exception:
-        return []
+    data = get_json(BINANCE_KLINES, params={
+        "symbol": symbol, "interval": "1m",
+        "startTime": str(start_ms), "limit": str(min(minutes, 1000)),
+    }, timeout=15)
+    return data if isinstance(data, list) else []
 
 
 def prefetch(signals: list[dict], minutes: int) -> list[dict]:
@@ -149,6 +146,57 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
 
     net = gross - fee_pct  # gidiş-dönüş komisyon
     return {"outcome": outcome, "net_pct": net, **sig}
+
+
+def _directional_move(sig: dict) -> float | None:
+    """Sinyalin haber yönünde gerçekleşen % hareketi (pencere sonu kapanış).
+
+    SL/TP'den bağımsız ham yön isabeti için. Pozitif = fiyat haber yönünde gitti.
+    """
+    candles = sig.get("candles") or []
+    if len(candles) < 2:
+        return None
+    entry = float(candles[0][1])
+    last = float(candles[-1][4])
+    if entry <= 0:
+        return None
+    move = (last - entry) / entry * 100
+    return move if sig["direction"] == "bullish" else -move
+
+
+def signal_scorecard(signals: list[dict]) -> dict:
+    """Ham sinyal kalitesi: haber yönü gerçekleşti mi (işlem/SL-TP'den bağımsız).
+
+    Önceden prefetch edilmiş sinyallerden isabet oranı + ort. yön hareketini
+    kaynak/güç dilimi bazında kırar ('hit' = fiyat haber yönünde hareket etti).
+    """
+    rows = []
+    for s in signals:
+        m = _directional_move(s)
+        if m is None:
+            continue
+        rows.append({**s, "move_pct": round(m, 3), "hit": m > 0})
+
+    def _stat(v: list[dict]) -> dict:
+        hits = sum(1 for x in v if x["hit"])
+        return {
+            "n": len(v),
+            "hit_rate": round(hits / len(v) * 100, 1) if v else 0.0,
+            "avg_move_pct": round(sum(x["move_pct"] for x in v) / len(v), 3) if v else 0.0,
+        }
+
+    def _group(key_fn) -> dict:
+        buckets: dict[str, list[dict]] = {}
+        for r in rows:
+            buckets.setdefault(str(key_fn(r)), []).append(r)
+        return {k: _stat(v) for k, v in sorted(buckets.items())}
+
+    return {
+        "n": len(rows),
+        "overall": _stat(rows),
+        "by_source": _group(lambda r: r.get("source", "?")),
+        "by_impact": _group(lambda r: r.get("impact", "?")),
+    }
 
 
 def simulate_all(signals: list[dict], sl: float, tp: float, fee: float) -> list[dict]:

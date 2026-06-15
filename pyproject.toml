@@ -11,5 +11,5 @@ ignore_missing_imports = true
 files = [
     "trader.py", "storage.py", "notify.py", "metrics.py", "news.py",
     "news_bot.py", "news_backtest.py", "risk.py", "reconcile.py",
-    "strategy.py", "optimize.py", "walkforward.py",
+    "strategy.py", "optimize.py", "walkforward.py", "netutil.py",
 ]

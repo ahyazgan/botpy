@@ -114,6 +114,24 @@ type Performance = {
   sharpe: number | null;
 };
 
+type TuningSuggestion = {
+  type: string;
+  message: string;
+  current?: number;
+  suggested?: number;
+  tier?: string;
+  source?: string;
+  avg_pnl?: number;
+  count?: number;
+};
+
+type Tuning = {
+  ready: boolean;
+  samples: number;
+  min_samples: number;
+  suggestions: TuningSuggestion[];
+};
+
 type Position = {
   id: string;
   symbol: string;
@@ -371,6 +389,7 @@ export default function App() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [totalPnl, setTotalPnl] = useState(0);
   const [perf, setPerf] = useState<Performance | null>(null);
+  const [tuning, setTuning] = useState<Tuning | null>(null);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
@@ -414,7 +433,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -425,6 +444,7 @@ export default function App() {
         fetch(`${API_BASE}/health`),
         fetch(`${API_BASE}/trades/closed?limit=100`),
         fetch(`${API_BASE}/summary`),
+        fetch(`${API_BASE}/tuning`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -457,6 +477,7 @@ export default function App() {
         setTotalPnl(pData.total_pnl);
       }
       if (perfRes.ok) setPerf(await perfRes.json());
+      if (tuningRes.ok) setTuning(await tuningRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -1327,6 +1348,35 @@ export default function App() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {/* Öğrenen beyin — öneriler (otomatik uygulanmaz) */}
+      {tuning && tuning.ready && tuning.suggestions.length > 0 && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <h2 className="mb-1 text-lg font-semibold text-white">
+            🧠 Öğrenen beyin
+            <span className="ml-2 text-sm font-normal text-zinc-500">({tuning.samples} kapanmış işlemden öneri — otomatik uygulanmaz)</span>
+          </h2>
+          <div className="space-y-2">
+            {tuning.suggestions.map((s, i) => {
+              const canApply = s.type === "auto_min_impact" && typeof s.suggested === "number";
+              return (
+                <div key={i} className="flex items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-950/20 px-4 py-3">
+                  <p className="text-sm text-amber-100/90">{s.message}</p>
+                  {canApply && (
+                    <button
+                      type="button"
+                      onClick={() => void patchSettings({ auto_min_impact: s.suggested })}
+                      className="shrink-0 rounded-md border border-amber-500/40 bg-amber-900/40 px-3 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-800/50"
+                    >
+                      Uygula → {s.suggested}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </section>
       )}
 

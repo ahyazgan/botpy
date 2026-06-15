@@ -1688,6 +1688,13 @@ def get_performance() -> dict[str, Any]:
     return trader.get_performance()
 
 
+@app.get("/tuning")
+def get_tuning() -> dict[str, Any]:
+    """Öğrenen beyin (öneri modu): kapanan işlemlerden eşik ayarı önerileri.
+    Otomatik UYGULAMAZ — kaynak-tier eşlemesi için `_source_tier` geçirilir."""
+    return trader.suggest_tuning(tier_of=_source_tier)
+
+
 class PositionPatch(BaseModel):
     sl_price: float | None = None   # 0/negatif = SL kaldır
     tp_price: float | None = None   # 0/negatif = TP kaldır

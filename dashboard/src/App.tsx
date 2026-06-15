@@ -472,6 +472,21 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [load]);
 
+  // Gerçek zamanlıya yakın haber akışı (SSE). 15s poll diğer verileri (pozisyon/
+  // ayar/performans) tazeler; haberler buradan ~2s'de gelir. EventSource oto-reconnect.
+  useEffect(() => {
+    const es = new EventSource(`${API_BASE}/stream`);
+    es.onmessage = (e) => {
+      try {
+        const item = JSON.parse(e.data) as NewsItem;
+        setNews((prev) => (prev.some((n) => n.id === item.id) ? prev : [item, ...prev].slice(0, 200)));
+      } catch {
+        /* bozuk olay — yoksay */
+      }
+    };
+    return () => es.close();
+  }, []);
+
   const patchSettings = async (patch: Partial<Settings>) => {
     try {
       const r = await fetch(`${API_BASE}/settings`, {

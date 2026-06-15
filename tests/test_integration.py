@@ -117,3 +117,11 @@ def test_render_metrics_pure():
     assert "# HELP botpy_alerts_total" in out
     assert "botpy_alerts_total 3" in out
     assert out.endswith("\n")
+
+
+def test_stream_diff_pure():
+    # snapshot en-yeni-başta; seen'de olmayanlar en-eski-önce döner
+    snap = [{"id": "c"}, {"id": "b"}, {"id": "a"}]
+    assert nb._stream_diff(snap, {"a", "b", "c"}) == []         # hepsi görüldü
+    assert nb._stream_diff(snap, {"a"}) == [{"id": "b"}, {"id": "c"}]  # b,c yeni → eski-önce
+    assert nb._stream_diff([], set()) == []

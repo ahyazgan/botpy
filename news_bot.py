@@ -856,10 +856,19 @@ def _background_loop(stop: threading.Event) -> None:
 MONITOR_INTERVAL_SEC = 8
 
 
+def _persist_closed(pos: dict[str, Any]) -> None:
+    """Kapanan işlemi kalıcı deftere yaz (trade_state.json 500 sınırı dışı). Hata akışı bozmaz."""
+    try:
+        get_store().add_closed_news_trade(pos)
+    except Exception as e:
+        log.warning("Kapanan işlem arşivlenemedi: %s", e)
+
+
 def _monitor_loop(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             for pos in trader.monitor_positions():
+                _persist_closed(pos)
                 notify_remote(_fmt_trade_msg(pos, opened=False))
         except Exception as e:
             log.warning("Pozisyon izleme hatası: %s", e)
@@ -977,9 +986,12 @@ async def lifespan(app: FastAPI):
     setup_logging()
     _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
     try:
-        get_store().prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
+        store = get_store()
+        store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
+        for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
+            store.add_closed_news_trade(t)
     except Exception as e:
-        log.warning("Arşiv budama hatası: %s", e)
+        log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
     _bg_thread = threading.Thread(target=_background_loop, args=(_stop_event,), daemon=True)
     _bg_thread.start()
@@ -1117,10 +1129,21 @@ def auto_preview(limit: int = 20) -> dict[str, Any]:
     return {"preview": preview, "auto_trade_on": trader.S.auto_trade}
 
 
+def _closed_trades(limit: int) -> list[dict[str, Any]]:
+    """Kalıcı arşivden kapanan işlemler; arşiv boşsa in-memory deftere düş."""
+    try:
+        rows = get_store().list_closed_news_trades(limit)
+        if rows:
+            return rows
+    except Exception as e:
+        log.warning("Kapanan işlem arşivi okunamadı: %s", e)
+    return trader.closed_trades(limit)
+
+
 @app.get("/trades/closed")
 def trades_closed(limit: int = 200) -> dict[str, Any]:
-    """Kapanan işlemler (işlem günlüğü), en yeniden eskiye."""
-    return {"trades": trader.closed_trades(limit)}
+    """Kapanan işlemler (kalıcı defter, en yeniden eskiye)."""
+    return {"trades": _closed_trades(limit)}
 
 
 _CSV_FIELDS = (
@@ -1135,7 +1158,7 @@ def trades_closed_csv(limit: int = 1000) -> PlainTextResponse:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=_CSV_FIELDS, extrasaction="ignore")
     writer.writeheader()
-    for t in trader.closed_trades(limit):
+    for t in _closed_trades(limit):
         writer.writerow(t)
     headers = {"Content-Disposition": 'attachment; filename="closed_trades.csv"'}
     return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers=headers)
@@ -1339,9 +1362,11 @@ def get_performance() -> dict[str, Any]:
 @app.delete("/positions/{pid}", dependencies=[Depends(require_token)])
 def delete_position(pid: str) -> dict[str, Any]:
     try:
-        return trader.close_position(pid)
+        closed = trader.close_position(pid)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+    _persist_closed(closed)
+    return closed
 
 
 def main() -> None:

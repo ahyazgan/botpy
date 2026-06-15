@@ -167,7 +167,35 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backtest_ts ON backtest_runs(ts);
+
+CREATE TABLE IF NOT EXISTS news_closed_trades (
+    row_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id    TEXT NOT NULL,
+    closed_at   TEXT NOT NULL,
+    opened_at   TEXT,
+    symbol      TEXT,
+    side        TEXT,
+    mode        TEXT,
+    usdt        REAL,
+    entry_price REAL,
+    close_price REAL,
+    pnl         REAL,
+    pnl_pct     REAL,
+    close_reason TEXT,
+    source      TEXT,
+    news_source TEXT,
+    impact      INTEGER,
+    UNIQUE(trade_id, closed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nct_closed ON news_closed_trades(closed_at);
 """
+
+_NCT_COLUMNS = (
+    "trade_id", "closed_at", "opened_at", "symbol", "side", "mode", "usdt",
+    "entry_price", "close_price", "pnl", "pnl_pct", "close_reason",
+    "source", "news_source", "impact",
+)
 
 _BACKTEST_COLUMNS = (
     "ts", "mode", "sl", "tp", "fee", "usdt", "hours", "min_impact",
@@ -559,6 +587,64 @@ class Store:
                 "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Kapanan haber-işlem defteri (kalıcı; trade_state.json 500 sınırı dışı) ──
+    def add_closed_news_trade(self, trade: dict[str, Any]) -> bool:
+        """Kapanan bir işlemi arşivle. (trade_id, closed_at) zaten varsa atlar.
+
+        Kısmi + tam kapanışlar farklı closed_at taşıdığı için ikisi de saklanır.
+        Yeni eklendiyse True döner.
+        """
+        row = {
+            "trade_id": trade.get("id"),
+            "closed_at": trade.get("closed_at"),
+            "opened_at": trade.get("opened_at"),
+            "symbol": trade.get("symbol"),
+            "side": trade.get("side"),
+            "mode": trade.get("mode"),
+            "usdt": trade.get("usdt"),
+            "entry_price": trade.get("entry_price"),
+            "close_price": trade.get("close_price"),
+            "pnl": trade.get("pnl"),
+            "pnl_pct": trade.get("pnl_pct"),
+            "close_reason": trade.get("close_reason"),
+            "source": trade.get("source"),
+            "news_source": trade.get("news_source"),
+            "impact": trade.get("impact"),
+        }
+        if not row["trade_id"] or not row["closed_at"]:
+            return False
+        cols = ", ".join(_NCT_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _NCT_COLUMNS)
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT OR IGNORE INTO news_closed_trades ({cols}) VALUES ({placeholders})",
+                row,
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def list_closed_news_trades(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Arşivdeki kapanan işlemler, en yeniden eskiye. `id` alanı geri eklenir."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM news_closed_trades ORDER BY closed_at DESC, row_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["id"] = d.pop("trade_id")
+            d.pop("row_id", None)
+            out.append(d)
+        return out
+
+    def count_closed_news_trades(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM news_closed_trades",
+            ).fetchone()
+        return int(row["c"]) if row else 0
 
     # ── Uygulama ayarları (kalıcı; restart'a dayanıklı) ───────────────────
     def set_setting(self, key: str, value: str) -> None:

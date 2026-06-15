@@ -10,7 +10,7 @@
   Done when: panel haber kartında `price_60m_pct` ve 15dk/1s uyum durumu görünür; "sadece teyitli" filtresi; tsc+build yeşil; commit.
 - [x] Kalıcı kapanan-işlem defteri (SQLite, restart.a dayanıklı)  (339d22e)
   Done when: kapanan işlemler `storage.closed_news_trades` tablosuna yazılır (trade_state.json 500 sınırından bağımsız); `/trades/closed` arşivden de okuyabilir; testler; commit.
-- [ ] Ağ-yoğun uçlarda eşzamanlılık koruması (/backtest, /scorecard)
+- [x] Ağ-yoğun uçlarda eşzamanlılık koruması (/backtest, /scorecard)  (8737f2a)
   Done when: aynı anda çalışan ağır istek tek seferde bir koşar (in-flight lock); ikinci istek 409/uyarı döner; test; commit.
 
 -----

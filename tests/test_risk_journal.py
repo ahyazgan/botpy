@@ -9,6 +9,7 @@ import pytest
 
 import news_bot as nb
 import trader
+from storage import Store
 
 
 @pytest.fixture()
@@ -17,7 +18,11 @@ def clean_trader(monkeypatch):
     monkeypatch.setattr(trader, "_positions", [])
     monkeypatch.setattr(trader, "_closed", [])
     monkeypatch.setattr(trader, "_daily", {"date": trader._today(), "realized": 0.0})
+    # boş arşiv → /trades/closed in-memory deftere düşer (suite paylaşımlı store'dan izole)
+    s = Store(":memory:")
+    monkeypatch.setattr(nb, "_store", s)
     yield
+    s.close()
 
 
 def _pos(symbol="FOOUSDT", usdt=100.0):

@@ -502,6 +502,32 @@ def reconcile_positions(exchange_symbols: set[str] | None = None) -> dict[str, A
     return {"checked": True, "orphans": orphans, "matched": matched}
 
 
+def close_all(reason: str = "toplu-kapat") -> dict[str, Any]:
+    """Tüm açık pozisyonları kapat (acil/panic). Detaylı rapor döner.
+
+    Pozisyon başına izole: biri kapanamazsa diğerleri kapanır. Dönen:
+    {closed: [...], errors: [{id, symbol, error}], count, failed, total_pnl}.
+    """
+    with _lock:
+        targets = [(p["id"], p["symbol"]) for p in _positions]
+    closed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for pid, sym in targets:
+        try:
+            closed.append(close_position(pid, reason=reason))
+        except Exception as e:
+            log.warning("Toplu kapatmada hata (%s): %s", sym, e)
+            errors.append({"id": pid, "symbol": sym, "error": str(e)})
+    total = round(sum((c.get("pnl") or 0.0) for c in closed), 2)
+    return {
+        "closed": closed,
+        "errors": errors,
+        "count": len(closed),
+        "failed": len(errors),
+        "total_pnl": total,
+    }
+
+
 def get_positions() -> tuple[list[dict[str, Any]], float]:
     with _lock:
         snap = list(_positions)

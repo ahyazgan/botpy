@@ -221,6 +221,7 @@ type Health = {
   updated_at: string | null;
   ws_connected?: boolean;
   ws_last_msg_age_sec?: number | null;
+  feed_stale?: boolean;
   rate_limited?: number;
 };
 
@@ -1003,6 +1004,9 @@ export default function App() {
                   <span className={health.ws_connected ? "text-emerald-400" : "text-red-400"}>●</span> WS
                   {health.ws_last_msg_age_sec != null ? ` ${Math.round(health.ws_last_msg_age_sec)}s` : ""}
                 </span>
+              )}
+              {health.feed_stale && (
+                <span className="font-semibold text-red-400" title="Haber akışı durdu — WS kopuk veya uzun süredir mesaj yok. Gerçek-zamanlı sinyal alınamıyor olabilir.">⛔ akış durdu</span>
               )}
               {!!health.rate_limited && health.rate_limited > 0 && (
                 <span className="text-amber-400" title="Binance rate-limit (429/418) sayısı">⚠ rate-limit ×{health.rate_limited}</span>

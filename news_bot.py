@@ -131,6 +131,10 @@ USE_TREENEWS = True
 TREE_WS = "wss://news.treeofalpha.com/ws"
 TREE_BACKFILL_GUARD_SEC = 8   # bağlantının ilk saniyelerindeki mesajlar = geçmiş, bildirme
 
+# Ölü-adam anahtarı: asıl gerçek-zamanlı kaynak (WS) bu kadar saniye kopuk/sessiz
+# kalırsa uzak kanaldan uyar (canlıda sessiz sinyal-kaybını önler), düzelince haber ver.
+WS_STALE_ALERT_SEC = float(os.environ.get("WS_STALE_ALERT_SEC", "600"))
+
 # ── Loglama ──────────────────────────────────────────────────────────────
 def setup_logging() -> None:
     logging.basicConfig(
@@ -789,6 +793,42 @@ def _maybe_daily_digest() -> None:
             log.warning("Günlük özet hatası: %s", e)
 
 
+# Ölü-adam anahtarı durumu (spam önleme: bir kez uyar, düzelince bir kez haber ver)
+_ws_alert_active = False
+
+
+def _ws_feed_stale(now: float | None = None) -> bool:
+    """WS akışı (asıl kaynak) durmuş mu: kopuk VEYA son mesaj eşikten eski. Saf."""
+    if not USE_TREENEWS:
+        return False
+    t = now if now is not None else time.time()
+    if t - _started_at < WS_STALE_ALERT_SEC:
+        return False   # başlangıç grace: ilk bağlantıya süre tanı
+    if not _ws_state.get("connected"):
+        return True
+    age = _ws_last_msg_age(t)
+    return age is not None and age > WS_STALE_ALERT_SEC
+
+
+def _maybe_deadman_alert(now: float | None = None) -> None:
+    """WS uzun süre kopuk/sessizse uzak kanaldan uyar; düzelince haber ver.
+    Arka plan döngüsünden çağrılır (durum-makinesi → tek uyarı, tek toparlama)."""
+    global _ws_alert_active
+    stale = _ws_feed_stale(now)
+    if stale and not _ws_alert_active:
+        _ws_alert_active = True
+        if not _ws_state.get("connected"):
+            detail = "WS bağlantısı kopuk"
+        else:
+            mins = int((_ws_last_msg_age(now) or 0) / 60)
+            detail = f"son mesaj {mins} dk önce"
+        notify_remote(f"⚠️ HABER AKIŞI DURDU: {detail}. Gerçek-zamanlı sinyal "
+                      "alınamıyor olabilir — motoru/bağlantıyı kontrol et.")
+    elif not stale and _ws_alert_active:
+        _ws_alert_active = False
+        notify_remote("✅ Haber akışı geri geldi (WS bağlı, mesaj akıyor).")
+
+
 def notify(item: NewsItem) -> None:
     """Güçlü haber için masaüstü (winotify) + uzak (Telegram/Discord) bildirim."""
     notify_remote(_fmt_news_msg(item))  # winotify yoksa bile uzak kanal çalışır
@@ -994,7 +1034,8 @@ def _background_loop(stop: threading.Event) -> None:
     session.headers.setdefault("User-Agent", "kripto-haber-bot/1.0")
     while not stop.is_set():
         refresh(session)
-        _maybe_daily_digest()   # gün dönümünde dünün özetini gönder
+        _maybe_daily_digest()      # gün dönümünde dünün özetini gönder
+        _maybe_deadman_alert()     # haber akışı durduysa uyar (ölü-adam anahtarı)
         if stop.wait(SCAN_INTERVAL_SEC):
             break
 
@@ -1359,6 +1400,7 @@ def health() -> dict[str, Any]:
         "treenews": USE_TREENEWS,
         "ws_connected": _ws_state["connected"],
         "ws_last_msg_age_sec": _ws_last_msg_age(),
+        "feed_stale": _ws_feed_stale(),
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
     }

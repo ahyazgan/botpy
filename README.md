@@ -39,6 +39,7 @@ cd dashboard && npm install && npm run dev   # http://localhost:5173
 | `BOTPY_DB` | SQLite yolu (varsayılan `botpy.db`) |
 | `API_TOKEN` | Tanımlıysa işlem/ayar uçları `X-API-Token` ister — **sunucuyu dışa açarsan ayarla** |
 | `CONFIRM_INTERVAL` / `CONFIRM_LIMIT` | Fiyat teyit penceresi (varsayılan `15m`×`4`; daha erken/gürültülü teyit için `1m`×`15`) |
+| `WS_STALE_ALERT_SEC` | Ölü-adam anahtarı eşiği: haber akışı bu kadar saniye kopuk/sessizse uzak kanaldan uyar (varsayılan 600) |
 
 ### Çalışma zamanı ayarları (panelden, kalıcı)
 İşlem ayarları `trade_state.json`'a, haber ayarları SQLite'a yazılır; restart'a dayanıklıdır.
@@ -75,6 +76,7 @@ Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak
 - **Likidite/slippage** — orderbook derinliği ve tahmini slippage girişte kontrol edilir.
 - **İdempotent emir** — `create_order` sabit `clientOrderId` ile gönderilir; yanıt kaybolsa bile **çift emir oluşmaz**.
 - **Acil flatten** — panelde "⛔ Tümünü kapat" / `POST /positions/close-all` ile tüm pozisyonlar tek tıkla kapatılır.
+- **Ölü-adam anahtarı** — gerçek-zamanlı haber akışı (WS) `WS_STALE_ALERT_SEC` (vars. 600s) boyunca kopuk/sessiz kalırsa Telegram/Discord'dan **otomatik uyarı**, düzelince toparlama bildirimi (sessiz sinyal-kaybını önler).
 
 ## Canlı işleme geçmeden — kontrol listesi
 

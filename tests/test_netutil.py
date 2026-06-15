@@ -80,3 +80,21 @@ def test_backoff_is_exponential():
 def test_bad_json_returns_none():
     s = _Session([_Resp(200, bad_json=True)])
     assert get_json("u", session=s, sleep=_no_sleep) is None
+
+
+def test_retries_on_429_rate_limit():
+    s = _Session([_Resp(429), _Resp(200, {"ok": 1})])
+    assert get_json("u", session=s, retries=3, sleep=_no_sleep) == {"ok": 1}
+    assert s.calls == 2                              # 429 → yeniden denendi
+
+
+def test_retries_on_418_ip_ban():
+    s = _Session([_Resp(418), _Resp(418), _Resp(200, {"ok": 1})])
+    assert get_json("u", session=s, retries=3, sleep=_no_sleep) == {"ok": 1}
+    assert s.calls == 3
+
+
+def test_404_still_no_retry():
+    s = _Session([_Resp(404), _Resp(200, {"ok": 1})])
+    assert get_json("u", session=s, retries=3, sleep=_no_sleep) is None
+    assert s.calls == 1                              # diğer 4xx → tek deneme

@@ -474,6 +474,51 @@ def score_item(item: NewsItem) -> None:
     item.scorer = "rule"
 
 
+# ── Bağlam beyni (kaynak güvenilirliği + haber yorgunluğu) ───────────────
+# Claude'a başlık dışında bağlam ipucu vererek isabeti yükseltir; ek istek/gecikme
+# YOK (sadece prompt'a kısa etiket eklenir). Kaynak tier'i + coin'in son saatlerdeki
+# haber sıklığı puanlamayı kalibre eder.
+_EXCHANGE_SRC = ("binance", "coinbase", "upbit", "okx", "bybit", "kraken",
+                 "kucoin", "bitget", "huobi", "gate", "bitfinex")
+_SOCIAL_SRC = ("twitter", "tweet", "x.com", "telegram", "reddit", "discord")
+_MEDIA_SRC = ("coindesk", "cointelegraph", "theblock", "decrypt", "bmag", "blog",
+              "direct", "reuters", "bloomberg", "wsj", "magazine")
+FATIGUE_WINDOW_HOURS = 6   # bu pencerede coin kaç kez haber oldu = "yorgunluk"
+
+
+def _source_tier(source: str) -> str:
+    """Kaynağı güvenilirlik sınıfına ayır: resmi-borsa > medya > sosyal > diğer."""
+    s = source.lower().lstrip("⚡").strip()
+    if any(x in s for x in _EXCHANGE_SRC):
+        return "resmi-borsa"
+    if any(x in s for x in _SOCIAL_SRC):
+        return "sosyal"
+    if any(x in s for x in _MEDIA_SRC):
+        return "medya"
+    return "diğer"
+
+
+def _coin_fatigue(coin: str, now: datetime, recent: list[NewsItem]) -> int:
+    """Son FATIGUE_WINDOW_HOURS içinde bu coin'i konu alan haber sayısı (yorgunluk)."""
+    cutoff = now - timedelta(hours=FATIGUE_WINDOW_HOURS)
+    n = 0
+    for it in recent:
+        ts = _parse_time(it.published) or _parse_time(it.fetched_at)
+        if ts and ts >= cutoff and coin in it.coins:
+            n += 1
+    return n
+
+
+def _item_context(it: NewsItem, now: datetime, recent: list[NewsItem]) -> str:
+    """Bir haber için Claude'a verilecek bağlam etiketi (kaynak tier + yorgunluk)."""
+    parts = [f"kaynak:{_source_tier(it.source)}"]
+    if it.coins:
+        fat = max(_coin_fatigue(c, now, recent) for c in it.coins)
+        if fat > 1:
+            parts.append(f"son{FATIGUE_WINDOW_HOURS}s:{fat}x (yorgun)")
+    return " · ".join(parts)
+
+
 # ── Puanlama (Claude — opsiyonel, akıllı) ────────────────────────────────
 _anthropic_client: Any = None
 
@@ -500,11 +545,19 @@ class _ScoreBatch(BaseModel):
 
 _SCORE_SYSTEM = (
     "Sen bir kripto haber-trade analistisin. Sana numaralı kripto haber başlıkları "
-    "verilecek. Her başlık için tek bir JSON kaydı üret:\n"
+    "verilecek. Her başlığın köşeli parantezinde kaynak ve bağlam ipuçları var:\n"
+    "- kaynak:resmi-borsa = borsanın kendi duyurusu, en güvenilir (etkiyi tam ver)\n"
+    "- kaynak:medya = haber sitesi, güvenilir\n"
+    "- kaynak:sosyal = doğrulanmamış tweet/söylenti — etkiyi TEMKİNLİ puanla (1-2 düşür)\n"
+    "- kaynak:diğer = belirsiz kaynak — temkinli\n"
+    "- 'sonNs:Mx (yorgun)' = bu coin son N saatte M kez haber oldu; haber zaten "
+    "fiyatlanmış olabilir, ek haberin marjinal etkisi azdır — etkiyi bir miktar düşür\n"
+    "Her başlık için tek bir JSON kaydı üret:\n"
     "- index: başlığın numarası\n"
     "- coins: etkilenen coin ticker'ları (örn. ['BTC','SOL']); net coin yoksa boş liste\n"
     "- impact: 1-10 piyasa etkisi (10 = piyasayı anında sert hareket ettirir: hack, "
-    "iflas, ETF onayı, büyük borsa listelemesi, yasak, dava; 1 = önemsiz/genel yorum)\n"
+    "iflas, ETF onayı, büyük borsa listelemesi, yasak, dava; 1 = önemsiz/genel yorum). "
+    "Kaynak güvenilirliği ve yorgunluğu bu skoru ayarlar.\n"
     "- direction: 'bullish' (fiyatı yukarı), 'bearish' (aşağı) veya 'neutral'\n"
     "- reason: en fazla 12 kelimelik Türkçe gerekçe\n"
     "Sadece istenen yapıyı döndür."
@@ -516,8 +569,13 @@ _SCORE_SYSTEM = (
 CLAUDE_BATCH = 25
 
 
-def _score_chunk(client: Any, chunk: list[NewsItem]) -> None:
-    listing = "\n".join(f"{i}. [{it.source}] {it.title}" for i, it in enumerate(chunk))
+def _score_chunk(client: Any, chunk: list[NewsItem], recent: list[NewsItem] | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    ctx = recent if recent is not None else chunk
+    listing = "\n".join(
+        f"{i}. [{it.source} · {_item_context(it, now, ctx)}] {it.title}"
+        for i, it in enumerate(chunk)
+    )
     resp = client.messages.parse(
         model=CLAUDE_MODEL,
         max_tokens=4000,
@@ -544,10 +602,13 @@ def score_with_claude(items: list[NewsItem]) -> None:
     if not items:
         return
     client = _get_anthropic()
+    # Yorgunluk hesabı için son haberlerin anlık görüntüsü (bağlam beyni)
+    with _cache_lock:
+        recent = list(_news)
     for start in range(0, len(items), CLAUDE_BATCH):
         chunk = items[start:start + CLAUDE_BATCH]
         try:
-            _score_chunk(client, chunk)
+            _score_chunk(client, chunk, recent)
         except Exception as e:
             log.warning("Claude grup puanlama başarısız (kural-tabanlı): %s", e)
             for it in chunk:

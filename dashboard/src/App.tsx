@@ -137,6 +137,16 @@ type Risk = {
   auto_trade: boolean;
 };
 
+type ScoreStat = { n: number; hit_rate: number; avg_move_pct: number };
+type Scorecard = {
+  ok: boolean;
+  reason?: string;
+  n?: number;
+  overall?: ScoreStat;
+  by_source?: Record<string, ScoreStat>;
+  by_impact?: Record<string, ScoreStat>;
+};
+
 type AutoPreviewRow = {
   id: string;
   title: string;
@@ -320,6 +330,8 @@ export default function App() {
   const [newsSettings, setNewsSettings] = useState<NewsSettings | null>(null);
   const [preview, setPreview] = useState<AutoPreviewRow[] | null>(null);
   const [previewOn, setPreviewOn] = useState(false);
+  const [scorecard, setScorecard] = useState<Scorecard | null>(null);
+  const [scorecardOn, setScorecardOn] = useState(false);
   const [risk, setRisk] = useState<Risk | null>(null);
   const [daily, setDaily] = useState<DailySummary | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -465,6 +477,18 @@ export default function App() {
         if (r.ok) setPreview((await r.json()).preview ?? []);
       } catch {
         setPreview([]);
+      }
+    }
+  };
+
+  const runScorecard = async () => {
+    setScorecardOn((v) => !v);
+    if (scorecard === null) {
+      try {
+        const r = await fetch(`${API_BASE}/scorecard`);
+        setScorecard(r.ok ? await r.json() : { ok: false, reason: `scorecard ${r.status}` });
+      } catch {
+        setScorecard({ ok: false, reason: "bağlanılamadı" });
       }
     }
   };
@@ -1310,6 +1334,38 @@ export default function App() {
         )}
       </section>
 
+      {/* Sinyal kalitesi (scorecard — ham yön isabeti) */}
+      <section className="mx-auto mt-10 max-w-5xl">
+        <button
+          type="button"
+          onClick={() => void runScorecard()}
+          className="mb-3 text-lg font-semibold text-white transition hover:text-zinc-300"
+        >
+          Sinyal kalitesi <span className="ml-1 text-sm font-normal text-zinc-500">(ham yön isabeti) {scorecardOn ? "▾" : "▸"}</span>
+        </button>
+        {scorecardOn && (
+          scorecard === null ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Binance'ten veri indiriliyor…</p>
+          ) : !scorecard.ok ? (
+            <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-amber-300">{scorecard.reason ?? "Sonuç yok"}</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm">
+                <span className="text-zinc-400">Genel ({scorecard.overall?.n} sinyal): </span>
+                <strong className={`${(scorecard.overall?.hit_rate ?? 0) >= 50 ? "text-emerald-400" : "text-red-400"}`}>
+                  %{scorecard.overall?.hit_rate} isabet
+                </strong>
+                <span className="text-zinc-500"> · ort. yön hareketi %{scorecard.overall?.avg_move_pct}</span>
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <ScoreTable title="Kaynağa göre" rows={scorecard.by_source ?? {}} />
+                <ScoreTable title="Güce göre" rows={scorecard.by_impact ?? {}} />
+              </div>
+            </div>
+          )
+        )}
+      </section>
+
       {/* İşlem günlüğü (kapanan işlemler + CSV) */}
       <section className="mx-auto mt-10 max-w-5xl">
         <div className="mb-3 flex items-center justify-between">
@@ -1446,6 +1502,36 @@ function EquityChart({ points }: { points: Array<{ cumulative: number }> }) {
       <path d={area} fill={color} fillOpacity={0.12} />
       <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
     </svg>
+  );
+}
+
+function ScoreTable({ title, rows }: { title: string; rows: Record<string, ScoreStat> }) {
+  const entries = Object.entries(rows);
+  if (entries.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-white/10 bg-zinc-800/40 p-3">
+      <p className="mb-2 text-xs uppercase text-zinc-500">{title}</p>
+      <table className="w-full text-left text-xs">
+        <thead>
+          <tr className="text-zinc-600">
+            <th className="pb-1 font-normal">grup</th>
+            <th className="pb-1 text-right font-normal">n</th>
+            <th className="pb-1 text-right font-normal">isabet</th>
+            <th className="pb-1 text-right font-normal">ort. hareket</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map(([k, v]) => (
+            <tr key={k} className="text-zinc-300">
+              <td className="py-0.5">{k}</td>
+              <td className="py-0.5 text-right tabular-nums text-zinc-400">{v.n}</td>
+              <td className={`py-0.5 text-right tabular-nums ${v.hit_rate >= 50 ? "text-emerald-400" : "text-red-400"}`}>%{v.hit_rate}</td>
+              <td className={`py-0.5 text-right tabular-nums ${v.avg_move_pct >= 0 ? "text-emerald-400" : "text-red-400"}`}>{v.avg_move_pct >= 0 ? "+" : ""}{v.avg_move_pct}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

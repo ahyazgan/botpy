@@ -10,7 +10,7 @@
 
 - [x] Canlı sinyal scorecard (ham sinyal kalitesi)  (7a5e968)
   Done when: `/scorecard` arşiv sinyallerinin gerçekleşen yön isabetini (SL/TP'den bağımsız) kaynak/güç bazında döndürür; saf `signal_scorecard` + testler; ruff+mypy+pytest yeşil; commit.
-- [ ] Scorecard dashboard yüzeyi
+- [x] Scorecard dashboard yüzeyi  (6fe4565)
   Done when: panelde katlanır "Sinyal kalitesi" tablosu (isabet oranı/ort. hareket, kaynak+güç kırılımı); tsc+build yeşil; commit.
 - [ ] Dış API retry + backoff (Binance/Anthropic)
   Done when: ortak `_http_get` retry sarmalayıcısı (üstel backoff, sınırlı deneme) fiyat/kline çağrılarına uygulanır; testler retry davranışını kapsar; commit.

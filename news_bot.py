@@ -1512,6 +1512,20 @@ def get_performance() -> dict[str, Any]:
     return trader.get_performance()
 
 
+class PositionPatch(BaseModel):
+    sl_price: float | None = None   # 0/negatif = SL kaldır
+    tp_price: float | None = None   # 0/negatif = TP kaldır
+
+
+@app.patch("/positions/{pid}", dependencies=[Depends(require_token)])
+def patch_position(pid: str, body: PositionPatch) -> dict[str, Any]:
+    """Açık pozisyonun SL/TP'sini güncelle (canlı yönetim)."""
+    try:
+        return trader.update_position(pid, sl_price=body.sl_price, tp_price=body.tp_price)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.delete("/positions/{pid}", dependencies=[Depends(require_token)])
 def delete_position(pid: str) -> dict[str, Any]:
     try:

@@ -371,6 +371,24 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
     return pos
 
 
+def update_position(pid: str, *, sl_price: float | None = None,
+                    tp_price: float | None = None) -> dict[str, Any]:
+    """Açık pozisyonun SL/TP'sini güncelle (0/negatif = kaldır). Güncel pozisyonu döner.
+
+    SL/TP yerel olarak `monitor_positions` ile izlenir; borsa emri gerektirmez.
+    """
+    with _lock:
+        pos = next((p for p in _positions if p["id"] == pid), None)
+        if pos is None:
+            raise RuntimeError("Pozisyon bulunamadı")
+        if sl_price is not None:
+            pos["sl_price"] = round(float(sl_price), 8) if sl_price > 0 else None
+        if tp_price is not None:
+            pos["tp_price"] = round(float(tp_price), 8) if tp_price > 0 else None
+        _save_state()
+        return dict(pos)
+
+
 def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
     with _lock:
         idx = next((i for i, p in enumerate(_positions) if p["id"] == pid), None)

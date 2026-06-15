@@ -528,6 +528,20 @@ export default function App() {
     }
   };
 
+  const patchPos = async (id: string, patch: { sl_price?: number; tp_price?: number }) => {
+    try {
+      const r = await fetch(`${API_BASE}/positions/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "SL/TP güncellenemedi");
+    }
+  };
+
   const runPreview = async () => {
     setPreviewOn((v) => !v);
     if (preview === null) {
@@ -1065,9 +1079,23 @@ export default function App() {
                       <td className="px-4 py-3 tabular-nums text-zinc-300">${p.usdt}</td>
                       <td className="px-4 py-3 tabular-nums text-zinc-400">{p.entry_price}</td>
                       <td className="px-4 py-3 text-xs tabular-nums">
-                        <span className="text-red-400">{p.sl_price ?? "—"}</span>
-                        <span className="text-zinc-600"> / </span>
-                        <span className="text-emerald-400">{p.tp_price ?? "—"}</span>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number" step="any" defaultValue={p.sl_price ?? ""} key={`sl-${p.id}-${p.sl_price}`}
+                            title="Stop-loss fiyatı (0 = kaldır, Enter/blur ile kaydet)"
+                            onBlur={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v !== (p.sl_price ?? NaN)) void patchPos(p.id, { sl_price: v }); }}
+                            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                            className="h-6 w-16 rounded border border-zinc-700 bg-zinc-800/80 px-1 text-right text-red-300 outline-none focus:border-red-500/50"
+                          />
+                          <span className="text-zinc-600">/</span>
+                          <input
+                            type="number" step="any" defaultValue={p.tp_price ?? ""} key={`tp-${p.id}-${p.tp_price}`}
+                            title="Take-profit fiyatı (0 = kaldır, Enter/blur ile kaydet)"
+                            onBlur={(e) => { const v = parseFloat(e.target.value); if (!Number.isNaN(v) && v !== (p.tp_price ?? NaN)) void patchPos(p.id, { tp_price: v }); }}
+                            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                            className="h-6 w-16 rounded border border-zinc-700 bg-zinc-800/80 px-1 text-right text-emerald-300 outline-none focus:border-emerald-500/50"
+                          />
+                        </div>
                       </td>
                       <td className="px-4 py-3 tabular-nums text-zinc-300">{p.current_price ?? "—"}</td>
                       <td className="px-4 py-3 tabular-nums">

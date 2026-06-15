@@ -23,7 +23,7 @@
   Done when: `/healthz` (her zaman 200) + `/health` (kaynak/uptime); test; commit.
 - [x] Pozisyon bazında güç attribution (impact pozisyonda saklanır → live by_impact)  (a954b66)
   Done when: place_trade impact saklar; get_performance `by_impact`; test; commit.
-- [ ] Güvenlik başlıkları (CSP/HSTS/X-Frame-Options/X-Content-Type-Options)
+- [x] Güvenlik başlıkları (CSP/HSTS/X-Frame-Options/X-Content-Type-Options)  (323dae7)
   Done when: FastAPI middleware başlıkları ekler; test; commit.
 
 -----

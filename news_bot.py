@@ -214,6 +214,17 @@ _metrics: dict[str, int] = {
     "scan_errors_total": 0,     # arka plan tarama hatası sayısı
 }
 
+# TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
+_ws_state: dict[str, Any] = {"connected": False, "last_msg_at": None}
+
+
+def _ws_last_msg_age(now: float | None = None) -> float | None:
+    """Son WS mesajından bu yana geçen saniye (hiç mesaj yoksa None). Saf."""
+    last = _ws_state.get("last_msg_at")
+    if last is None:
+        return None
+    return round((now if now is not None else time.time()) - last, 1)
+
 # ── Çalışma zamanı ayarları (panelden değişir, store'da kalıcı) ───────────
 _news_settings: dict[str, Any] = {
     "alert_threshold": ALERT_THRESHOLD,   # bu güç (1-10) ve üstü = uyarı/işlem
@@ -1003,9 +1014,11 @@ def _tree_ws_loop(stop: threading.Event) -> None:
 
     def on_open(ws: Any) -> None:
         connect_ts[0] = time.monotonic()
+        _ws_state["connected"] = True
         log.info("TreeNews WebSocket bağlandı — gerçek zamanlı haber akışı açık")
 
     def on_message(ws: Any, message: str) -> None:
+        _ws_state["last_msg_at"] = time.time()
         item = parse_tree_message(message)
         if item is None:
             return
@@ -1031,6 +1044,7 @@ def _tree_ws_loop(stop: threading.Event) -> None:
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             log.warning("TreeNews WS hatası: %s", e)
+        _ws_state["connected"] = False   # bağlantı düştü
         # Uzun süre bağlı kaldıysa backoff'u sıfırla; yoksa üstel büyüt (flood koruması)
         backoff = _WS_BACKOFF_BASE if time.monotonic() - started >= _WS_STABLE_SEC else _next_backoff(backoff)
         log.info("TreeNews WS yeniden bağlanılıyor (%.0fs)...", backoff)
@@ -1192,6 +1206,8 @@ _METRIC_META = {
     "botpy_scan_errors_total": ("counter", "Arka plan tarama hatası"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
     "botpy_signals_archived": ("gauge", "Arşivlenmiş sinyal sayısı"),
+    "botpy_ws_connected": ("gauge", "TreeNews WS bağlı mı (1/0)"),
+    "botpy_ws_last_msg_age_seconds": ("gauge", "Son WS mesajından bu yana saniye"),
 }
 
 
@@ -1225,7 +1241,11 @@ def metrics() -> PlainTextResponse:
         "botpy_scan_errors_total": _metrics["scan_errors_total"],
         "botpy_open_positions": len(trader._positions),
         "botpy_signals_archived": archived,
+        "botpy_ws_connected": 1 if _ws_state["connected"] else 0,
     }
+    age = _ws_last_msg_age()
+    if age is not None:
+        values["botpy_ws_last_msg_age_seconds"] = age
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
 
 
@@ -1243,6 +1263,8 @@ def health() -> dict[str, Any]:
         "uptime_sec": int(time.time() - _started_at),
         "scorer": "claude" if USE_CLAUDE else "rule",
         "treenews": USE_TREENEWS,
+        "ws_connected": _ws_state["connected"],
+        "ws_last_msg_age_sec": _ws_last_msg_age(),
         "signals_archived": archived,
     }
 

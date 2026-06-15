@@ -125,3 +125,21 @@ def test_stream_diff_pure():
     assert nb._stream_diff(snap, {"a", "b", "c"}) == []         # hepsi görüldü
     assert nb._stream_diff(snap, {"a"}) == [{"id": "b"}, {"id": "c"}]  # b,c yeni → eski-önce
     assert nb._stream_diff([], set()) == []
+
+
+def test_ws_last_msg_age_pure(monkeypatch):
+    monkeypatch.setitem(nb._ws_state, "last_msg_at", None)
+    assert nb._ws_last_msg_age() is None
+    monkeypatch.setitem(nb._ws_state, "last_msg_at", 1000.0)
+    assert nb._ws_last_msg_age(now=1012.0) == 12.0
+
+
+def test_health_and_metrics_expose_ws(client, monkeypatch):
+    monkeypatch.setitem(nb._ws_state, "connected", True)
+    monkeypatch.setitem(nb._ws_state, "last_msg_at", None)
+    h = client.get("/health").json()
+    assert h["ws_connected"] is True and h["ws_last_msg_age_sec"] is None
+    body = client.get("/metrics").text
+    assert "botpy_ws_connected 1" in body
+    # mesaj yokken age gauge'i atlanır
+    assert "botpy_ws_last_msg_age_seconds" not in body

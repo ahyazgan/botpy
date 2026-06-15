@@ -126,3 +126,14 @@ def test_retry_after_capped():
     slept = []
     get_json("u", session=s, retries=3, sleep=slept.append)
     assert slept == [120.0]                  # RETRY_AFTER_MAX ile sınırlı
+
+
+def test_stats_count_rate_limit_and_retries(monkeypatch):
+    import netutil
+    monkeypatch.setitem(netutil._stats, "rate_limited", 0)
+    monkeypatch.setitem(netutil._stats, "retries", 0)
+    s = _Session([_Resp(429), _Resp(503), _Resp(200, {"ok": 1})])
+    get_json("u", session=s, retries=5, sleep=_no_sleep)
+    st = netutil.get_stats()
+    assert st["rate_limited"] == 1     # yalnızca 429
+    assert st["retries"] == 2          # 429 ve 503 sonrası birer bekleme

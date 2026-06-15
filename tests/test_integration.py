@@ -143,3 +143,12 @@ def test_health_and_metrics_expose_ws(client, monkeypatch):
     assert "botpy_ws_connected 1" in body
     # mesaj yokken age gauge'i atlanır
     assert "botpy_ws_last_msg_age_seconds" not in body
+
+
+def test_metrics_exposes_rate_limit(client, monkeypatch):
+    import netutil
+    monkeypatch.setitem(netutil._stats, "rate_limited", 4)
+    monkeypatch.setitem(netutil._stats, "retries", 7)
+    body = client.get("/metrics").text
+    assert "botpy_rate_limited_total 4" in body
+    assert "botpy_http_retries_total 7" in body

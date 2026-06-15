@@ -19,7 +19,7 @@
 
 ## Next (Now bitince)
 
-- [ ] Liveness/readiness ayrımı `/health` (hafif liveness + zengin readiness)
+- [x] Liveness/readiness ayrımı `/health` (hafif liveness + zengin readiness)  (7126997)
   Done when: `/healthz` (her zaman 200) + `/health` (kaynak/uptime); test; commit.
 - [ ] Pozisyon bazında güç attribution (impact'i pozisyonda sakla → live `by_impact`)
   Done when: place_trade impact saklar; get_performance `by_impact`; test; commit.

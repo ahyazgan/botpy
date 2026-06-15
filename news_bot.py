@@ -1026,6 +1026,12 @@ def get_alerts(limit: int = 50) -> NewsResponse:
     return get_news(limit=limit, min_impact=get_news_settings()["alert_threshold"])
 
 
+@app.get("/healthz")
+def healthz() -> dict[str, bool]:
+    """Liveness probe — süreç ayakta mı. Her zaman 200; bağımlılık kontrolü yok."""
+    return {"ok": True}
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     with _cache_lock:

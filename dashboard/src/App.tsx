@@ -1,4 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+function beep(): void {
+  try {
+    const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.3);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.3);
+  } catch {
+    /* ses çalınamadı — sorun değil */
+  }
+}
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 const POLL_MS = 15_000;
@@ -359,6 +379,10 @@ export default function App() {
   const [minImpact, setMinImpact] = useState(0);
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   const [onlyConfirmed, setOnlyConfirmed] = useState(false);
+  const [notifyBrowser, setNotifyBrowser] = useState(() =>
+    typeof localStorage !== "undefined" && localStorage.getItem("notifyBrowser") === "1");
+  const notifiedRef = useRef<Set<string>>(new Set());
+  const notifyPrimedRef = useRef(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
@@ -388,6 +412,25 @@ export default function App() {
       const nData: NewsPayload = await nRes.json();
       setNews(nData.news);
       setMeta({ total_seen: nData.total_seen, alert_threshold: nData.alert_threshold, updated_at: nData.updated_at });
+      // Tarayıcı bildirimi: panel açıkken gelen YENİ güçlü sinyalleri haber ver
+      {
+        const strong = nData.news.filter((n) => n.impact >= nData.alert_threshold);
+        if (!notifyPrimedRef.current) {
+          strong.forEach((n) => notifiedRef.current.add(n.id));   // ilk yük: tohumla, bildirme
+          notifyPrimedRef.current = true;
+        } else {
+          const fresh = strong.filter((n) => !notifiedRef.current.has(n.id));
+          fresh.forEach((n) => notifiedRef.current.add(n.id));
+          const enabled = localStorage.getItem("notifyBrowser") === "1";
+          if (fresh.length > 0 && enabled && "Notification" in window && Notification.permission === "granted") {
+            const top = fresh[0];
+            new Notification(`⚡ Güç ${top.impact}/10 · ${top.coins.join(", ") || "Genel"}`, {
+              body: top.title.slice(0, 140),
+            });
+            beep();
+          }
+        }
+      }
       if (nData.error) setErr(nData.error);
       if (sRes.ok) setSettings(await sRes.json());
       if (pRes.ok) {
@@ -494,6 +537,27 @@ export default function App() {
       } catch {
         setPreview([]);
       }
+    }
+  };
+
+  const toggleNotify = async () => {
+    if (!notifyBrowser) {
+      if (!("Notification" in window)) {
+        setErr("Tarayıcı bildirim desteklemiyor");
+        return;
+      }
+      if (Notification.permission !== "granted") {
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") {
+          setErr("Bildirim izni verilmedi");
+          return;
+        }
+      }
+      localStorage.setItem("notifyBrowser", "1");
+      setNotifyBrowser(true);
+    } else {
+      localStorage.setItem("notifyBrowser", "0");
+      setNotifyBrowser(false);
     }
   };
 
@@ -840,6 +904,16 @@ export default function App() {
             }`}
           >
             Sadece teyitli
+          </button>
+          <button
+            type="button"
+            onClick={() => void toggleNotify()}
+            title="Panel açıkken güçlü sinyal gelince tarayıcı bildirimi + ses"
+            className={`h-10 rounded-xl border px-4 text-sm font-semibold transition ${
+              notifyBrowser ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+            }`}
+          >
+            {notifyBrowser ? "🔔 Bildirim açık" : "🔕 Bildirim"}
           </button>
         </div>
       </header>

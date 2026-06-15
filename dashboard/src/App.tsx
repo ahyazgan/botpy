@@ -429,6 +429,8 @@ export default function App() {
   // Backtest paneli (talep üzerine; 15s polling'e dahil DEĞİL — Binance'i yormamak için)
   const [btSl, setBtSl] = useState(3);
   const [btTp, setBtTp] = useState(6);
+  const [btSlip, setBtSlip] = useState(0);
+  const [btEntryDelay, setBtEntryDelay] = useState(0);
   const [btMode, setBtMode] = useState<BacktestMode>("simple");
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
@@ -687,6 +689,8 @@ export default function App() {
       const qs = new URLSearchParams({
         sl: String(btSl),
         tp: String(btTp),
+        slip: String(btSlip),
+        entry_delay: String(btEntryDelay),
         mode: btMode,
         min_impact: String(meta.alert_threshold),
       });
@@ -1517,6 +1521,22 @@ export default function App() {
                 type="number" value={btTp} step={0.5} min={0.5} disabled={btMode !== "simple"}
                 onChange={(e) => setBtTp(Number(e.target.value))}
                 className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-40"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-zinc-400" title="Bacak başına slippage % — canlı dolum gerçekçiliği (önerilen ~0.1)">
+              <span>Slippage %</span>
+              <input
+                type="number" value={btSlip} step={0.05} min={0}
+                onChange={(e) => setBtSlip(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-zinc-400" title="Kaç dk gecikmeli gir — tespit+teyit+emir gecikmesini modelle (haber spike chase)">
+              <span>Giriş gecikme dk</span>
+              <input
+                type="number" value={btEntryDelay} step={1} min={0}
+                onChange={(e) => setBtEntryDelay(Number(e.target.value))}
+                className="h-9 w-24 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-right text-sm tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50"
               />
             </label>
             <div className="flex flex-col gap-1 text-xs text-zinc-400">

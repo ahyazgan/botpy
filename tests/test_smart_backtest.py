@@ -82,3 +82,33 @@ def test_simulate_smart_all_skips_short_series():
     bad = _sig([_k(100, 100, 100, 100)])   # tek mum → atla
     out = nbt.simulate_smart_all([good, bad], P, fee=0.0)
     assert len(out) == 1 and out[0]["outcome"] == "tp"
+
+
+# ── Canlı-gerçekçilik: slippage + gecikmeli giriş ──────────────────────────
+def test_smart_slippage_reduces_net():
+    sig = _sig([_k(100, 100, 100, 100), _k(100, 107, 99, 105)])
+    p = {**P, "slip_pct": 0.1}
+    r = nbt.simulate_smart(sig, p, fee_pct=0.0)
+    # gross 6 - slip 0.1*2 bacak = 5.8
+    assert r["net_pct"] == pytest.approx(5.8)
+
+
+def test_smart_entry_delay_changes_entry_price():
+    # gecikme: 1. mumdan değil 2. mumun açılışından (105) gir → TP/SL ona göre
+    sig = _sig([_k(100, 100, 100, 100), _k(100, 100, 100, 105), _k(105, 112, 104, 110)])
+    p = {**P, "entry_delay_min": 1}
+    r = nbt.simulate_smart(sig, p, fee_pct=0.0)
+    # entry=105, tp=105*1.06=111.3; 3. mum high=112 → tp +%6
+    assert r["outcome"] == "tp" and r["net_pct"] == pytest.approx(6.0)
+
+
+def test_smart_entry_delay_insufficient_candles():
+    sig = _sig([_k(100, 100, 100, 100), _k(100, 107, 99, 105)])
+    assert nbt.simulate_smart(sig, {**P, "entry_delay_min": 5}, fee_pct=0.0) is None
+
+
+def test_simple_slippage_and_delay():
+    sig = _sig([_k(100, 100, 100, 100), _k(100, 100, 100, 101), _k(101, 108, 100, 107)])
+    # gecikme 1 → entry=101, tp=101*1.06≈107.06; 3.mum high=108 ≥ → tp; slip 0.1*2=0.2
+    r = nbt.simulate(sig, 3.0, 6.0, 0.0, slip_pct=0.1, entry_delay_min=1)
+    assert r["outcome"] == "tp" and r["net_pct"] == pytest.approx(5.8)

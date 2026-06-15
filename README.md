@@ -63,6 +63,9 @@ python news_backtest.py --db botpy.db --grid         # en kârlı SL/TP araması
 python news_backtest.py --db botpy.db --walk         # walk-forward (overfit testi)
 # Panelden "Akıllı çıkış" modu: mevcut ayarları/preset'i (breakeven+kısmi TP+
 # trailing+time-stop) arşivde simüle eder — haber-trade preset'ini canlıdan önce doğrula.
+# Canlı-gerçekçilik: --slip (bacak başı kayma %) + --entry-delay (gecikmeli giriş dk)
+# ile backtest'i gerçeğe yaklaştır (panelde Slippage % / Giriş gecikme alanları).
+python news_backtest.py --db botpy.db --slip 0.1 --entry-delay 2
 ```
 
 Panelden de çalıştırılabilir (Backtest bölümü). Güç-dilimi/yön/kaynak kırılımıyla `auto_min_impact`/eşik veriyle ayarlanır.

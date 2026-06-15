@@ -1558,13 +1558,15 @@ def _run_backtest_impl(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
     mode: str = "simple", train_frac: float = 0.7,
+    slip: float = 0.0, entry_delay: int = 0,
 ) -> dict[str, Any]:
     """Arşivlenmiş sinyaller üzerinde backtest koşar.
 
-    Her sinyal için Binance geçmiş klines indirip SL/TP çıkışını simüle eder
-    (komisyon dahil). `mode`: "simple" (tek SL/TP), "grid" (en kârlı SL/TP araması),
-    "walk" (walk-forward overfit testi). Ağ gerektirir; senkron çalışır (FastAPI
-    bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
+    Her sinyal için Binance geçmiş klines indirip çıkışı simüle eder (komisyon +
+    `slip` bacak-başı kayma %% + `entry_delay` dk gecikmeli giriş = canlı-gerçekçilik).
+    `mode`: "simple" (tek SL/TP), "smart" (akıllı çıkış / preset), "grid" (en kârlı
+    SL/TP araması), "walk" (walk-forward overfit testi). Ağ gerektirir; senkron çalışır
+    (FastAPI bunu threadpool'da koşturur, olay döngüsünü bloklamaz).
     """
     import news_backtest as nbt
 
@@ -1604,6 +1606,7 @@ def _run_backtest_impl(
             "breakeven_pct": trader.S.breakeven_pct, "partial_tp_pct": trader.S.partial_tp_pct,
             "partial_tp_frac": trader.S.partial_tp_frac, "trailing_stop_pct": trader.S.trailing_stop_pct,
             "time_stop_min": trader.S.time_stop_min,
+            "slip_pct": slip, "entry_delay_min": entry_delay,
         }
         results = nbt.simulate_smart_all(signals, params, fee)
         summary = nbt._summarize(results, usdt)
@@ -1617,7 +1620,7 @@ def _run_backtest_impl(
                               stats=summary, note="akıllı çıkış (mevcut ayarlar)", **common)
         return summary
 
-    results = nbt.simulate_all(signals, sl, tp, fee)
+    results = nbt.simulate_all(signals, sl, tp, fee, slip_pct=slip, entry_delay_min=entry_delay)
     summary = nbt._summarize(results, usdt)
     summary["ok"] = True
     summary["mode"] = "simple"
@@ -1634,12 +1637,13 @@ def run_backtest(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
     mode: str = "simple", train_frac: float = 0.7,
+    slip: float = 0.0, entry_delay: int = 0,
 ) -> dict[str, Any]:
     """Backtest çalıştır (ağ-yoğun; aynı anda tek koşar — bkz `_heavy_guard`)."""
     with _heavy_guard():
         return _run_backtest_impl(sl=sl, tp=tp, fee=fee, usdt=usdt, hours=hours,
                                   min_impact=min_impact, limit=limit, mode=mode,
-                                  train_frac=train_frac)
+                                  train_frac=train_frac, slip=slip, entry_delay=entry_delay)
 
 
 def _persist_backtest(mode: str, *, sl: float | None, tp: float | None, fee: float,

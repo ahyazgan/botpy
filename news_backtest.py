@@ -107,13 +107,30 @@ def prefetch(signals: list[dict], minutes: int) -> list[dict]:
     return out
 
 
-def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | None:
-    """Önceden çekilmiş mumlarla tek sinyali simüle et. outcome + net % (komisyon dahil)."""
-    candles = sig.get("candles") or []
-    if len(candles) < 2:
+def _entry_setup(candles: list, entry_delay_min: int) -> tuple[float, int] | None:
+    """Gerçekçi giriş: haber mumundan `entry_delay_min` sonra o mumun açılışından gir
+    (tespit+teyit+emir gecikmesini modelle). (entry_price, başlangıç_idx) döner; yeterli
+    mum yoksa None. entry_delay_min=0 → eski davranış (ilk mum açılışı)."""
+    idx = max(0, int(entry_delay_min))
+    if len(candles) <= idx + 1:
         return None
+    entry = float(candles[idx][1])
+    return (entry, idx + 1) if entry > 0 else None
+
+
+def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float,
+             *, slip_pct: float = 0.0, entry_delay_min: int = 0) -> dict | None:
+    """Önceden çekilmiş mumlarla tek sinyali simüle et. outcome + net % (komisyon + slippage).
+
+    slip_pct: bacak başına kayma %% (giriş + çıkış market dolumu); entry_delay_min:
+    kaç dakika sonra gir (haber spike'ını chase). İkisi de canlı-gerçekçilik içindir.
+    """
+    candles = sig.get("candles") or []
+    setup = _entry_setup(candles, entry_delay_min)
+    if setup is None:
+        return None
+    entry, start = setup
     is_long = sig["direction"] == "bullish"
-    entry = float(candles[0][1])  # ilk mum açılışı
     if is_long:
         sl = entry * (1 - sl_pct / 100)
         tp = entry * (1 + tp_pct / 100)
@@ -122,7 +139,7 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
         tp = entry * (1 - tp_pct / 100)
 
     outcome, gross = "timeout", 0.0
-    for c in candles[1:]:
+    for c in candles[start:]:
         high, low = float(c[2]), float(c[3])
         if is_long:
             hit_sl = low <= sl
@@ -144,8 +161,8 @@ def simulate(sig: dict, sl_pct: float, tp_pct: float, fee_pct: float) -> dict | 
         move = (last - entry) / entry * 100
         gross = move if is_long else -move
 
-    net = gross - fee_pct  # gidiş-dönüş komisyon
-    return {"outcome": outcome, "net_pct": net, **sig}
+    net = gross - fee_pct - 2 * slip_pct  # komisyon + giriş/çıkış kayması (2 bacak)
+    return {"outcome": outcome, "net_pct": round(net, 4), **sig}
 
 
 def simulate_smart(sig: dict, params: dict, fee_pct: float) -> dict | None:
@@ -157,12 +174,13 @@ def simulate_smart(sig: dict, params: dict, fee_pct: float) -> dict | None:
      (önce ters uç = SL/adverse kontrol edilir). Pozisyonun ağırlıklı net %'sini döndürür.
     """
     candles = sig.get("candles") or []
-    if len(candles) < 2:
+    slip_pct = float(params.get("slip_pct", 0.0))
+    entry_delay_min = int(params.get("entry_delay_min", 0))
+    setup = _entry_setup(candles, entry_delay_min)
+    if setup is None:
         return None
+    entry, start = setup
     is_long = sig["direction"] == "bullish"
-    entry = float(candles[0][1])
-    if entry <= 0:
-        return None
 
     sl_pct = float(params.get("sl_pct", 3.0))
     tp_pct = float(params.get("tp_pct", 6.0))
@@ -185,7 +203,7 @@ def simulate_smart(sig: dict, params: dict, fee_pct: float) -> dict | None:
     partial_done = be_done = False
     outcome = "timeout"
 
-    for idx, c in enumerate(candles[1:], start=1):
+    for idx, c in enumerate(candles[start:], start=1):
         high, low, close = float(c[2]), float(c[3]), float(c[4])
         adverse = low if is_long else high   # en kötü fiyat
         favor = high if is_long else low     # en iyi fiyat
@@ -227,9 +245,10 @@ def simulate_smart(sig: dict, params: dict, fee_pct: float) -> dict | None:
     if remaining > 0:   # timeout: kalanı son kapanışta kapat
         realized += remaining * gain_at(float(candles[-1][4]))
 
-    # Komisyon: tam tur + kısmi olduysa fazladan bir bacak (frac kadar)
+    # Komisyon + slippage: tam tur + kısmi olduysa fazladan bir çıkış bacağı
+    legs = 2 + (1 if partial_done else 0)   # giriş + çıkış (+ kısmi çıkış)
     fee_total = fee_pct + (fee_pct / 2 * ptp_frac if partial_done else 0.0)
-    net = realized - fee_total
+    net = realized - fee_total - slip_pct * legs
     return {"outcome": outcome, "net_pct": round(net, 4), "partial": partial_done, **sig}
 
 
@@ -294,11 +313,12 @@ def signal_scorecard(signals: list[dict]) -> dict:
     }
 
 
-def simulate_all(signals: list[dict], sl: float, tp: float, fee: float) -> list[dict]:
+def simulate_all(signals: list[dict], sl: float, tp: float, fee: float,
+                 *, slip_pct: float = 0.0, entry_delay_min: int = 0) -> list[dict]:
     """Tüm sinyalleri simüle et; geçerli sonuçların listesini döndür."""
     out = []
     for s in signals:
-        r = simulate(s, sl, tp, fee)
+        r = simulate(s, sl, tp, fee, slip_pct=slip_pct, entry_delay_min=entry_delay_min)
         if r:
             out.append(r)
     return out
@@ -349,8 +369,9 @@ def breakdown(results: list[dict], usdt: float = 100.0) -> dict:
     }
 
 
-def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verbose: bool) -> dict:
-    results = simulate_all(signals, sl, tp, fee)
+def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verbose: bool,
+        *, slip: float = 0.0, entry_delay: int = 0) -> dict:
+    results = simulate_all(signals, sl, tp, fee, slip_pct=slip, entry_delay_min=entry_delay)
     summary = _summarize(results, usdt)
     if verbose and results:
         for r in sorted(results, key=lambda x: x["net_pct"], reverse=True):
@@ -434,6 +455,8 @@ def main() -> None:
     ap.add_argument("--tp", type=float, default=6.0)
     ap.add_argument("--hours", type=float, default=4.0)
     ap.add_argument("--fee", type=float, default=0.2, help="gidiş-dönüş komisyon %% (spot ~0.2)")
+    ap.add_argument("--slip", type=float, default=0.0, help="bacak başına slippage %% (canlı-gerçekçilik)")
+    ap.add_argument("--entry-delay", type=int, default=0, help="kaç dk gecikmeli gir (haber spike chase)")
     ap.add_argument("--usdt", type=float, default=100.0)
     ap.add_argument("--grid", action="store_true", help="en iyi SL/TP kombinasyonunu ara")
     ap.add_argument("--walk", action="store_true",
@@ -500,8 +523,10 @@ def main() -> None:
             print(f"\n>>> En kârlı: SL={b['sl']}% TP={b['tp']}% → {b['total_pnl_usdt']:+.2f} USDT")
         return
 
-    print(f"\nBacktest: SL={args.sl}% TP={args.tp}% pencere={args.hours}s komisyon=%{args.fee}\n")
-    s = run(signals, args.sl, args.tp, args.fee, args.usdt, args.verbose)
+    print(f"\nBacktest: SL={args.sl}% TP={args.tp}% pencere={args.hours}s komisyon=%{args.fee}"
+          f" slippage=%{args.slip} giriş-gecikme={args.entry_delay}dk\n")
+    s = run(signals, args.sl, args.tp, args.fee, args.usdt, args.verbose,
+            slip=args.slip, entry_delay=args.entry_delay)
     print(f"\n{'='*50}")
     print(f"Sinyal sayısı     : {s['n']}")
     print(f"Kazanma oranı     : %{s['win_rate']}")

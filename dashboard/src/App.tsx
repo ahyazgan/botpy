@@ -200,6 +200,9 @@ type Health = {
   treenews: boolean;
   signals_archived: number | null;
   updated_at: string | null;
+  ws_connected?: boolean;
+  ws_last_msg_age_sec?: number | null;
+  rate_limited?: number;
 };
 
 type ClosedTrade = {
@@ -928,6 +931,15 @@ export default function App() {
                 {fmtUptime(health.uptime_sec)} · {health.scorer === "claude" ? "Claude" : "kural"}
                 {health.treenews ? " · TreeNews" : ""}
               </span>
+              {health.treenews && health.ws_connected !== undefined && (
+                <span title={`TreeNews WS · son mesaj: ${health.ws_last_msg_age_sec != null ? `${health.ws_last_msg_age_sec}s önce` : "—"}`}>
+                  <span className={health.ws_connected ? "text-emerald-400" : "text-red-400"}>●</span> WS
+                  {health.ws_last_msg_age_sec != null ? ` ${Math.round(health.ws_last_msg_age_sec)}s` : ""}
+                </span>
+              )}
+              {!!health.rate_limited && health.rate_limited > 0 && (
+                <span className="text-amber-400" title="Binance rate-limit (429/418) sayısı">⚠ rate-limit ×{health.rate_limited}</span>
+              )}
             </>
           )}
           <span className="text-zinc-700">|</span>

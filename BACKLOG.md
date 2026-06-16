@@ -7,6 +7,9 @@
 
 ## Now (üstten alta, ara vermeden)
 
+- [x] Hazırlık kokpiti (/readiness) — paper-doğrulama verdikti
+  Done when: yerel ölçütleri (örnek sayısı, profit_factor, beyin kalibrasyonu) eşiklere göre
+  değerlendirip geç/kal/veri-yetersiz verdikti; panelde 🚦 banner; testler; yeşil; commit.
 - [x] Borsa-native koruyucu stop (canlı güvenlik açığı)
   Done when: place_trade canlıda borsaya DURAN SL/TP koyar (_place_protective_orders, ccxt
   stopLossPrice/takeProfitPrice); close/update iptal+yeniler; protect_error → uzak uyarı; paper

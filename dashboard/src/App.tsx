@@ -112,6 +112,11 @@ type BrainVetoReview = {
   ready: boolean; reason?: string; n: number;
   avg_net_pct?: number | null; win_rate?: number | null; verdict?: string;
 };
+type ReadinessCheck = { check: string; status: "pass" | "fail" | "pending"; detail: string };
+type Readiness = {
+  verdict: string; samples: number; win_rate: number | null; profit_factor: number | null;
+  max_drawdown: number | null; checks: ReadinessCheck[]; note: string;
+};
 
 type Performance = {
   total_trades: number;
@@ -466,6 +471,7 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
   const [brainBtRunning, setBrainBtRunning] = useState(false);
   const runBrainBacktest = async () => {
@@ -498,7 +504,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -511,6 +517,7 @@ export default function App() {
         fetch(`${API_BASE}/summary`),
         fetch(`${API_BASE}/tuning`),
         fetch(`${API_BASE}/brain-scorecard`),
+        fetch(`${API_BASE}/readiness`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -545,6 +552,7 @@ export default function App() {
       if (perfRes.ok) setPerf(await perfRes.json());
       if (tuningRes.ok) setTuning(await tuningRes.json());
       if (bsRes.ok) setBrainSc(await bsRes.json());
+      if (rdRes.ok) setReadiness(await rdRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -1541,6 +1549,33 @@ export default function App() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {/* Hazırlık kokpiti — canlıya geçiş verdikti */}
+      {readiness && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <div className={`rounded-2xl border px-4 py-3 ${
+            readiness.verdict.startsWith("UMUT") ? "border-emerald-500/40 bg-emerald-950/20"
+              : readiness.verdict.startsWith("HENÜZ") ? "border-red-500/40 bg-red-950/20"
+              : "border-zinc-600/40 bg-zinc-900/40"}`}>
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-sm font-bold text-white">🚦 Canlıya hazırlık</span>
+              <span className="text-sm font-semibold text-zinc-200">{readiness.verdict}</span>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs">
+              {readiness.checks.map((c) => (
+                <span key={c.check} className={`rounded-md px-2 py-1 ${
+                  c.status === "pass" ? "bg-emerald-900/50 text-emerald-200"
+                    : c.status === "fail" ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-400"}`}>
+                  {c.status === "pass" ? "✓" : c.status === "fail" ? "✗" : "…"} {c.check}: {c.detail}
+                </span>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] text-zinc-500">
+              pf {readiness.profit_factor ?? "—"} · kazanma %{readiness.win_rate ?? "—"} · max DD {readiness.max_drawdown ?? "—"} · {readiness.note}
+            </p>
+          </div>
         </section>
       )}
 

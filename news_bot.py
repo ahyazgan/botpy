@@ -2107,6 +2107,56 @@ def get_tuning() -> dict[str, Any]:
     return trader.suggest_tuning(tier_of=_source_tier)
 
 
+READINESS_MIN_SAMPLES = 50   # canlıya geçiş için min kapanan işlem (heuristik)
+READINESS_PF_MIN = 1.3       # min profit factor
+
+
+@app.get("/readiness")
+def readiness() -> dict[str, Any]:
+    """Canlıya hazırlık kokpiti: ucuz (ağsız) yerel ölçütleri eşiklere göre değerlendirir.
+    Tek bakışta geç/kal/veri-yetersiz verdikti. Edge/veto için /brain-backtest + /veto-review ayrı."""
+    perf = trader.get_performance()
+    sc = trader.brain_scorecard()
+    n = int(perf.get("total_trades", 0))
+    pf = perf.get("profit_factor")
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})  # pass|fail|pending
+
+    enough = n >= READINESS_MIN_SAMPLES
+    add("Yeterli örnek", "pass" if enough else "pending",
+        f"{n}/{READINESS_MIN_SAMPLES} kapanan işlem" + ("" if enough else " — biriktirmeye devam"))
+    if not enough:
+        add(f"Profit factor ≥ {READINESS_PF_MIN}", "pending", "yeterli veri yok")
+        add("Beyin kalibrasyonu", "pending", "yeterli veri yok")
+        verdict = "VERİ YETERSİZ — paper'da çalışmaya devam et"
+    else:
+        if pf is None:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "pending", "henüz zarar yok (tanımsız)")
+        elif pf >= READINESS_PF_MIN:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "pass", str(pf))
+        else:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "fail", f"{pf} — beklenti zayıf")
+        if sc["samples"] < 5:
+            add("Beyin kalibrasyonu", "pending", f"{sc['samples']} beyinli işlem — az")
+        elif sc["calibrated"]:
+            add("Beyin kalibrasyonu", "pass", "konviksiyon↑ → P&L↑")
+        else:
+            add("Beyin kalibrasyonu", "fail", "yüksek konviksiyon daha iyi P&L üretmiyor")
+        statuses = {c["status"] for c in checks}
+        if "fail" in statuses:
+            verdict = "HENÜZ DEĞİL — ayarla (/tuning/apply, kaybeden kaynağı sustur) ve yeniden ölç"
+        elif "pending" in statuses:
+            verdict = "GELİŞİYOR — birkaç ölçüt daha veri bekliyor"
+        else:
+            verdict = "UMUT VERİCİ — /brain-backtest + /brain-veto-review ile edge'i doğrula, sonra MİNİK canlı"
+    return {"verdict": verdict, "samples": n, "win_rate": perf.get("win_rate"),
+            "profit_factor": pf, "max_drawdown": perf.get("max_drawdown"), "checks": checks,
+            "note": "Edge/veto doğrulaması ağ-yoğun, ayrı çalıştır: /brain-backtest (edge_pct>0) "
+                    "+ /brain-veto-review (avg_net<0)."}
+
+
 @app.get("/brain-scorecard")
 def brain_scorecard() -> dict[str, Any]:
     """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).

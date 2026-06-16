@@ -76,6 +76,7 @@ type Settings = {
   max_total_exposure_usdt: number;
   max_per_coin_usdt: number;
   order_type: "market" | "limit";
+  exchange_native_stops: boolean;
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
@@ -1078,6 +1079,14 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ exchange_native_stops: !settings.exchange_native_stops })}
+                title="Canlıda borsaya DURAN SL/TP emri koy — bot çökse/internet gitse bile pozisyon korunur (yalnız canlı mod)"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.exchange_native_stops ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-red-500/40 bg-red-950/40 text-red-200"}`}
+              >
+                🛡️ Borsa-native stop: {settings.exchange_native_stops ? "AÇIK" : "KAPALI (riskli)"}
+              </button>
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />

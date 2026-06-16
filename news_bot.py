@@ -1297,6 +1297,9 @@ def process_items(
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
+                if pos.get("protect_error"):   # borsa stop konulamadı → KORUMASIZ canlı pozisyon
+                    notify_remote(f"⚠️ DİKKAT: {pos['symbol']} borsa koruyucu stop KONULAMADI "
+                                  f"— pozisyon yalnız bot çalışırken korumalı. Sebep: {pos['protect_error']}")
 
     return len(new_items), len(alerts)
 
@@ -2036,6 +2039,7 @@ class SettingsPatch(BaseModel):
     max_total_exposure_usdt: float | None = None
     max_per_coin_usdt: float | None = None
     order_type: str | None = None
+    exchange_native_stops: bool | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None

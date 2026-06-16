@@ -7,6 +7,12 @@
 
 ## Now (üstten alta, ara vermeden)
 
+- [x] Borsa-native koruyucu stop (canlı güvenlik açığı)
+  Done when: place_trade canlıda borsaya DURAN SL/TP koyar (_place_protective_orders, ccxt
+  stopLossPrice/takeProfitPrice); close/update iptal+yeniler; protect_error → uzak uyarı; paper
+  dokunulmaz; panel toggle; testler; ruff+mypy+pytest+build yeşil; commit.
+
+
 ### Epic: Akıllı oto-trade güçlendirme (haber→otomatik işlem)
 
 - [x] Faz 1 — Güvenlik kapıları (auto_decision)  (cc5be8c)

@@ -77,6 +77,7 @@ class Settings:
     reduce_after_losses: int = 0     # >0: son N işlem zararsa boyutu yarıla (kayıp serisi freni)
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
+    exchange_native_stops: bool = True   # canlıda borsaya DURAN SL/TP emri koy (bot çökse de korur)
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
@@ -106,6 +107,7 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
+    "exchange_native_stops",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
@@ -439,6 +441,39 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
     raise last_exc if last_exc else RuntimeError("emir gönderilemedi")
 
 
+def _place_protective_orders(ex: Any, csym: str, pos: dict[str, Any]) -> None:
+    """Canlıda girişten sonra borsaya DURAN koruyucu SL (ve TP) emri koy.
+
+    Bot çökse/internet gitse bile pozisyon borsada korunur. ccxt birleşik
+    `stopLossPrice`/`takeProfitPrice` parametreleriyle (STOP_MARKET) — spot+futures.
+    ID'ler pozisyonda saklanır (kapanış/güncellemede iptal için). Hata yutmaz.
+    """
+    ex_side = "sell" if pos["side"] == "long" else "buy"
+    amount = pos["amount"]
+    base = {"reduceOnly": True} if pos["market"] == "futures" else {}
+    if pos.get("sl_price"):
+        o = ex.create_order(csym, "market", ex_side, amount, None,
+                            {**base, "stopLossPrice": pos["sl_price"]})
+        pos["exchange_sl_id"] = o.get("id") if isinstance(o, dict) else None
+    if pos.get("tp_price"):
+        o = ex.create_order(csym, "market", ex_side, amount, None,
+                            {**base, "takeProfitPrice": pos["tp_price"]})
+        pos["exchange_tp_id"] = o.get("id") if isinstance(o, dict) else None
+
+
+def _cancel_protective_orders(ex: Any, csym: str, pos: dict[str, Any]) -> None:
+    """Pozisyonun duran koruyucu emirlerini iptal et (zaten dolmuşsa hata yutulur)."""
+    for key in ("exchange_sl_id", "exchange_tp_id"):
+        oid = pos.get(key)
+        if not oid:
+            continue
+        try:
+            ex.cancel_order(oid, csym)
+        except Exception as e:
+            log.warning("Koruyucu emir iptal edilemedi (%s %s): %s", key, oid, e)
+        pos.pop(key, None)
+
+
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
                 news_source: str = "", impact: int | None = None,
@@ -541,6 +576,17 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         _save_state()
     log.info("%s AÇ | %s %s | %.2f USDT @ %.6f | SL=%s TP=%s | %s",
              mode.upper(), pos["side"], symbol, usdt, price, sl_price, tp_price, source)
+    # Canlıda borsaya DURAN koruyucu stop koy (bot çökse de korunsun). Hata girişi bozmaz
+    # ama LOUD uyarı + flag bırakır (korumasız canlı pozisyon tehlikeli).
+    if mode == "live" and S.exchange_native_stops and (sl_price or tp_price):
+        try:
+            _place_protective_orders(_get_exchange(), _ccxt_symbol(symbol), pos)
+            with _lock:
+                _save_state()
+        except Exception as e:
+            log.error("⚠️ KORUYUCU STOP KONULAMADI (%s) — pozisyon yalnız bot-lokal korumalı: %s",
+                      symbol, e)
+            pos["protect_error"] = str(e)
     return pos
 
 
@@ -559,7 +605,19 @@ def update_position(pid: str, *, sl_price: float | None = None,
         if tp_price is not None:
             pos["tp_price"] = round(float(tp_price), 8) if tp_price > 0 else None
         _save_state()
-        return dict(pos)
+    # Canlıda borsadaki duran koruyucu emri yeni SL/TP'ye göre yenile (eskiyi iptal, yenisini koy)
+    if pos.get("mode") == "live" and S.exchange_native_stops:
+        try:
+            ex = _get_exchange()
+            csym = _ccxt_symbol(pos["symbol"])
+            _cancel_protective_orders(ex, csym, pos)
+            _place_protective_orders(ex, csym, pos)
+            with _lock:
+                _save_state()
+        except Exception as e:
+            log.error("Koruyucu emir güncellenemedi (%s): %s", pos["symbol"], e)
+            pos["protect_error"] = str(e)
+    return dict(pos)
 
 
 def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
@@ -574,6 +632,7 @@ def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
         try:
             ex = _get_exchange()
             csym = _ccxt_symbol(pos["symbol"])
+            _cancel_protective_orders(ex, csym, pos)   # duran SL/TP'yi iptal et (çift kapanış önle)
             ex_side = "sell" if pos["side"] == "long" else "buy"
             params = {"reduceOnly": True} if pos["market"] == "futures" else {}
             _create_order_idempotent(ex, csym, "market", ex_side, pos["amount"], params=params)

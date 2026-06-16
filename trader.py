@@ -47,6 +47,7 @@ class Settings:
     auto_min_impact: int = 8
     auto_require_confirm: bool = True
     tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
+    use_entry_brain: bool = False    # giriş anında Claude kararlı yargı (Tier-2 adaylarda; refleks atlanır)
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
@@ -96,7 +97,7 @@ _exchange: Any = None
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
-    "tier1_skip_confirm_impact", "cooldown_sec",
+    "tier1_skip_confirm_impact", "use_entry_brain", "cooldown_sec",
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
@@ -801,15 +802,38 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
             "side": side, "usdt": round(usdt, 2), "news_source": news_source}
 
 
+def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str, Any] | None:
+    """Giriş beynini güvenli çağır. Hata olursa None (mekanik karar geçerli kalır)."""
+    try:
+        return brain(item, decision)
+    except Exception as e:
+        log.warning("Giriş beyni hatası, mekanik karar geçerli: %s", e)
+        return None
+
+
 def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
-                     news_age_sec: float | None = None) -> dict[str, Any] | None:
+                     news_age_sec: float | None = None,
+                     brain: Any = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
     d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec)
     if not d["would_trade"]:
         return None
+    usdt = d["usdt"]
+    # Giriş beyni: mekanik kapıları geçen Tier-2 (refleks olmayan) adayda son yargı.
+    # enter=False → veto; conviction → boyutu ölçekler. Refleks girişte hız için atlanır.
+    if brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks":
+        v = _consult_brain(brain, item, d)
+        if v is not None:
+            if not v.get("enter", True):
+                log.info("Giriş beyni VETO | %s | %s", item.symbol, v.get("reason", ""))
+                return None
+            conv = v.get("conviction")
+            if conv is not None:
+                mult = max(0.5, min(1.5, float(conv) + 0.5))  # conviction 0.5→1.0x, 1.0→1.5x
+                usdt = round(usdt * mult, 2)
     try:
-        return place_trade(item.symbol, d["side"], usdt=d["usdt"], source="auto",
+        return place_trade(item.symbol, d["side"], usdt=usdt, source="auto",
                            news_source=d["news_source"], impact=int(item.impact),
                            reason=getattr(item, "reason", ""),
                            atr_pct=getattr(item, "atr_pct", None))

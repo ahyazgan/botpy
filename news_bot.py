@@ -622,6 +622,74 @@ def score_with_claude(items: list[NewsItem]) -> None:
                     score_item(it)
 
 
+# ── Giriş beyni: girişin tam anında kararlı son yargı ────────────────────
+# Mekanik kapıları geçen Tier-2 adaylarda çalışır. Puanlayıcının görmediği her şeyi
+# (canlı fiyat hareketi + ATR + funding + kaynağın geçmiş beklentisi + portföy) görür.
+ENTRY_BRAIN_MODEL = "claude-haiku-4-5"
+
+
+class _EntryDecision(BaseModel):
+    enter: bool           # gerçekten girilsin mi (veto yetkisi)
+    conviction: float     # 0-1: kurulumun gücü (boyutu ölçekler)
+    direction: str        # bullish | bearish | neutral (haber yönünü teyit/düzelt)
+    reason: str           # kısa Türkçe gerekçe
+
+
+_ENTRY_BRAIN_SYSTEM = (
+    "Sen disiplinli bir kripto haber-trade risk yöneticisisin. Sana, teyit kapılarını "
+    "geçmiş bir oto-işlem ADAYI verilecek (JSON): haber + canlı fiyat hareketi + bu "
+    "kaynağın geçmiş beklentisi + portföy durumu. Görevin SON YARGI: bu girişe gerçekten "
+    "girilmeli mi ve ne kadar konviksiyonla?\n"
+    "Değerlendir: zaten fiyatlanmış mı (24s büyük hareket → chase riski), 15dk ve 1s "
+    "çelişiyor mu (fade riski), kaynak negatif beklentili mi, aynı yönde küme/BTC-korele "
+    "risk var mı, likidite/oynaklık (hacim, ATR) ve funding maliyeti makul mu.\n"
+    "- enter: kurulum zayıf/riskliyse false ile VETO et\n"
+    "- conviction: 0-1 (1 = çok temiz, yüksek-olasılık kurulum; şüphede düşük tut)\n"
+    "- direction: haber yönünü teyit et; fiyat/bağlam ters ya da belirsizse düzelt (neutral)\n"
+    "- reason: en fazla 15 kelimelik Türkçe gerekçe\n"
+    "Sermaye korunması önce gelir: şüphede kal = düşük conviction veya veto."
+)
+
+
+def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, Any] | None:
+    """Giriş anında Claude kararlı yargı. None = beyin yok/başarısız (mekanik karar geçerli).
+
+    `decision`: trader.auto_decision çıktısı (side, usdt, news_source). Yan etkisiz.
+    """
+    if not USE_CLAUDE:
+        return None
+    src = getattr(item, "source", "") or ""
+    st = trader.source_stats(src)
+    same_dir = trader._open_side_count(decision.get("side") or "")
+    ctx = {
+        "haber": {
+            "kaynak": src, "kaynak_tier": _source_tier(src),
+            "baslik": item.title[:200], "guc": item.impact,
+            "yon": item.direction, "gerekce": item.reason[:160],
+            "coin": item.symbol, "yas_sn": round(_news_age_sec(item) or 0),
+        },
+        "fiyat": {
+            "deg_24s_pct": item.price_24h_pct, "deg_15dk_pct": item.price_15m_pct,
+            "deg_1s_pct": item.price_60m_pct, "hacim_usd": item.volume_usd,
+            "atr_pct": item.atr_pct, "teyitli": item.confirmed, "not": item.price_note[:160],
+        },
+        "kaynak_gecmisi": {"kapanmis_islem": st["count"], "ort_pnl_usdt": st["avg_pnl"]},
+        "portfoy": {"ayni_yonde_acik": same_dir, "yon": decision.get("side")},
+    }
+    client = _get_anthropic()
+    resp = client.messages.parse(
+        model=ENTRY_BRAIN_MODEL,
+        max_tokens=400,
+        system=_ENTRY_BRAIN_SYSTEM,
+        messages=[{"role": "user", "content": json.dumps(ctx, ensure_ascii=False)}],
+        output_format=_EntryDecision,
+    )
+    r = resp.parsed_output
+    conv = max(0.0, min(1.0, float(r.conviction)))
+    return {"enter": bool(r.enter), "conviction": conv,
+            "direction": r.direction, "reason": (r.reason or "")[:160]}
+
+
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, float] | None:
     """Bir parite için 24s değişim, hacim, son ~15dk ve ~1s hareketini döndür."""
@@ -1000,7 +1068,7 @@ def process_items(
             _archive_signal(it)
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
-            pos = trader.maybe_auto_trade(it, **_trade_context(it))
+            pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=entry_brain_decision)
             if pos:
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
@@ -1708,6 +1776,7 @@ class SettingsPatch(BaseModel):
     auto_min_impact: int | None = None
     auto_require_confirm: bool | None = None
     tier1_skip_confirm_impact: int | None = None
+    use_entry_brain: bool | None = None
     cooldown_sec: int | None = None
     halt_trade_on_stale: bool | None = None
     max_news_age_sec: int | None = None

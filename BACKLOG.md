@@ -25,6 +25,10 @@
 - [x] Panel kontrolleri — yeni oto-trade ayarları  (44142a1)
   Done when: güvenlik kapıları/ATR/funding toggle+slider + oto-kalibrasyon "uygula" butonu;
   tsc+vite build yeşil; commit.
+- [x] Giriş beyni — girişte Claude kararlı son yargı
+  Done when: entry_brain_decision (haiku, haber+fiyat+geçmiş+portföy → enter/conviction/veto);
+  maybe_auto_trade beyin kancası (Tier-2'de, refleks atlanır, fail-safe); panel toggle;
+  testler; ruff+mypy+pytest+build yeşil; commit.
 
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.

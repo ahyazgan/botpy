@@ -85,6 +85,13 @@ type Settings = {
   suppress_losing_sources: boolean;
   min_source_samples: number;
   skip_already_priced_pct: number;
+  halt_trade_on_stale: boolean;
+  max_news_age_sec: number;
+  max_same_direction: number;
+  max_funding_rate_pct: number;
+  use_atr_exits: boolean;
+  atr_sl_mult: number;
+  atr_tp_mult: number;
   has_live_keys: boolean;
   open_exposure_usdt: number;
   realized_today: number;
@@ -559,6 +566,27 @@ export default function App() {
     }
   };
 
+  const [tuningApplying, setTuningApplying] = useState(false);
+  const applyTuning = async () => {
+    setTuningApplying(true);
+    try {
+      const r = await fetch(`${API_BASE}/tuning/apply`, { method: "POST" });
+      if (!r.ok) throw new Error(`apply ${r.status}`);
+      const out = await r.json();
+      // ayarları + önerileri tazele
+      const [s, t] = await Promise.all([fetch(`${API_BASE}/settings`), fetch(`${API_BASE}/tuning`)]);
+      if (s.ok) setSettings(await s.json());
+      if (t.ok) setTuning(await t.json());
+      setErr(out.applied
+        ? `Oto-kalibrasyon uygulandı: ${out.changes.map((c: { field: string; to: unknown }) => `${c.field}→${c.to}`).join(", ")}`
+        : "Oto-kalibrasyon: yeterli örnek yok, değişiklik yapılmadı");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Oto-kalibrasyon hatası");
+    } finally {
+      setTuningApplying(false);
+    }
+  };
+
   const applyPreset = async (name: "news" | "safe") => {
     try {
       const r = await fetch(`${API_BASE}/settings/preset/${name}`, { method: "POST" });
@@ -904,6 +932,20 @@ export default function App() {
               <NumField label="Kısmi TP % (0=kapalı)" value={settings.partial_tp_pct} onSave={(v) => patchSettings({ partial_tp_pct: v })} />
               <NumField label="Kısmi TP oranı (0-1)" value={settings.partial_tp_frac} onSave={(v) => patchSettings({ partial_tp_frac: v })} />
               <NumField label="Tier-1 refleks güç (0=kapalı)" value={settings.tier1_skip_confirm_impact} onSave={(v) => patchSettings({ tier1_skip_confirm_impact: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ use_atr_exits: !settings.use_atr_exits })}
+                title="SL/TP'yi sabit % yerine coin oynaklığına (ATR) göre ölçekle"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.use_atr_exits ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                ATR çıkış (volatilite SL/TP): {settings.use_atr_exits ? "AÇIK" : "kapalı"}
+              </button>
+              {settings.use_atr_exits && (
+                <>
+                  <NumField label="ATR SL çarpanı" value={settings.atr_sl_mult} onSave={(v) => patchSettings({ atr_sl_mult: v })} />
+                  <NumField label="ATR TP çarpanı" value={settings.atr_tp_mult} onSave={(v) => patchSettings({ atr_tp_mult: v })} />
+                </>
+              )}
               <div className="flex gap-2 pt-1">
                 <button type="button" onClick={() => void applyPreset("news")}
                   className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/50">
@@ -948,6 +990,20 @@ export default function App() {
                 Kaybeden kaynağı sustur: {settings.suppress_losing_sources ? "AÇIK" : "kapalı"}
               </button>
               <NumField label="Min. kaynak örneği" value={settings.min_source_samples} onSave={(v) => patchSettings({ min_source_samples: v })} />
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-rose-400/80">Güvenlik kapıları</p>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ halt_trade_on_stale: !settings.halt_trade_on_stale })}
+                title="Haber akışı (WS) kopukken yeni oto-işlem açma — kör giriş önleme"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.halt_trade_on_stale ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                Akış kopukken durdur: {settings.halt_trade_on_stale ? "AÇIK" : "kapalı"}
+              </button>
+              <NumField label="Max haber yaşı sn (0=kapalı)" value={settings.max_news_age_sec} onSave={(v) => patchSettings({ max_news_age_sec: v })} />
+              <NumField label="Aynı yönde max pozisyon (0=kapalı)" value={settings.max_same_direction} onSave={(v) => patchSettings({ max_same_direction: v })} />
+              <NumField label="Max funding % futures (0=kapalı)" value={settings.max_funding_rate_pct} onSave={(v) => patchSettings({ max_funding_rate_pct: v })} />
             </div>
           </div>
         )}
@@ -1384,15 +1440,26 @@ export default function App() {
             🧠 Öğrenen beyin
             <span className="ml-2 text-sm font-normal text-zinc-500">(öneri — otomatik uygulanmaz)</span>
           </h2>
-          <button
-            type="button"
-            onClick={() => void runPretrade()}
-            disabled={pretradeRunning}
-            title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
-            className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
-          >
-            {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void applyTuning()}
+              disabled={tuningApplying}
+              title="Önerileri korkuluklarla otomatik uygula: auto_min_impact tabana kıstırılır + negatif kaynak susturulur (risk/boyut ayarlarına dokunmaz)"
+              className="rounded-md border border-amber-500/40 bg-amber-950/40 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+            >
+              {tuningApplying ? "Uygulanıyor…" : "🤖 Oto-kalibrasyonu uygula"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void runPretrade()}
+              disabled={pretradeRunning}
+              title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
+              className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
+            >
+              {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
+            </button>
+          </div>
         </div>
 
         {/* Canlı: kapanan gerçek işlemlerden */}

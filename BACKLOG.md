@@ -19,7 +19,7 @@
 - [x] Faz 3 — Bearish/short (futures funding kapısı)  (7dffbc2)
   Done when: futures short zaten açık; `max_funding_rate_pct` ile funding'e ters pahalı yönde girme;
   `get_funding_rate`; testler; yeşil; commit.
-- [ ] Faz 4 — ATR volatilite SL/TP
+- [x] Faz 4 — ATR volatilite SL/TP  (9a3840f)
   Done when: confirm'de `atr_pct` hesapla; `use_atr_exits`/`atr_sl_mult`/`atr_tp_mult` ile place_trade
   dinamik SL/TP; testler; yeşil; commit.
 

@@ -169,6 +169,7 @@ class NewsItem:
     price_15m_pct: float | None = None
     price_60m_pct: float | None = None   # ~1 saatlik hareket (çoklu zaman dilimi teyidi)
     volume_usd: float | None = None
+    atr_pct: float | None = None    # son mumların ortalama gerçek aralığı (%) — ATR çıkış için
     confirmed: bool = False         # haber + fiyat hareketi uyumlu mu
     price_note: str = ""            # teyit açıklaması
 
@@ -190,6 +191,7 @@ class NewsItem:
             "price_15m_pct": self.price_15m_pct,
             "price_60m_pct": self.price_60m_pct,
             "volume_usd": self.volume_usd,
+            "atr_pct": self.atr_pct,
             "confirmed": self.confirmed,
             "price_note": self.price_note,
         }
@@ -633,7 +635,7 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
         params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(CONFIRM_LIMIT)},
         timeout=REQUEST_TIMEOUT, session=session,
     )
-    move15 = move60 = 0.0
+    move15 = move60 = atr_pct = 0.0
     if isinstance(candles, list) and candles:
         last = candles[-1]
         o15, c15 = float(last[1]), float(last[4])
@@ -642,11 +644,17 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
         o60, c60 = float(candles[0][1]), float(candles[-1][4])
         if o60:
             move60 = (c60 - o60) / o60 * 100
+        # ATR% ≈ mumların ortalama (yüksek-düşük)/kapanış — oynaklık ölçüsü
+        ranges = [(float(k[2]) - float(k[3])) / float(k[4]) * 100
+                  for k in candles if float(k[4]) > 0]
+        if ranges:
+            atr_pct = sum(ranges) / len(ranges)
     return {
         "pct24": float(t.get("priceChangePercent", 0) or 0),
         "vol": float(t.get("quoteVolume", 0) or 0),
         "move15": move15,
         "move60": move60,
+        "atr_pct": atr_pct,
     }
 
 
@@ -678,6 +686,7 @@ def confirm_with_price(session: requests.Session, item: NewsItem) -> None:
     item.price_15m_pct = round(stats["move15"], 2)
     item.price_60m_pct = round(stats.get("move60", 0.0), 2)
     item.volume_usd = stats["vol"]
+    item.atr_pct = round(stats.get("atr_pct", 0.0), 3) or None
 
     liq_ok = stats["vol"] >= MIN_VOLUME_USD
     move = stats["move15"]
@@ -1707,6 +1716,9 @@ class SettingsPatch(BaseModel):
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     trailing_stop_pct: float | None = None
+    use_atr_exits: bool | None = None
+    atr_sl_mult: float | None = None
+    atr_tp_mult: float | None = None
     daily_loss_limit_usdt: float | None = None
     max_total_exposure_usdt: float | None = None
     max_per_coin_usdt: float | None = None

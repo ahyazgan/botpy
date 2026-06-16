@@ -38,7 +38,8 @@ def auto_env(monkeypatch):
     trader.S.trade_usdt = 100.0
     captured = {}
 
-    def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source="", impact=None):
+    def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source="",
+                   impact=None, atr_pct=None):
         captured["usdt"] = usdt
         captured["side"] = side
         captured["impact"] = impact

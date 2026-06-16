@@ -16,7 +16,7 @@
 - [x] Faz 2 — Oto-kalibrasyon (POST /tuning/apply)  (daa8466)
   Done when: `trader.apply_tuning` öneriyi korkuluklarla uygular (auto_min_impact taban + kaynak
   susturma); endpoint; testler; yeşil; commit.
-- [ ] Faz 3 — Bearish/short (futures funding kapısı)
+- [x] Faz 3 — Bearish/short (futures funding kapısı)  (7dffbc2)
   Done when: futures short zaten açık; `max_funding_rate_pct` ile funding'e ters pahalı yönde girme;
   `get_funding_rate`; testler; yeşil; commit.
 - [ ] Faz 4 — ATR volatilite SL/TP

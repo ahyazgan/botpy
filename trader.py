@@ -57,6 +57,10 @@ class Settings:
     stop_loss_pct: float = 3.0       # -%3'te zarar durdur
     take_profit_pct: float = 6.0     # +%6'da kâr al
     trailing_stop_pct: float = 0.0   # 0 = kapalı; >0 ise kârı takip eden stop
+    # Volatilite-bazlı çıkış (ATR): sabit % yerine coin oynaklığına göre SL/TP
+    use_atr_exits: bool = False      # açıksa SL/TP = çarpan × ATR% (haber teyidinden)
+    atr_sl_mult: float = 1.5         # SL = atr_sl_mult × ATR% ([0.5, 15] kıstırılır)
+    atr_tp_mult: float = 3.0         # TP = atr_tp_mult × ATR% ([1, 30] kıstırılır)
     # Akıllı çıkış yönetimi
     time_stop_min: int = 0           # >0: bu kadar dk sonra hâlâ açıksa kapat (haber edge'i söndü)
     breakeven_pct: float = 0.0       # >0: +%X kâra ulaşınca SL'i girişe çek (kârı koru)
@@ -95,6 +99,7 @@ _PERSIST_KEYS = (
     "tier1_skip_confirm_impact", "cooldown_sec",
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+    "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
@@ -348,7 +353,8 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
 
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
-                news_source: str = "", impact: int | None = None) -> dict[str, Any]:
+                news_source: str = "", impact: int | None = None,
+                atr_pct: float | None = None) -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -395,19 +401,25 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         if order.get("filled"):
             amount = float(order["filled"]) or amount
 
+    # SL/TP yüzdeleri: sabit (varsayılan) veya volatilite-bazlı (ATR)
+    sl_pct, tp_pct = S.stop_loss_pct, S.take_profit_pct
+    if S.use_atr_exits and atr_pct and atr_pct > 0:
+        sl_pct = max(0.5, min(15.0, S.atr_sl_mult * atr_pct))
+        tp_pct = max(1.0, min(30.0, S.atr_tp_mult * atr_pct))
+
     # SL/TP fiyatları
     sl_price = tp_price = None
     if S.use_sl_tp:
         if is_long:
-            if S.stop_loss_pct > 0:
-                sl_price = round(price * (1 - S.stop_loss_pct / 100), 8)
-            if S.take_profit_pct > 0:
-                tp_price = round(price * (1 + S.take_profit_pct / 100), 8)
+            if sl_pct > 0:
+                sl_price = round(price * (1 - sl_pct / 100), 8)
+            if tp_pct > 0:
+                tp_price = round(price * (1 + tp_pct / 100), 8)
         else:
-            if S.stop_loss_pct > 0:
-                sl_price = round(price * (1 + S.stop_loss_pct / 100), 8)
-            if S.take_profit_pct > 0:
-                tp_price = round(price * (1 - S.take_profit_pct / 100), 8)
+            if sl_pct > 0:
+                sl_price = round(price * (1 + sl_pct / 100), 8)
+            if tp_pct > 0:
+                tp_price = round(price * (1 - tp_pct / 100), 8)
 
     pos = {
         "id": str(uuid.uuid4())[:8],
@@ -428,6 +440,7 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "news_source": news_source,
         "impact": impact,
         "reason": reason,
+        "atr_pct": round(atr_pct, 3) if (S.use_atr_exits and atr_pct) else None,
     }
     with _lock:
         _positions.append(pos)
@@ -798,7 +811,8 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
     try:
         return place_trade(item.symbol, d["side"], usdt=d["usdt"], source="auto",
                            news_source=d["news_source"], impact=int(item.impact),
-                           reason=getattr(item, "reason", ""))
+                           reason=getattr(item, "reason", ""),
+                           atr_pct=getattr(item, "atr_pct", None))
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
         return None

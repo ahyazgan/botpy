@@ -633,6 +633,7 @@ ENTRY_ESCALATE_LOW, ENTRY_ESCALATE_HIGH = 0.4, 0.6
 
 class _EntryDecision(BaseModel):
     enter: bool           # gerçekten girilsin mi (veto yetkisi)
+    wait_seconds: int     # >0: henüz net değil, bu kadar sn sonra yeniden değerlendir (girme)
     conviction: float     # 0-1: kurulumun gücü (boyutu ölçekler)
     direction: str        # bullish | bearish | neutral (haber yönünü teyit/düzelt)
     # çok-boyutlu rubrik (0-1; risk alanlarında yüksek=kötü, kalite alanlarında yüksek=iyi)
@@ -649,22 +650,79 @@ class _EntryDecision(BaseModel):
 
 _ENTRY_BRAIN_SYSTEM = (
     "Sen disiplinli bir kripto haber-trade risk yöneticisisin. Sana, teyit kapılarını "
-    "geçmiş bir oto-işlem ADAYI verilecek (JSON): haber + canlı fiyat hareketi + bu "
-    "kaynağın geçmiş beklentisi + benzer geçmiş işlemlerin EMSAL sonucu + portföy durumu. "
-    "Görevin SON YARGI: bu girişe gerçekten girilmeli mi, ne kadar konviksiyonla, hangi çıkışla?\n"
+    "geçmiş bir oto-işlem ADAYI verilecek (JSON): haber + canlı fiyat + EMSAL (benzer geçmiş "
+    "işlemlerin gerçek sonucu) + PİYASA REJİMİ (BTC) + KÜME (aynı coine yakın haberler) + "
+    "BEYİN KALİBRASYONU (senin geçmiş konviksiyonlarının gerçek isabeti) + portföy. "
+    "Görevin SON YARGI: girilmeli mi, ne kadar konviksiyonla, hangi çıkışla — yoksa BEKLE mi?\n"
     "Önce her boyutu 0-1 puanla: chase_risk (24s büyük hareket → kovalama), fade_risk "
     "(15dk-1s çelişkisi → sönme), liquidity (hacim yeterli mi, yüksek=iyi), source_quality "
-    "(kaynak tier + emsal/kaynak geçmişi, yüksek=iyi), correlation_risk (aynı yönde küme). "
-    "Emsal sonuçları (recent_pnls/win_rate) varsa onlara AĞIRLIK ver — prior değil gerçek "
-    "track record.\n"
-    "- enter: yüksek risk veya negatif emsalde false ile VETO et\n"
+    "(kaynak tier + emsal/kaynak geçmişi, yüksek=iyi), correlation_risk (aynı yönde küme + "
+    "BTC rejimi).\n"
+    "Emsal (recent_pnls/win_rate) ve kendi kalibrasyonuna AĞIRLIK ver — prior değil gerçek veri. "
+    "Piyasa rejimi 'risk-off' iken alt-coin long'a temkinli ol; 'risk-on' iken cesur. "
+    "Küme: aynı coine zaten girilmiş/çok haber varsa kümülatif etki azalır.\n"
+    "- enter: yüksek risk/negatif emsalde false ile VETO et\n"
+    "- wait_seconds: kurulum HENÜZ net değil ama gelişiyorsa (ör. fiyat henüz teyit etmedi, "
+    "spike oturuyor) 0 yerine 30-180 ver → enter=false, sonra yeniden bakılır. Net ise 0.\n"
     "- conviction: 0-1 (1 = temiz, yüksek-olasılık; şüphede düşük tut)\n"
     "- direction: haber yönünü teyit et; fiyat/bağlam ters/belirsizse düzelt (neutral)\n"
     "- sl_tightness: oynak/belirsizde 'tight', net trend + iyi likiditede 'wide', aksi 'normal'\n"
     "- hold_minutes: haber edge'inin süresi (hızlı spike 15-30, yapısal haber 60-120, yoksa 0)\n"
     "- reason: en fazla 15 kelimelik Türkçe gerekçe\n"
-    "Sermaye korunması önce gelir: şüphede kal = düşük conviction veya veto."
+    "Sermaye korunması önce gelir: şüphede kal = düşük conviction, BEKLE veya veto."
 )
+
+
+_btc_regime_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+BTC_REGIME_TTL = 60.0
+CLUSTER_WINDOW_MIN = 30
+
+
+def _btc_regime() -> dict[str, Any] | None:
+    """Piyasa rejimi: BTC 24s + ~1s hareketi → risk-on/off/nötr. 60s cache; hata=None."""
+    now = time.time()
+    c = _btc_regime_cache
+    if c["data"] is not None and now - c["ts"] < BTC_REGIME_TTL:
+        return c["data"]  # type: ignore[return-value]
+    data: dict[str, Any] | None = None
+    try:
+        t = get_json(f"{BINANCE_API}/ticker/24hr", params={"symbol": "BTCUSDT"}, timeout=REQUEST_TIMEOUT)
+        kl = get_json(f"{BINANCE_API}/klines", params={"symbol": "BTCUSDT", "interval": "15m",
+                                                       "limit": "4"}, timeout=REQUEST_TIMEOUT)
+        pct24 = float(t.get("priceChangePercent", 0) or 0) if t else 0.0
+        move1h = 0.0
+        if isinstance(kl, list) and kl:
+            o, cl = float(kl[0][1]), float(kl[-1][4])
+            if o:
+                move1h = (cl - o) / o * 100
+        regime = "risk-on" if (pct24 >= 2 and move1h >= 0) else "risk-off" if pct24 <= -2 else "nötr"
+        data = {"btc_24s_pct": round(pct24, 2), "btc_1s_pct": round(move1h, 2), "rejim": regime}
+    except Exception as e:
+        log.warning("BTC rejim alınamadı: %s", e)
+    c["ts"], c["data"] = now, data
+    return data
+
+
+def _cluster_context(item: NewsItem) -> dict[str, Any]:
+    """Küme: aynı coine son CLUSTER_WINDOW_MIN dakikadaki haber sayısı + yön kırılımı."""
+    coin = (item.coins[0] if item.coins else None) or (item.symbol or "").replace("USDT", "")
+    if not coin:
+        return {"son_haber": 0, "ayni_yon": 0, "ters_yon": 0}
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CLUSTER_WINDOW_MIN)
+    same = opp = 0
+    with _cache_lock:
+        snapshot = list(_news)
+    for n in snapshot:
+        if n.id == item.id or coin not in n.coins:
+            continue
+        t = _parse_time(n.published) or _parse_time(n.fetched_at)
+        if t is None or t < cutoff:
+            continue
+        if n.direction == item.direction:
+            same += 1
+        elif n.direction != "neutral":
+            opp += 1
+    return {"son_haber": same + opp, "ayni_yon": same, "ters_yon": opp}
 
 
 def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
@@ -704,6 +762,9 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
             "kaynak_geneli": trader.precedent_stats(news_source=src),
             "ayni_coin_yon": trader.precedent_stats(symbol=item.symbol, side=side),
         },
+        "piyasa_rejimi": _btc_regime(),
+        "kume": _cluster_context(item),
+        "beyin_kalibrasyon": trader.brain_scorecard(),
         "portfoy": {"ayni_yonde_acik": trader._open_side_count(side), "yon": side},
     }
     client = _get_anthropic()
@@ -719,7 +780,8 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
         except Exception as e:
             log.warning("Beyin eskalasyonu başarısız, haiku kararı geçerli: %s", e)
     return {
-        "enter": bool(r.enter), "conviction": max(0.0, min(1.0, float(r.conviction))),
+        "enter": bool(r.enter), "wait_seconds": max(0, min(300, int(r.wait_seconds))),
+        "conviction": max(0.0, min(1.0, float(r.conviction))),
         "direction": r.direction, "sl_tightness": r.sl_tightness,
         "hold_minutes": max(0, int(r.hold_minutes)), "reason": (r.reason or "")[:160],
         "scores": {
@@ -730,6 +792,78 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
         },
         "model": model_used, "escalated": escalated,
     }
+
+
+# ── Bekle/izle: kararsız ama gelişen kurulumu kısa süre ertele, sonra yeniden bak ──
+_deferred_lock = threading.Lock()
+_brain_due: dict[str, float] = {}        # item_id -> yeniden bakılacak monotonic zaman
+_brain_items: dict[str, NewsItem] = {}   # item_id -> item
+_brain_tries: dict[str, int] = {}        # item_id -> kaç kez 'bekle' dendi
+MAX_BRAIN_DEFERS = 3
+MAX_DEFERRED = 50
+
+
+def _clear_defer(iid: str) -> None:
+    _brain_due.pop(iid, None)
+    _brain_items.pop(iid, None)
+    _brain_tries.pop(iid, None)
+
+
+def _brain_for_trade(item: NewsItem, decision: dict[str, Any]) -> dict[str, Any] | None:
+    """Canlı işlem yolunda beyin: 'bekle' (wait_seconds) kararını erteleme olarak yönetir.
+
+    entry_brain_decision saf kalır; deferral bookkeeping burada. Net kararda erteleme temizlenir.
+    """
+    v = entry_brain_decision(item, decision)
+    if v is None:
+        return None
+    wait = int(v.get("wait_seconds", 0) or 0)
+    if wait > 0:
+        with _deferred_lock:
+            tries = _brain_tries.get(item.id, 0)
+            if tries < MAX_BRAIN_DEFERS and len(_brain_due) < MAX_DEFERRED:
+                _brain_tries[item.id] = tries + 1
+                _brain_due[item.id] = time.monotonic() + wait
+                _brain_items[item.id] = item
+                log.info("Giriş beyni BEKLE | %s | %ds (deneme %d) | %s",
+                         item.symbol, wait, tries + 1, v.get("reason", ""))
+            else:
+                _clear_defer(item.id)   # deneme/kapasite bitti → bırak
+        return {**v, "enter": False}
+    with _deferred_lock:
+        _clear_defer(item.id)   # net karar → ertelemeyi temizle
+    return v
+
+
+def _recheck_deferred_entries() -> None:
+    """Süresi gelen 'bekle' adaylarını yeniden değerlendir (canlı işlem yolu). _monitor_loop'tan."""
+    now = time.monotonic()
+    with _deferred_lock:
+        due_ids = [iid for iid, due in _brain_due.items() if due <= now]
+        for iid in due_ids:
+            _brain_due.pop(iid, None)   # bu turda tekrar seçilmesin (tries/item korunur)
+    for iid in due_ids:
+        item = _brain_items.get(iid)
+        if item is None:
+            continue
+        if _too_old(item):
+            with _deferred_lock:
+                _clear_defer(iid)
+            continue
+        try:
+            pos = trader.maybe_auto_trade(item, **_trade_context(item), brain=_brain_for_trade)
+        except Exception as e:
+            log.warning("Ertelenen giriş yeniden değerlendirme hatası (%s): %s", item.symbol, e)
+            pos = None
+        if pos:
+            _metrics["trades_opened_total"] += 1
+            log.info("OTO İŞLEM (ertelenen) | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
+            notify_remote(_fmt_trade_msg(pos, opened=True))
+        else:
+            # brain yeniden 'bekle' dediyse due geri yazıldı; aksi halde (veto/uygunsuz) temizle
+            with _deferred_lock:
+                if iid in _brain_items and iid not in _brain_due:
+                    _clear_defer(iid)
 
 
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
@@ -1114,7 +1248,7 @@ def process_items(
             _archive_signal(it)
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
-            pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=entry_brain_decision)
+            pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
             if pos:
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
@@ -1196,6 +1330,10 @@ def _monitor_loop(stop: threading.Event) -> None:
                 notify_remote(_fmt_trade_msg(pos, opened=False))
         except Exception as e:
             log.warning("Pozisyon izleme hatası: %s", e)
+        try:
+            _recheck_deferred_entries()   # giriş beyni 'bekle' adaylarını yeniden değerlendir
+        except Exception as e:
+            log.warning("Ertelenen giriş kontrolü hatası: %s", e)
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -1904,6 +2042,13 @@ def get_tuning() -> dict[str, Any]:
     """Öğrenen beyin (öneri modu): kapanan GERÇEK işlemlerden eşik ayarı önerileri.
     Otomatik UYGULAMAZ — kaynak-tier eşlemesi için `_source_tier` geçirilir."""
     return trader.suggest_tuning(tier_of=_source_tier)
+
+
+@app.get("/brain-scorecard")
+def brain_scorecard() -> dict[str, Any]:
+    """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).
+    `calibrated` = yüksek konviksiyon daha yüksek ort. P&L üretiyor mu (beyin edge katıyor mu)."""
+    return trader.brain_scorecard()
 
 
 @app.post("/tuning/apply", dependencies=[Depends(require_token)])

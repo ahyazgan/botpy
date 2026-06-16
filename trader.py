@@ -320,6 +320,37 @@ def precedent_stats(*, news_source: str | None = None, symbol: str | None = None
             "recent_pnls": [round(c["pnl"], 2) for c in rows]}
 
 
+_BRAIN_BANDS = (("0-0.5", 0.0, 0.5), ("0.5-0.7", 0.5, 0.7),
+                ("0.7-0.85", 0.7, 0.85), ("0.85-1", 0.85, 1.01))
+
+
+def brain_scorecard() -> dict[str, Any]:
+    """Beyin kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen+kapanan işlemler).
+
+    `calibrated`: yüksek konviksiyon dilimi daha yüksek ort. P&L üretiyor mu (monoton artış).
+    Beyin gerçekten edge katıyor mu ölçer (sadece girilen işlemler; veto'lar görülmez).
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None and isinstance(c.get("brain"), dict)
+                and c["brain"].get("conviction") is not None]
+    bands: list[dict[str, Any]] = []
+    for name, lo, hi in _BRAIN_BANDS:
+        b = [c for c in rows if lo <= float(c["brain"]["conviction"]) < hi]
+        if not b:
+            bands.append({"band": name, "n": 0, "win_rate": None, "avg_pnl": None})
+            continue
+        wins = sum(1 for c in b if c["pnl"] > 0)
+        bands.append({"band": name, "n": len(b), "win_rate": round(wins / len(b), 2),
+                      "avg_pnl": round(sum(c["pnl"] for c in b) / len(b), 2)})
+    filled = [x for x in bands if x["n"] > 0]
+    calibrated: bool | None = None
+    if len(filled) >= 2:
+        calibrated = all(filled[i]["avg_pnl"] <= filled[i + 1]["avg_pnl"]
+                         for i in range(len(filled) - 1))
+    return {"samples": len(rows), "bands": bands, "calibrated": calibrated,
+            "escalated_n": sum(1 for c in rows if c["brain"].get("escalated"))}
+
+
 def _check_risk(symbol: str, usdt: float) -> None:
     """Risk limitlerini ihlal eden işlemde RuntimeError fırlatır."""
     _reset_daily_if_needed()

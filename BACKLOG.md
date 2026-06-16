@@ -29,10 +29,14 @@
   Done when: entry_brain_decision (haiku, haber+fiyat+geçmiş+portföy → enter/conviction/veto);
   maybe_auto_trade beyin kancası (Tier-2'de, refleks atlanır, fail-safe); panel toggle;
   testler; ruff+mypy+pytest+build yeşil; commit.
-- [x] Giriş beynini derinleştir (emsal + rubrik + çıkış + eskalasyon)
+- [x] Giriş beynini derinleştir (emsal + rubrik + çıkış + eskalasyon)  (f7f1a6d)
   Done when: precedent_stats emsal hafızası; çok-boyutlu rubrik alt-skorlar; sl_tightness/hold_minutes
   çıkış (place_trade sl_mult + pozisyon-bazlı time-stop); brain_escalate iki-kademeli (haiku→sonnet);
   pos["brain"] bildirimde; panel eskalasyon toggle; testler; hepsi yeşil; commit.
+- [x] Beyin ileri-seviye (kalibrasyon + BTC rejimi + bekle + küme)
+  Done when: brain_scorecard + /brain-scorecard + panel şeridi + ctx geri besleme; _btc_regime piyasa
+  rejimi; _cluster_context küme; wait_seconds bekle/izle erteleme (_brain_for_trade + recheck loop);
+  testler; ruff+mypy+pytest+build yeşil; commit.
 
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.

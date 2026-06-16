@@ -99,6 +99,9 @@ type Settings = {
   realized_today: number;
 };
 
+type BrainBand = { band: string; n: number; win_rate: number | null; avg_pnl: number | null };
+type BrainScorecard = { samples: number; bands: BrainBand[]; calibrated: boolean | null; escalated_n: number };
+
 type Performance = {
   total_trades: number;
   wins: number;
@@ -446,11 +449,12 @@ export default function App() {
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
+  const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
 
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -462,6 +466,7 @@ export default function App() {
         fetch(`${API_BASE}/trades/closed?limit=100`),
         fetch(`${API_BASE}/summary`),
         fetch(`${API_BASE}/tuning`),
+        fetch(`${API_BASE}/brain-scorecard`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -495,6 +500,7 @@ export default function App() {
       }
       if (perfRes.ok) setPerf(await perfRes.json());
       if (tuningRes.ok) setTuning(await tuningRes.json());
+      if (bsRes.ok) setBrainSc(await bsRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -1489,6 +1495,37 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {/* Giriş beyni kalibrasyonu: conviction dilimi → gerçek isabet */}
+        {brainSc && brainSc.samples > 0 && (
+          <div className="mb-3 rounded-2xl border border-violet-500/30 bg-violet-950/20 px-4 py-3">
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-semibold uppercase tracking-wider text-violet-300/80">🧠 Giriş beyni kalibrasyonu</span>
+              <span className="text-zinc-500">{brainSc.samples} işlem · {brainSc.escalated_n} eskalasyon</span>
+              <span className={`rounded px-2 py-0.5 font-semibold ${
+                brainSc.calibrated === true ? "bg-emerald-900/50 text-emerald-200"
+                  : brainSc.calibrated === false ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-400"}`}>
+                {brainSc.calibrated === true ? "✓ kalibre (konv↑ → P&L↑)"
+                  : brainSc.calibrated === false ? "✗ kalibre değil" : "yetersiz veri"}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {brainSc.bands.map((b) => (
+                <div key={b.band} className="rounded-lg border border-white/10 bg-zinc-900/50 px-2 py-1.5 text-center">
+                  <div className="text-[10px] uppercase text-zinc-500">konv {b.band}</div>
+                  {b.n > 0 ? (
+                    <div className="text-sm font-semibold tabular-nums">
+                      <span className={(b.avg_pnl ?? 0) >= 0 ? "text-emerald-300" : "text-red-300"}>
+                        {(b.avg_pnl ?? 0) >= 0 ? "+" : ""}{b.avg_pnl}
+                      </span>
+                      <span className="text-zinc-500"> · {Math.round((b.win_rate ?? 0) * 100)}% · {b.n}</span>
+                    </div>
+                  ) : <div className="text-sm text-zinc-600">—</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Canlı: kapanan gerçek işlemlerden */}
         {tuning && tuning.ready && tuning.suggestions.length > 0 && (

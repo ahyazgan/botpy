@@ -131,7 +131,7 @@ def _news_item():
 
 
 def _dec(conviction=0.8, **kw):
-    base = dict(enter=True, conviction=conviction, direction="bullish",
+    base = dict(enter=True, wait_seconds=0, conviction=conviction, direction="bullish",
                 chase_risk=0.2, fade_risk=0.2, liquidity=0.8, source_quality=0.7,
                 correlation_risk=0.1, sl_tightness="normal", hold_minutes=30, reason="temiz")
     base.update(kw)
@@ -166,6 +166,8 @@ def claude(monkeypatch):
     monkeypatch.setattr(trader, "_open_side_count", lambda s: 1)
     monkeypatch.setattr(trader, "precedent_stats", lambda **kw: {"n": 3, "win_rate": 0.67,
                                                                  "avg_pnl": 2.0, "recent_pnls": [4, 6, -2]})
+    monkeypatch.setattr(trader, "brain_scorecard", lambda: {"samples": 0, "bands": [], "calibrated": None})
+    monkeypatch.setattr(nb, "_btc_regime", lambda: {"btc_24s_pct": 1.0, "btc_1s_pct": 0.2, "rejim": "nötr"})
     monkeypatch.setattr(trader.S, "brain_escalate", False)
     yield monkeypatch
 
@@ -226,3 +228,65 @@ def test_precedent_stats_empty(monkeypatch):
     monkeypatch.setattr(trader, "_closed", [])
     out = trader.precedent_stats(news_source="X")
     assert out["n"] == 0 and out["win_rate"] is None and out["recent_pnls"] == []
+
+
+# ── trader.brain_scorecard (kalibrasyon) ──────────────────────────────────
+def test_brain_scorecard_buckets_by_conviction(monkeypatch):
+    monkeypatch.setattr(trader, "_closed", [
+        {"pnl": -1.0, "brain": {"conviction": 0.3}},
+        {"pnl": 2.0, "brain": {"conviction": 0.6}},
+        {"pnl": 5.0, "brain": {"conviction": 0.9, "escalated": True}},
+        {"pnl": 4.0, "brain": {"conviction": 0.9}},
+        {"pnl": 1.0, "brain": None},          # beyinsiz → sayılmaz
+        {"pnl": 3.0},                          # brain yok → sayılmaz
+    ])
+    sc = trader.brain_scorecard()
+    assert sc["samples"] == 4 and sc["escalated_n"] == 1
+    top = next(b for b in sc["bands"] if b["band"] == "0.85-1")
+    assert top["n"] == 2 and top["avg_pnl"] == 4.5
+    assert sc["calibrated"] is True   # yüksek conviction → yüksek P&L (monoton)
+
+
+# ── Bekle/izle erteleme (_brain_for_trade + recheck) ─────────────────────
+def test_wait_defers_then_resolves(monkeypatch):
+    """wait_seconds>0 → erteleme kaydı + enter False; süre dolunca yeniden değerlendirilir."""
+    for d in (nb._brain_due, nb._brain_items, nb._brain_tries):
+        d.clear()
+    item = _news_item()
+    seq = iter([
+        {"enter": True, "wait_seconds": 60, "conviction": 0.5, "reason": "gelişiyor"},
+        {"enter": True, "wait_seconds": 0, "conviction": 0.8, "reason": "net"},
+    ])
+    monkeypatch.setattr(nb, "entry_brain_decision", lambda it, d: next(seq))
+
+    # 1) İlk bakış: bekle → erteleme kaydı, enter False
+    v = nb._brain_for_trade(item, {"side": "long"})
+    assert v["enter"] is False and item.id in nb._brain_due
+
+    # 2) Süre geçmiş gibi yap → recheck maybe_auto_trade çağırır → bu kez net girer
+    nb._brain_due[item.id] = 0.0
+    opened = {"pos": None}
+    monkeypatch.setattr(trader, "maybe_auto_trade",
+                        lambda it, brain=None, **kw: (opened.update(pos=brain(it, {"side": "long"})) or
+                                                      {"side": "long", "symbol": "FOOUSDT", "mode": "paper"}))
+    monkeypatch.setattr(nb, "_trade_context", lambda it: {})
+    monkeypatch.setattr(nb, "notify_remote", lambda m: None)
+    monkeypatch.setattr(nb, "_too_old", lambda it: False)
+    nb._recheck_deferred_entries()
+    assert item.id not in nb._brain_due   # net karar → erteleme temizlendi
+
+
+# ── Küme bağlamı ──────────────────────────────────────────────────────────
+def test_cluster_context_counts_recent_same_coin(monkeypatch):
+    now_iso = nb._now_iso()
+    others = [
+        NewsItem(id="b", source="S", title="t", url="u", published=now_iso, fetched_at=now_iso,
+                 coins=["FOO"], direction="bullish"),
+        NewsItem(id="c", source="S", title="t", url="u", published=now_iso, fetched_at=now_iso,
+                 coins=["FOO"], direction="bearish"),
+        NewsItem(id="d", source="S", title="t", url="u", published=now_iso, fetched_at=now_iso,
+                 coins=["BAR"], direction="bullish"),
+    ]
+    monkeypatch.setattr(nb, "_news", others)
+    out = nb._cluster_context(_news_item())   # item coins=["FOO"], bullish
+    assert out["son_haber"] == 2 and out["ayni_yon"] == 1 and out["ters_yon"] == 1

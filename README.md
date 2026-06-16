@@ -33,7 +33,8 @@ cd dashboard && npm install && npm run dev   # http://localhost:5173
 ### Ortam değişkenleri (`.env`)
 | Değişken | Etki |
 |----------|------|
-| `ANTHROPIC_API_KEY` | Claude ile akıllı haber puanlaması (yoksa kural-tabanlı) |
+| `ANTHROPIC_API_KEY` | Claude ile akıllı haber puanlaması + giriş beyni (yoksa kural-tabanlı, beyin uykuda) |
+| `ENTRY_BRAIN_MODEL` / `ENTRY_BRAIN_ESCALATE_MODEL` | Giriş beyni modeli (vars. `claude-haiku-4-5`) + kararsızda eskalasyon modeli (vars. `claude-sonnet-4-6`) |
 | `BINANCE_API_KEY` / `BINANCE_SECRET` | CANLI işlem (yoksa paper) — para çekme izni KAPALI olmalı |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `DISCORD_WEBHOOK_URL` | Uzak bildirim (telefona sinyal) |
 | `BOTPY_DB` | SQLite yolu (varsayılan `botpy.db`) |
@@ -48,6 +49,19 @@ cd dashboard && npm install && npm run dev   # http://localhost:5173
 - **Çıkış:** SL/TP %, trailing, time-stop dk, breakeven %, kısmi TP %/oran — panelde **"⚡ Haber-trade preset'i"** ile tek tıkla optimal düzen (hızlı breakeven + erken kısmi TP + trailing + 60dk time-stop + tier-1), **"Muhafazakâr"** ile geri dön
 - **Risk:** günlük zarar limiti, toplam/coin maruziyet tavanı, max açık risk, kayıp serisi freni
 - **Sinyal kalitesi:** uyarı eşiği, "zaten-fiyatlanmış" atla (chase önleme), kaybeden kaynağı sustur
+- **Giriş beyni** (`use_entry_brain`): girişin tam anında Claude kararlı son yargı (haber+gövde + canlı fiyat/ATR/funding + orderbook + BTC rejimi + küme + emsal + kendi kalibrasyonu) → gir/bekle/veto + konviksiyon→boyut + SL sıkılığı + time-stop. Eskalasyon (`brain_escalate`, kararsızda Sonnet) + kendini-iyileştirme (`brain_self_improve`, negatif konviksiyon dilimini oto-veto)
+
+### Giriş beynini gerçek veriyle besleme ve doğrulama
+Beyin, **gerçek piyasa+haber akışı** ve birikmiş geçmişle güçlenir. Önerilen sıra (para riske atmadan):
+
+1. **Anahtar:** `.env`'de `ANTHROPIC_API_KEY` (beyin bunsuz uykuda, sadece mekanik çalışır). Canlı işlem için Binance anahtarları **gerekmez** — paper modda tüm beyin/karar yolu çalışır.
+2. **Çalıştır (paper):** `python news_bot.py` — motor RSS + TreeNews WS + Binance fiyatını çeker; güçlü sinyaller `news_signals` arşivine, oto-işlem kapanışları `news_closed_trades` defterine yazılır (restart'a dayanıklı). Birkaç gün biriksin.
+3. **Doğrula — offline:** panelde **🧠 Beyin backtest** (`/brain-backtest`) — arşiv sinyallerini geçmiş fiyatla simüle edip **beyin-girer vs mekanik** ortalama net P&L'i karşılaştırır (`edge_pct`). Pozitif edge = beyin kazananı kaybedenden ayırıyor.
+4. **Doğrula — canlı kalibrasyon:** **🧠 Giriş beyni kalibrasyonu** şeridi (`/brain-scorecard`) — kapanan işlemleri conviction dilimine ayırır; `calibrated` = yüksek konviksiyon daha yüksek P&L üretiyor mu. Yeterli örnek birikince `brain_self_improve` aç → negatif dilim oto-veto edilir.
+5. **Önizleme:** `/auto-preview` ile hangi adayların hangi gerekçeyle açılacağını canlıdan önce gör.
+6. **Canlıya geç:** edge + kalibrasyon olumluysa Binance anahtarı (withdraw kapalı, IP whitelist) + `paper_trading=false`.
+
+> Not: Bulut/uzak ortamda gerçek veri için ağ politikası `api.binance.com`, `fapi.binance.com`, `news.treeofalpha.com`, `api.anthropic.com` hostlarına çıkışa izin vermeli.
 
 ## Panel
 

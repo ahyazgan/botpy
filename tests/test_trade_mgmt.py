@@ -22,7 +22,7 @@ def clean(monkeypatch):
         "skip_already_priced_pct": 0.0, "auto_trade": True, "paper_trading": True,
         "auto_min_impact": 7, "auto_require_confirm": False, "market": "spot",
         "trade_usdt": 100.0, "size_by_impact": False, "max_positions": 20,
-        "cooldown_sec": 0, "stop_loss_pct": 3.0,
+        "cooldown_sec": 0, "stop_loss_pct": 3.0, "use_entry_brain": False,
     }.items():
         setattr(trader.S, k, v)
     yield

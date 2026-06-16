@@ -45,7 +45,7 @@ def pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(nb, "score_item", fake_score)
     monkeypatch.setattr(nb, "confirm_with_price", lambda session, it: None)
     monkeypatch.setattr(nb, "notify", lambda it: None)
-    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it: None)
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it, **kw: None)
 
     yield scores, store
     store.close()
@@ -109,7 +109,7 @@ def test_two_phase_early_notify_and_claude_promote(pipeline, monkeypatch):
     notified: list[str] = []
     traded: list[str] = []
     monkeypatch.setattr(nb, "notify", lambda it: notified.append(it.id))
-    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it: (traded.append(it.id), None)[1])
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it, **kw: (traded.append(it.id), None)[1])
     scores.update({"a": 8, "b": 3})   # kural: a güçlü (erken bildir), b zayıf
 
     def claude(items):
@@ -131,7 +131,7 @@ def test_two_phase_claude_downgrade_heads_up_only(pipeline, monkeypatch):
     notified: list[str] = []
     traded: list[str] = []
     monkeypatch.setattr(nb, "notify", lambda it: notified.append(it.id))
-    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it: (traded.append(it.id), None)[1])
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it, **kw: (traded.append(it.id), None)[1])
     scores.update({"a": 9})            # kural güçlü → erken heads-up
 
     def claude(items):

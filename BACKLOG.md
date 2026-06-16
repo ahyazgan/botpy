@@ -7,6 +7,48 @@
 
 ## Now (üstten alta, ara vermeden)
 
+### Epic: Akıllı oto-trade güçlendirme (haber→otomatik işlem)
+
+- [x] Faz 1 — Güvenlik kapıları (auto_decision)  (cc5be8c)
+  Done when: feed-stale halt (`halt_trade_on_stale`) + latency kapısı (`max_news_age_sec`) +
+  aynı-yön korelasyon limiti (`max_same_direction`); auto_decision/maybe_auto_trade context alır;
+  /auto-preview yansıtır; testler; mypy+ruff+pytest yeşil; commit.
+- [x] Faz 2 — Oto-kalibrasyon (POST /tuning/apply)  (daa8466)
+  Done when: `trader.apply_tuning` öneriyi korkuluklarla uygular (auto_min_impact taban + kaynak
+  susturma); endpoint; testler; yeşil; commit.
+- [x] Faz 3 — Bearish/short (futures funding kapısı)  (7dffbc2)
+  Done when: futures short zaten açık; `max_funding_rate_pct` ile funding'e ters pahalı yönde girme;
+  `get_funding_rate`; testler; yeşil; commit.
+- [x] Faz 4 — ATR volatilite SL/TP  (9a3840f)
+  Done when: confirm'de `atr_pct` hesapla; `use_atr_exits`/`atr_sl_mult`/`atr_tp_mult` ile place_trade
+  dinamik SL/TP; testler; yeşil; commit.
+- [x] Panel kontrolleri — yeni oto-trade ayarları  (44142a1)
+  Done when: güvenlik kapıları/ATR/funding toggle+slider + oto-kalibrasyon "uygula" butonu;
+  tsc+vite build yeşil; commit.
+- [x] Giriş beyni — girişte Claude kararlı son yargı  (122c6bd)
+  Done when: entry_brain_decision (haiku, haber+fiyat+geçmiş+portföy → enter/conviction/veto);
+  maybe_auto_trade beyin kancası (Tier-2'de, refleks atlanır, fail-safe); panel toggle;
+  testler; ruff+mypy+pytest+build yeşil; commit.
+- [x] Giriş beynini derinleştir (emsal + rubrik + çıkış + eskalasyon)  (f7f1a6d)
+  Done when: precedent_stats emsal hafızası; çok-boyutlu rubrik alt-skorlar; sl_tightness/hold_minutes
+  çıkış (place_trade sl_mult + pozisyon-bazlı time-stop); brain_escalate iki-kademeli (haiku→sonnet);
+  pos["brain"] bildirimde; panel eskalasyon toggle; testler; hepsi yeşil; commit.
+- [x] Beyin ileri-seviye (kalibrasyon + BTC rejimi + bekle + küme)  (17942fe)
+  Done when: brain_scorecard + /brain-scorecard + panel şeridi + ctx geri besleme; _btc_regime piyasa
+  rejimi; _cluster_context küme; wait_seconds bekle/izle erteleme (_brain_for_trade + recheck loop);
+  testler; ruff+mypy+pytest+build yeşil; commit.
+- [x] Beyin uzman-seviye (backtest + kendini-iyileştirme + mikroyapı + tam metin)  (ea4ebeb)
+  Done when: /brain-backtest offline replay (beyin vs mekanik edge); brain_self_improve oto-veto+boyut;
+  orderbook_imbalance mikroyapı; NewsItem.body tam metin; panel backtest butonu+self-improve toggle;
+  testler; ruff+mypy+pytest+build yeşil; commit.
+- [x] /auto-preview'a beyin verdikti (canlıdan önce gözlem)
+  Done when: /auto-preview?brain=true entry_brain_decision verdiktini döner; panelde 🧠 Beyin önizleme
+  butonu + tabloda gir/bekle/veto rozeti; testler; yeşil; commit.
+- [x] Beyin karar günlüğü + veto hesap verebilirliği
+  Done when: storage.brain_decisions tablosu + add/list; _log_brain_decision her canlı kararı yazar;
+  /brain-log + /brain-veto-review (vetolanan sinyalleri geçmiş fiyatla sına — kaybedeni mi eledi);
+  panelde 🧪 Veto denetimi; testler; ruff+mypy+pytest+build yeşil; commit.
+
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.
 - [x] Açık pozisyonda canlı SL/TP düzenleme  (da9ffd6)

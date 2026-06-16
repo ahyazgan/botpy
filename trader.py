@@ -32,6 +32,7 @@ from netutil import get_json
 log = logging.getLogger(__name__)
 
 BINANCE_API = "https://api.binance.com/api/v3"
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"   # futures (funding rate)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_state.json")
 
 
@@ -46,12 +47,23 @@ class Settings:
     auto_min_impact: int = 8
     auto_require_confirm: bool = True
     tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
+    use_entry_brain: bool = False    # giriş anında Claude kararlı yargı (Tier-2 adaylarda; refleks atlanır)
+    brain_escalate: bool = False     # kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci bakış
+    brain_self_improve: bool = False # kalibrasyondan öğren: negatif conviction dilimini oto-veto + boyut eğ
     cooldown_sec: int = 1800
+    # Güvenlik kapıları (oto-işlem)
+    halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
+    max_news_age_sec: int = 0          # >0: haber bu kadar saniyeden eskiyse girme (hareket bitti)
+    max_same_direction: int = 0        # >0: aynı yönde açık pozisyon sayısı tavanı (korelasyon riski)
     # Otomatik çıkış
     use_sl_tp: bool = True
     stop_loss_pct: float = 3.0       # -%3'te zarar durdur
     take_profit_pct: float = 6.0     # +%6'da kâr al
     trailing_stop_pct: float = 0.0   # 0 = kapalı; >0 ise kârı takip eden stop
+    # Volatilite-bazlı çıkış (ATR): sabit % yerine coin oynaklığına göre SL/TP
+    use_atr_exits: bool = False      # açıksa SL/TP = çarpan × ATR% (haber teyidinden)
+    atr_sl_mult: float = 1.5         # SL = atr_sl_mult × ATR% ([0.5, 15] kıstırılır)
+    atr_tp_mult: float = 3.0         # TP = atr_tp_mult × ATR% ([1, 30] kıstırılır)
     # Akıllı çıkış yönetimi
     time_stop_min: int = 0           # >0: bu kadar dk sonra hâlâ açıksa kapat (haber edge'i söndü)
     breakeven_pct: float = 0.0       # >0: +%X kâra ulaşınca SL'i girişe çek (kârı koru)
@@ -72,6 +84,7 @@ class Settings:
     suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
     min_source_samples: int = 8      # bir kaynağı yargılamak için gereken min kapanmış işlem
     skip_already_priced_pct: float = 0.0   # >0: 24s'te bu % haber yönünde oynamışsa girme (chase önleme)
+    max_funding_rate_pct: float = 0.0  # >0 (futures): yön funding'e ters & maliyet bu %'yi geçerse girme
 
 
 S = Settings()
@@ -86,13 +99,17 @@ _exchange: Any = None
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
-    "tier1_skip_confirm_impact", "cooldown_sec",
+    "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
+    "brain_self_improve", "cooldown_sec",
+    "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+    "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
+    "max_funding_rate_pct",
 )
 
 
@@ -151,6 +168,46 @@ def get_price(symbol: str) -> float | None:
         return float(data["price"]) if data else None
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def get_funding_rate(symbol: str) -> float | None:
+    """Binance futures anlık funding oranı (% cinsinden, 8 saatlik). Hata/yoksa None.
+
+    Pozitif → longlar shortlara öder (long maliyeti). Negatif → tersi.
+    """
+    data = get_json(f"{BINANCE_FAPI}/premiumIndex", params={"symbol": symbol}, timeout=10)
+    try:
+        return float(data["lastFundingRate"]) * 100 if data else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def orderbook_imbalance(symbol: str, depth: int = 20) -> dict[str, Any] | None:
+    """Emir defteri dengesizliği: üst `depth` seviyede alıcı/satıcı baskınlığı.
+
+    skew ∈ [-1,1]: +1 alıcı baskın (yukarı baskı), -1 satıcı baskın. Veri yoksa None.
+    """
+    book = get_json(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": str(depth)}, timeout=10)
+    if not book:
+        return None
+    try:
+        bid_usd = sum(float(p) * float(q) for p, q in book.get("bids", []))
+        ask_usd = sum(float(p) * float(q) for p, q in book.get("asks", []))
+    except (TypeError, ValueError):
+        return None
+    tot = bid_usd + ask_usd
+    if tot <= 0:
+        return None
+    return {"skew": round((bid_usd - ask_usd) / tot, 3),
+            "bid_usd": round(bid_usd), "ask_usd": round(ask_usd)}
+
+
+def _funding_cost_pct(symbol: str, side: str) -> float | None:
+    """Bu yön için funding MALİYETİ (% — pozitif=ödüyorsun). Veri yoksa None."""
+    fr = get_funding_rate(symbol)
+    if fr is None:
+        return None
+    return fr if side == "long" else -fr
 
 
 def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | None:
@@ -264,6 +321,70 @@ def source_stats(news_source: str) -> dict[str, Any]:
     return {"count": len(rows), "avg_pnl": round(sum(c["pnl"] for c in rows) / len(rows), 2)}
 
 
+def precedent_stats(*, news_source: str | None = None, symbol: str | None = None,
+                    side: str | None = None, limit: int = 10) -> dict[str, Any]:
+    """Emsal: benzer kapanmış işlemlerin gerçek sonucu (kaynak/sembol/yön filtreli).
+
+    Beyne 'bu tür kurulum geçmişte ne yaptı' verir. {n, win_rate, avg_pnl, recent_pnls}.
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None
+                and (news_source is None or c.get("news_source") == news_source)
+                and (symbol is None or c.get("symbol") == symbol)
+                and (side is None or c.get("side") == side)]
+    rows = rows[-limit:]
+    n = len(rows)
+    if not n:
+        return {"n": 0, "win_rate": None, "avg_pnl": None, "recent_pnls": []}
+    wins = sum(1 for c in rows if c["pnl"] > 0)
+    return {"n": n, "win_rate": round(wins / n, 2),
+            "avg_pnl": round(sum(c["pnl"] for c in rows) / n, 2),
+            "recent_pnls": [round(c["pnl"], 2) for c in rows]}
+
+
+_BRAIN_BANDS = (("0-0.5", 0.0, 0.5), ("0.5-0.7", 0.5, 0.7),
+                ("0.7-0.85", 0.7, 0.85), ("0.85-1", 0.85, 1.01))
+
+
+def brain_scorecard() -> dict[str, Any]:
+    """Beyin kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen+kapanan işlemler).
+
+    `calibrated`: yüksek konviksiyon dilimi daha yüksek ort. P&L üretiyor mu (monoton artış).
+    Beyin gerçekten edge katıyor mu ölçer (sadece girilen işlemler; veto'lar görülmez).
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None and isinstance(c.get("brain"), dict)
+                and c["brain"].get("conviction") is not None]
+    bands: list[dict[str, Any]] = []
+    for name, lo, hi in _BRAIN_BANDS:
+        b = [c for c in rows if lo <= float(c["brain"]["conviction"]) < hi]
+        if not b:
+            bands.append({"band": name, "n": 0, "win_rate": None, "avg_pnl": None})
+            continue
+        wins = sum(1 for c in b if c["pnl"] > 0)
+        bands.append({"band": name, "n": len(b), "win_rate": round(wins / len(b), 2),
+                      "avg_pnl": round(sum(c["pnl"] for c in b) / len(b), 2)})
+    filled = [x for x in bands if x["n"] > 0]
+    calibrated: bool | None = None
+    if len(filled) >= 2:
+        calibrated = all(filled[i]["avg_pnl"] <= filled[i + 1]["avg_pnl"]
+                         for i in range(len(filled) - 1))
+    return {"samples": len(rows), "bands": bands, "calibrated": calibrated,
+            "escalated_n": sum(1 for c in rows if c["brain"].get("escalated"))}
+
+
+_BRAIN_SELF_IMPROVE_MIN = 5   # bir conviction dilimini yargılamak için min örnek
+
+
+def _brain_band_stats(conviction: float) -> dict[str, Any] | None:
+    """Verili conviction'ın düştüğü kalibrasyon dilimi (kendini-iyileştirme için)."""
+    sc = brain_scorecard()
+    for (name, lo, hi), band in zip(_BRAIN_BANDS, sc["bands"]):
+        if lo <= conviction < hi:
+            return band
+    return None
+
+
 def _check_risk(symbol: str, usdt: float) -> None:
     """Risk limitlerini ihlal eden işlemde RuntimeError fırlatır."""
     _reset_daily_if_needed()
@@ -320,7 +441,9 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
 
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
-                news_source: str = "", impact: int | None = None) -> dict[str, Any]:
+                news_source: str = "", impact: int | None = None,
+                atr_pct: float | None = None, sl_mult: float = 1.0,
+                time_stop_min: int | None = None) -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -367,19 +490,28 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         if order.get("filled"):
             amount = float(order["filled"]) or amount
 
+    # SL/TP yüzdeleri: sabit (varsayılan) veya volatilite-bazlı (ATR)
+    sl_pct, tp_pct = S.stop_loss_pct, S.take_profit_pct
+    if S.use_atr_exits and atr_pct and atr_pct > 0:
+        sl_pct = max(0.5, min(15.0, S.atr_sl_mult * atr_pct))
+        tp_pct = max(1.0, min(30.0, S.atr_tp_mult * atr_pct))
+    # Giriş beyni çıkış önerisi: SL sıkılığı (tight/normal/wide → sl_mult)
+    if sl_mult != 1.0 and sl_pct > 0:
+        sl_pct = max(0.5, min(15.0, sl_pct * sl_mult))
+
     # SL/TP fiyatları
     sl_price = tp_price = None
     if S.use_sl_tp:
         if is_long:
-            if S.stop_loss_pct > 0:
-                sl_price = round(price * (1 - S.stop_loss_pct / 100), 8)
-            if S.take_profit_pct > 0:
-                tp_price = round(price * (1 + S.take_profit_pct / 100), 8)
+            if sl_pct > 0:
+                sl_price = round(price * (1 - sl_pct / 100), 8)
+            if tp_pct > 0:
+                tp_price = round(price * (1 + tp_pct / 100), 8)
         else:
-            if S.stop_loss_pct > 0:
-                sl_price = round(price * (1 + S.stop_loss_pct / 100), 8)
-            if S.take_profit_pct > 0:
-                tp_price = round(price * (1 - S.take_profit_pct / 100), 8)
+            if sl_pct > 0:
+                sl_price = round(price * (1 + sl_pct / 100), 8)
+            if tp_pct > 0:
+                tp_price = round(price * (1 - tp_pct / 100), 8)
 
     pos = {
         "id": str(uuid.uuid4())[:8],
@@ -400,6 +532,8 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "news_source": news_source,
         "impact": impact,
         "reason": reason,
+        "atr_pct": round(atr_pct, 3) if (S.use_atr_exits and atr_pct) else None,
+        "time_stop_min": int(time_stop_min) if time_stop_min else None,
     }
     with _lock:
         _positions.append(pos)
@@ -659,9 +793,10 @@ def monitor_positions() -> list[dict[str, Any]]:
                 hit = "stop-loss"
             elif tp and cur <= tp:
                 hit = "take-profit"
-        if hit is None and S.time_stop_min > 0:
+        eff_ts = p.get("time_stop_min") or S.time_stop_min   # pozisyon-bazlı (beyin) > global
+        if hit is None and eff_ts and eff_ts > 0:
             opened = _parse_dt(p.get("opened_at"))
-            if opened and (now - opened).total_seconds() >= S.time_stop_min * 60:
+            if opened and (now - opened).total_seconds() >= eff_ts * 60:
                 hit = "time-stop"
         if hit:
             try:
@@ -683,18 +818,34 @@ def _can_auto_trade(symbol: str) -> bool:
     return True
 
 
+def _open_side_count(side: str) -> int:
+    """Şu an aynı yönde (long/short) açık pozisyon sayısı (korelasyon kapısı)."""
+    with _lock:
+        return sum(1 for p in _positions if p["side"] == side)
+
+
 def _size_multiplier(impact: int) -> float:
     """Conviction çarpanı: yüksek güç = büyük pozisyon. 8'de 1.0x, [0.5x, 1.5x] arası."""
     return max(0.5, min(1.5, 1.0 + (impact - 8) * 0.25))
 
 
-def auto_decision(item: Any) -> dict[str, Any]:
+def auto_decision(item: Any, *, feed_stale: bool = False,
+                  news_age_sec: float | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
 
     Global `auto_trade` anahtarını dikkate almaz (kalibrasyon/önizleme için her
     sinyali değerlendirir). Dönen: {would_trade, reason, side, usdt, news_source}.
+
+    `feed_stale`: haber akışı (WS) kopuk mu — güvenlik durdurması için çağıran geçirir.
+    `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
     """
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
+    # Güvenlik kapısı: akış kopukken kör girme (gerçek-zamanlı teyit güvenilmez)
+    if S.halt_trade_on_stale and feed_stale:
+        return no("haber akışı kopuk — güvenlik durdurması")
+    # Güvenlik kapısı: haber çok eskiyse hareket büyük olasılıkla bitmiştir
+    if S.max_news_age_sec > 0 and news_age_sec is not None and news_age_sec > S.max_news_age_sec:
+        return no(f"haber çok eski ({news_age_sec:.0f}s > {S.max_news_age_sec}s)")
     if item.impact < S.auto_min_impact:
         return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
     # Tier-1 "net" haber (hack/ETF/büyük listeleme vb. — yüksek güç): teyit beklemeden
@@ -715,6 +866,9 @@ def auto_decision(item: Any) -> dict[str, Any]:
         return no("spot'ta short yok")
     if not _can_auto_trade(symbol):
         return no("cooldown / limit / zaten açık pozisyon")
+    # Korelasyon kapısı: aynı yönde çok pozisyon = tek bahis (BTC-korele küme riski)
+    if S.max_same_direction > 0 and _open_side_count(side) >= S.max_same_direction:
+        return no(f"aynı yönde pozisyon limiti ({S.max_same_direction})")
     if S.skip_already_priced_pct > 0:
         m = getattr(item, "price_24h_pct", None)
         if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
@@ -725,6 +879,12 @@ def auto_decision(item: Any) -> dict[str, Any]:
         st = source_stats(news_source)
         if st["count"] >= S.min_source_samples and st["avg_pnl"] < 0:
             return no(f"kaynak negatif beklenti ({news_source} avg={st['avg_pnl']})")
+    # Funding kapısı (futures): yön funding'e ters & taşıma maliyeti yüksekse girme.
+    # Yalnız uygun adaylarda 1 ağ çağrısı; spot'ta ya da kapalıyken hiç çağrılmaz.
+    if S.market == "futures" and S.max_funding_rate_pct > 0:
+        cost = _funding_cost_pct(symbol, side)
+        if cost is not None and cost > S.max_funding_rate_pct:
+            return no(f"funding maliyeti yüksek (%{cost:+.3f} > %{S.max_funding_rate_pct})")
     # Boyut: conviction (güce göre) + kayıp serisi freni
     usdt = S.trade_usdt
     if S.size_by_impact:
@@ -735,19 +895,63 @@ def auto_decision(item: Any) -> dict[str, Any]:
             "side": side, "usdt": round(usdt, 2), "news_source": news_source}
 
 
-def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
+def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str, Any] | None:
+    """Giriş beynini güvenli çağır. Hata olursa None (mekanik karar geçerli kalır)."""
+    try:
+        return brain(item, decision)
+    except Exception as e:
+        log.warning("Giriş beyni hatası, mekanik karar geçerli: %s", e)
+        return None
+
+
+def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
+                     news_age_sec: float | None = None,
+                     brain: Any = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
-    d = auto_decision(item)
+    d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec)
     if not d["would_trade"]:
         return None
+    usdt = d["usdt"]
+    verdict: dict[str, Any] | None = None
+    sl_mult = 1.0
+    hold_min: int | None = None
+    # Giriş beyni: mekanik kapıları geçen Tier-2 (refleks olmayan) adayda son yargı.
+    # enter=False → veto; conviction → boyut; sl_tightness/hold_minutes → çıkış. Refleks atlanır.
+    if brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks":
+        verdict = _consult_brain(brain, item, d)
+        if verdict is not None:
+            if not verdict.get("enter", True):
+                log.info("Giriş beyni VETO | %s | %s", item.symbol, verdict.get("reason", ""))
+                return None
+            conv = verdict.get("conviction")
+            if conv is not None:
+                # Kendini-iyileştirme: bu conviction dilimi geçmişte negatifse oto-veto; zayıfsa boyutu kıs
+                if S.brain_self_improve:
+                    band = _brain_band_stats(float(conv))
+                    if band and band["n"] >= _BRAIN_SELF_IMPROVE_MIN and band["avg_pnl"] is not None:
+                        if band["avg_pnl"] < 0:
+                            log.info("Kendini-iyileştirme VETO | %s | konv-dilimi %s negatif (ort %s)",
+                                     item.symbol, band["band"], band["avg_pnl"])
+                            return None
+                        if band["win_rate"] is not None and band["win_rate"] < 0.5:
+                            usdt = round(usdt * 0.75, 2)   # zayıf dilim → boyutu kıs
+                usdt = round(usdt * max(0.5, min(1.5, float(conv) + 0.5)), 2)  # 0.5→1.0x,1.0→1.5x
+            sl_mult = {"tight": 0.6, "wide": 1.5}.get(verdict.get("sl_tightness", "normal"), 1.0)
+            hm = verdict.get("hold_minutes")
+            hold_min = int(hm) if hm and int(hm) > 0 else None
     try:
-        return place_trade(item.symbol, d["side"], usdt=d["usdt"], source="auto",
-                           news_source=d["news_source"], impact=int(item.impact),
-                           reason=getattr(item, "reason", ""))
+        pos = place_trade(item.symbol, d["side"], usdt=usdt, source="auto",
+                          news_source=d["news_source"], impact=int(item.impact),
+                          reason=getattr(item, "reason", ""),
+                          atr_pct=getattr(item, "atr_pct", None),
+                          sl_mult=sl_mult, time_stop_min=hold_min)
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
         return None
+    if verdict is not None:
+        pos["brain"] = verdict   # şeffaflık: konviksiyon + rubrik + gerekçe pozisyonda saklanır
+    return pos
 
 
 # ── Performans ───────────────────────────────────────────────────────────
@@ -1012,6 +1216,36 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
         closed = [c for c in _closed if c.get("pnl") is not None]
     return _suggest_from_trades(closed, value_key="pnl", source_key="news_source",
                                 tier_of=tier_of, unit=" USDT")
+
+
+def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> dict[str, Any]:
+    """Öğrenen beynin önerilerini KORKULUKLARLA uygula (oto-kalibrasyon).
+
+    Yalnızca güvenli ayarları otomatik değiştirir:
+    - `auto_min_impact`: önerilen eşik (tabana [min_impact_floor] ve 10'a kıstırılır)
+    - kaynak susturma: negatif-beklenti önerisi varsa `suppress_losing_sources` aç
+
+    Risk tavanları/boyut/kaldıraç gibi para-büyüklüğü ayarlarına DOKUNMAZ. Yeterli
+    örnek yoksa (`ready=False`) hiçbir şey değiştirmez. Uygulanan değişiklikleri döner.
+    """
+    if not suggestion.get("ready"):
+        return {"applied": False, "reason": "yeterli örnek yok",
+                "samples": suggestion.get("samples", 0), "changes": []}
+    changes: list[dict[str, Any]] = []
+    for s in suggestion.get("suggestions", []):
+        if s["type"] == "auto_min_impact":
+            new = max(min_impact_floor, min(10, int(s["suggested"])))
+            if new != S.auto_min_impact:
+                changes.append({"field": "auto_min_impact", "from": S.auto_min_impact, "to": new})
+                S.auto_min_impact = new
+        elif s["type"] in ("suppress_source", "suppress_tier") and not S.suppress_losing_sources:
+            changes.append({"field": "suppress_losing_sources", "from": False, "to": True})
+            S.suppress_losing_sources = True
+    if changes:
+        with _lock:
+            _save_state()
+        log.info("Oto-kalibrasyon uygulandı: %s", changes)
+    return {"applied": bool(changes), "samples": suggestion.get("samples", 0), "changes": changes}
 
 
 def suggest_from_backtest(results: list[dict[str, Any]], tier_of: Any = None) -> dict[str, Any]:

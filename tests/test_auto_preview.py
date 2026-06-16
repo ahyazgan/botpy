@@ -20,6 +20,8 @@ def env(monkeypatch):
         "trade_usdt": 100.0, "size_by_impact": False, "skip_already_priced_pct": 0.0,
         "suppress_losing_sources": False, "reduce_after_losses": 0, "cooldown_sec": 0,
         "max_positions": 20, "auto_trade": False, "tier1_skip_confirm_impact": 0,
+        "halt_trade_on_stale": True, "max_news_age_sec": 0, "max_same_direction": 0,
+        "max_funding_rate_pct": 0.0,
     }.items():
         setattr(trader.S, k, v)
     monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
@@ -90,6 +92,94 @@ def test_decision_conviction_size(env):
     assert trader.auto_decision(_Item(impact=10))["usdt"] == 150.0
 
 
+# ── Güvenlik kapıları (Faz 1) ────────────────────────────────────────────
+def test_decision_feed_stale_halts(env):
+    """Akış kopukken oto-işlem durur (halt_trade_on_stale)."""
+    d = trader.auto_decision(_Item(impact=10), feed_stale=True)
+    assert d["would_trade"] is False and "kopuk" in d["reason"]
+
+
+def test_decision_feed_stale_ignored_when_disabled(env):
+    trader.S.halt_trade_on_stale = False
+    d = trader.auto_decision(_Item(impact=10), feed_stale=True)
+    assert d["would_trade"] is True
+
+
+def test_decision_news_too_old(env):
+    trader.S.max_news_age_sec = 300
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=600)
+    assert d["would_trade"] is False and "eski" in d["reason"]
+
+
+def test_decision_news_fresh_enough(env):
+    trader.S.max_news_age_sec = 300
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=120)
+    assert d["would_trade"] is True
+
+
+def test_decision_age_gate_off_by_default(env):
+    """max_news_age_sec=0 → yaş yok sayılır (geriye uyumlu)."""
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=99999)
+    assert d["would_trade"] is True
+
+
+def test_decision_same_direction_cap(env):
+    trader.S.max_same_direction = 2
+    monkey = [{"side": "long"}, {"side": "long"}]
+    trader._positions = monkey  # type: ignore[assignment]
+    d = trader.auto_decision(_Item(impact=10, symbol="BARUSDT"))
+    assert d["would_trade"] is False and "aynı yönde" in d["reason"]
+
+
+def test_decision_same_direction_under_cap(env):
+    trader.S.max_same_direction = 2
+    trader._positions = [{"side": "long"}]  # type: ignore[assignment]
+    d = trader.auto_decision(_Item(impact=10, symbol="BARUSDT"))
+    assert d["would_trade"] is True
+
+
+# ── Bearish/short + funding kapısı (Faz 3) ───────────────────────────────
+def test_decision_futures_allows_short(env):
+    """Futures modunda bearish haber short açabilir (spot'ta yasak)."""
+    trader.S.market = "futures"
+    d = trader.auto_decision(_Item(impact=9, direction="bearish"))
+    assert d["would_trade"] is True and d["side"] == "short"
+
+
+def test_decision_funding_gate_blocks_costly_long(env, monkeypatch):
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: 0.10)  # long %0.10 öder
+    d = trader.auto_decision(_Item(impact=9, direction="bullish"))
+    assert d["would_trade"] is False and "funding" in d["reason"]
+
+
+def test_decision_funding_gate_allows_favorable_short(env, monkeypatch):
+    """Pozitif funding'de short funding ALIR (maliyet negatif) → geçer."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: 0.10)  # short maliyeti -0.10
+    d = trader.auto_decision(_Item(impact=9, direction="bearish"))
+    assert d["would_trade"] is True and d["side"] == "short"
+
+
+def test_decision_funding_gate_off_no_network(env, monkeypatch):
+    """Kapalıyken (0) funding ağ çağrısı yapılmaz."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.0
+    monkeypatch.setattr(trader, "get_funding_rate",
+                        lambda s: (_ for _ in ()).throw(AssertionError("çağrılmamalı")))
+    assert trader.auto_decision(_Item(impact=9, direction="bullish"))["would_trade"] is True
+
+
+def test_decision_funding_none_does_not_block(env, monkeypatch):
+    """Funding verisi alınamazsa kapı engellemez (fail-open)."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: None)
+    assert trader.auto_decision(_Item(impact=9, direction="bullish"))["would_trade"] is True
+
+
 def test_decision_is_side_effect_free(env):
     """auto_decision pozisyon açmamalı."""
     trader.auto_decision(_Item(impact=10))
@@ -111,4 +201,30 @@ def test_auto_preview_endpoint(monkeypatch, tmp_path, env):
     assert d["auto_trade_on"] is False
     assert len(d["preview"]) == 1
     assert d["preview"][0]["would_trade"] is True and d["preview"][0]["usdt"] == 100.0
+    assert "brain" not in d["preview"][0]   # brain=false → beyin çalışmaz
+    store.close()
+
+
+def test_auto_preview_brain_verdict(monkeypatch, tmp_path, env):
+    """brain=true → mekanik geçen adayda beyin verdikti döner (yan etkisiz)."""
+    store = Store(str(tmp_path / "apb.db"))
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nb, "_settings_loaded", True)
+    monkeypatch.setattr(nb, "_news_settings", {"alert_threshold": 7, "remote_notify": True})
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    monkeypatch.setattr(nb, "entry_brain_decision",
+                        lambda it, d: {"enter": True, "wait_seconds": 0, "conviction": 0.8,
+                                       "direction": "bullish", "sl_tightness": "normal",
+                                       "hold_minutes": 30, "reason": "temiz", "escalated": False,
+                                       "scores": {"chase_risk": 0.2}})
+    monkeypatch.setattr(nb, "_news", [
+        NewsItem(id="a", source="TreeNews", title="strong", url="u", published=None,
+                 fetched_at="2026-06-14T00:00:00+00:00", coins=["FOO"], impact=9,
+                 direction="bullish", symbol="FOOUSDT", confirmed=True),
+    ])
+    c = TestClient(nb.app)
+    d = c.get("/auto-preview?brain=true").json()
+    assert d["brain_used"] is True
+    assert d["preview"][0]["brain"]["conviction"] == 0.8
+    assert trader._positions == []   # yan etki yok
     store.close()

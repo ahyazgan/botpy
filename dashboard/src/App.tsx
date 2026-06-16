@@ -64,6 +64,9 @@ type Settings = {
   auto_min_impact: number;
   auto_require_confirm: boolean;
   tier1_skip_confirm_impact: number;
+  use_entry_brain: boolean;
+  brain_escalate: boolean;
+  brain_self_improve: boolean;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -85,9 +88,28 @@ type Settings = {
   suppress_losing_sources: boolean;
   min_source_samples: number;
   skip_already_priced_pct: number;
+  halt_trade_on_stale: boolean;
+  max_news_age_sec: number;
+  max_same_direction: number;
+  max_funding_rate_pct: number;
+  use_atr_exits: boolean;
+  atr_sl_mult: number;
+  atr_tp_mult: number;
   has_live_keys: boolean;
   open_exposure_usdt: number;
   realized_today: number;
+};
+
+type BrainBand = { band: string; n: number; win_rate: number | null; avg_pnl: number | null };
+type BrainScorecard = { samples: number; bands: BrainBand[]; calibrated: boolean | null; escalated_n: number };
+type BtSide = { n: number; avg_net_pct: number | null; win_rate: number | null };
+type BrainBacktest = {
+  ready: boolean; reason?: string; tested?: number;
+  mechanical?: BtSide; brain_enter?: BtSide; brain_veto?: BtSide; edge_pct?: number | null;
+};
+type BrainVetoReview = {
+  ready: boolean; reason?: string; n: number;
+  avg_net_pct?: number | null; win_rate?: number | null; verdict?: string;
 };
 
 type Performance = {
@@ -198,6 +220,11 @@ type AutoPreviewRow = {
   reason: string;
   side: string | null;
   usdt: number | null;
+  brain?: {
+    enter: boolean; wait_seconds: number; conviction: number; direction: string;
+    sl_tightness: string; hold_minutes: number; reason: string; escalated: boolean;
+    scores: Record<string, number>;
+  } | null;
 };
 
 type DailySummary = {
@@ -437,11 +464,40 @@ export default function App() {
   const [btResult, setBtResult] = useState<BacktestResult | null>(null);
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
+  const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
+  const [brainBtRunning, setBrainBtRunning] = useState(false);
+  const runBrainBacktest = async () => {
+    setBrainBtRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/brain-backtest`);
+      if (!r.ok) throw new Error(`brain-backtest ${r.status}`);
+      setBrainBt(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Beyin backtest hatası");
+    } finally {
+      setBrainBtRunning(false);
+    }
+  };
+  const [brainVeto, setBrainVeto] = useState<BrainVetoReview | null>(null);
+  const [brainVetoRunning, setBrainVetoRunning] = useState(false);
+  const runBrainVeto = async () => {
+    setBrainVetoRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/brain-veto-review`);
+      if (!r.ok) throw new Error(`brain-veto-review ${r.status}`);
+      setBrainVeto(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Veto denetimi hatası");
+    } finally {
+      setBrainVetoRunning(false);
+    }
+  };
 
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -453,6 +509,7 @@ export default function App() {
         fetch(`${API_BASE}/trades/closed?limit=100`),
         fetch(`${API_BASE}/summary`),
         fetch(`${API_BASE}/tuning`),
+        fetch(`${API_BASE}/brain-scorecard`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -486,6 +543,7 @@ export default function App() {
       }
       if (perfRes.ok) setPerf(await perfRes.json());
       if (tuningRes.ok) setTuning(await tuningRes.json());
+      if (bsRes.ok) setBrainSc(await bsRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -556,6 +614,27 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Ön-bilgi hatası");
     } finally {
       setPretradeRunning(false);
+    }
+  };
+
+  const [tuningApplying, setTuningApplying] = useState(false);
+  const applyTuning = async () => {
+    setTuningApplying(true);
+    try {
+      const r = await fetch(`${API_BASE}/tuning/apply`, { method: "POST" });
+      if (!r.ok) throw new Error(`apply ${r.status}`);
+      const out = await r.json();
+      // ayarları + önerileri tazele
+      const [s, t] = await Promise.all([fetch(`${API_BASE}/settings`), fetch(`${API_BASE}/tuning`)]);
+      if (s.ok) setSettings(await s.json());
+      if (t.ok) setTuning(await t.json());
+      setErr(out.applied
+        ? `Oto-kalibrasyon uygulandı: ${out.changes.map((c: { field: string; to: unknown }) => `${c.field}→${c.to}`).join(", ")}`
+        : "Oto-kalibrasyon: yeterli örnek yok, değişiklik yapılmadı");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Oto-kalibrasyon hatası");
+    } finally {
+      setTuningApplying(false);
     }
   };
 
@@ -652,15 +731,26 @@ export default function App() {
     }
   };
 
+  const [previewBrainRunning, setPreviewBrainRunning] = useState(false);
+  const fetchPreview = async (brain: boolean) => {
+    try {
+      const r = await fetch(`${API_BASE}/auto-preview${brain ? "?brain=true" : ""}`);
+      if (r.ok) setPreview((await r.json()).preview ?? []);
+    } catch {
+      setPreview([]);
+    }
+  };
   const runPreview = async () => {
     setPreviewOn((v) => !v);
-    if (preview === null) {
-      try {
-        const r = await fetch(`${API_BASE}/auto-preview`);
-        if (r.ok) setPreview((await r.json()).preview ?? []);
-      } catch {
-        setPreview([]);
-      }
+    if (preview === null) await fetchPreview(false);
+  };
+  const runPreviewBrain = async () => {
+    setPreviewBrainRunning(true);
+    if (!previewOn) setPreviewOn(true);
+    try {
+      await fetchPreview(true);
+    } finally {
+      setPreviewBrainRunning(false);
     }
   };
 
@@ -832,6 +922,46 @@ export default function App() {
             >
               📊 Güce göre boyut: {settings.size_by_impact ? "AÇIK" : "kapalı"}
             </button>
+            <button
+              type="button"
+              onClick={() => void patchSettings({ use_entry_brain: !settings.use_entry_brain })}
+              title="Giriş beyni: girişin tam anında Claude kararlı yargı (haber+fiyat+geçmiş+portföy). Tier-2 adaylarda çalışır, refleks girişte atlanır."
+              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                settings.use_entry_brain
+                  ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+              }`}
+            >
+              🧠 Giriş beyni: {settings.use_entry_brain ? "AÇIK" : "kapalı"}
+            </button>
+            {settings.use_entry_brain && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ brain_escalate: !settings.brain_escalate })}
+                title="İki-kademeli: kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci derin bakış"
+                className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                  settings.brain_escalate
+                    ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                ⬆️ Eskalasyon: {settings.brain_escalate ? "AÇIK" : "kapalı"}
+              </button>
+            )}
+            {settings.use_entry_brain && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ brain_self_improve: !settings.brain_self_improve })}
+                title="Kendini-iyileştirme: kalibrasyondan öğren — negatif conviction dilimini oto-veto et, zayıf dilimde boyutu kıs"
+                className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                  settings.brain_self_improve
+                    ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🔁 Kendini-iyileştir: {settings.brain_self_improve ? "AÇIK" : "kapalı"}
+              </button>
+            )}
             <div className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-1">
               {(["spot", "futures"] as const).map((m) => (
                 <button
@@ -904,6 +1034,20 @@ export default function App() {
               <NumField label="Kısmi TP % (0=kapalı)" value={settings.partial_tp_pct} onSave={(v) => patchSettings({ partial_tp_pct: v })} />
               <NumField label="Kısmi TP oranı (0-1)" value={settings.partial_tp_frac} onSave={(v) => patchSettings({ partial_tp_frac: v })} />
               <NumField label="Tier-1 refleks güç (0=kapalı)" value={settings.tier1_skip_confirm_impact} onSave={(v) => patchSettings({ tier1_skip_confirm_impact: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ use_atr_exits: !settings.use_atr_exits })}
+                title="SL/TP'yi sabit % yerine coin oynaklığına (ATR) göre ölçekle"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.use_atr_exits ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                ATR çıkış (volatilite SL/TP): {settings.use_atr_exits ? "AÇIK" : "kapalı"}
+              </button>
+              {settings.use_atr_exits && (
+                <>
+                  <NumField label="ATR SL çarpanı" value={settings.atr_sl_mult} onSave={(v) => patchSettings({ atr_sl_mult: v })} />
+                  <NumField label="ATR TP çarpanı" value={settings.atr_tp_mult} onSave={(v) => patchSettings({ atr_tp_mult: v })} />
+                </>
+              )}
               <div className="flex gap-2 pt-1">
                 <button type="button" onClick={() => void applyPreset("news")}
                   className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/50">
@@ -948,6 +1092,20 @@ export default function App() {
                 Kaybeden kaynağı sustur: {settings.suppress_losing_sources ? "AÇIK" : "kapalı"}
               </button>
               <NumField label="Min. kaynak örneği" value={settings.min_source_samples} onSave={(v) => patchSettings({ min_source_samples: v })} />
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-rose-400/80">Güvenlik kapıları</p>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ halt_trade_on_stale: !settings.halt_trade_on_stale })}
+                title="Haber akışı (WS) kopukken yeni oto-işlem açma — kör giriş önleme"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.halt_trade_on_stale ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                Akış kopukken durdur: {settings.halt_trade_on_stale ? "AÇIK" : "kapalı"}
+              </button>
+              <NumField label="Max haber yaşı sn (0=kapalı)" value={settings.max_news_age_sec} onSave={(v) => patchSettings({ max_news_age_sec: v })} />
+              <NumField label="Aynı yönde max pozisyon (0=kapalı)" value={settings.max_same_direction} onSave={(v) => patchSettings({ max_same_direction: v })} />
+              <NumField label="Max funding % futures (0=kapalı)" value={settings.max_funding_rate_pct} onSave={(v) => patchSettings({ max_funding_rate_pct: v })} />
             </div>
           </div>
         )}
@@ -1384,16 +1542,117 @@ export default function App() {
             🧠 Öğrenen beyin
             <span className="ml-2 text-sm font-normal text-zinc-500">(öneri — otomatik uygulanmaz)</span>
           </h2>
-          <button
-            type="button"
-            onClick={() => void runPretrade()}
-            disabled={pretradeRunning}
-            title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
-            className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
-          >
-            {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void applyTuning()}
+              disabled={tuningApplying}
+              title="Önerileri korkuluklarla otomatik uygula: auto_min_impact tabana kıstırılır + negatif kaynak susturulur (risk/boyut ayarlarına dokunmaz)"
+              className="rounded-md border border-amber-500/40 bg-amber-950/40 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
+            >
+              {tuningApplying ? "Uygulanıyor…" : "🤖 Oto-kalibrasyonu uygula"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void runPretrade()}
+              disabled={pretradeRunning}
+              title="Arşivlenmiş sinyalleri gerçekçi maliyetlerle backtest edip eşik önerisi çıkar — gerçek para riske atmadan, ilk işlemden akıllı"
+              className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
+            >
+              {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void runBrainBacktest()}
+              disabled={brainBtRunning}
+              title="Arşiv sinyallerini geçmiş fiyatlarla simüle edip beynin gir/veto kararını mekanik tabanla karşılaştır — beyin edge katıyor mu (ağ-yoğun)"
+              className="rounded-md border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200 hover:bg-violet-900/50 disabled:opacity-50"
+            >
+              {brainBtRunning ? "Replay…" : "🧠 Beyin backtest"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void runBrainVeto()}
+              disabled={brainVetoRunning}
+              title="Beynin vetoladığı/beklettiği sinyalleri geçmiş fiyatla sına — vetolar kaybedeni mi eledi (avg net < 0 = doğru)"
+              className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-1 text-xs font-semibold text-rose-200 hover:bg-rose-900/50 disabled:opacity-50"
+            >
+              {brainVetoRunning ? "Sınanıyor…" : "🧪 Veto denetimi"}
+            </button>
+          </div>
         </div>
+
+        {/* Veto denetimi: vetolanan sinyaller gerçekten kaybettirir miydi */}
+        {brainVeto && (
+          <div className="mb-3 rounded-2xl border border-rose-500/30 bg-rose-950/20 px-4 py-3 text-sm">
+            {!brainVeto.ready ? (
+              <p className="text-zinc-500">{brainVeto.reason ?? "Yetersiz veri."}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-4">
+                <span className="text-xs font-semibold uppercase tracking-wider text-rose-300/80">🧪 Veto denetimi</span>
+                <span className="text-zinc-400">{brainVeto.n} vetolanmış sinyal</span>
+                <span>Simüle ort. net: <b className={`tabular-nums ${(brainVeto.avg_net_pct ?? 0) < 0 ? "text-emerald-300" : "text-red-300"}`}>{brainVeto.avg_net_pct ?? "—"}%</b></span>
+                <span className="text-zinc-500">{brainVeto.win_rate ?? "—"}% kazanırdı</span>
+                <span className={`rounded px-2 py-0.5 font-semibold ${(brainVeto.avg_net_pct ?? 0) < 0 ? "bg-emerald-900/50 text-emerald-200" : "bg-red-900/50 text-red-200"}`}>
+                  {brainVeto.verdict}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Beyin backtest: beyin vs mekanik (offline replay) */}
+        {brainBt && (
+          <div className="mb-3 rounded-2xl border border-violet-500/30 bg-violet-950/20 px-4 py-3 text-sm">
+            {!brainBt.ready ? (
+              <p className="text-zinc-500">{brainBt.reason ?? "Yetersiz arşiv."}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-4">
+                <span className="text-xs font-semibold uppercase tracking-wider text-violet-300/80">🧠 Beyin backtest</span>
+                <span className="text-zinc-400">{brainBt.tested} sinyal</span>
+                <span>Mekanik: <b className="tabular-nums">{brainBt.mechanical?.avg_net_pct ?? "—"}%</b> · {brainBt.mechanical?.win_rate ?? "—"}% ({brainBt.mechanical?.n})</span>
+                <span>Beyin girer: <b className="tabular-nums text-emerald-300">{brainBt.brain_enter?.avg_net_pct ?? "—"}%</b> · {brainBt.brain_enter?.win_rate ?? "—"}% ({brainBt.brain_enter?.n})</span>
+                <span className="text-zinc-500">Veto: {brainBt.brain_veto?.avg_net_pct ?? "—"}% ({brainBt.brain_veto?.n})</span>
+                {brainBt.edge_pct != null && (
+                  <span className={`rounded px-2 py-0.5 font-semibold ${brainBt.edge_pct >= 0 ? "bg-emerald-900/50 text-emerald-200" : "bg-red-900/50 text-red-200"}`}>
+                    Edge {brainBt.edge_pct >= 0 ? "+" : ""}{brainBt.edge_pct}%
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Giriş beyni kalibrasyonu: conviction dilimi → gerçek isabet */}
+        {brainSc && brainSc.samples > 0 && (
+          <div className="mb-3 rounded-2xl border border-violet-500/30 bg-violet-950/20 px-4 py-3">
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-semibold uppercase tracking-wider text-violet-300/80">🧠 Giriş beyni kalibrasyonu</span>
+              <span className="text-zinc-500">{brainSc.samples} işlem · {brainSc.escalated_n} eskalasyon</span>
+              <span className={`rounded px-2 py-0.5 font-semibold ${
+                brainSc.calibrated === true ? "bg-emerald-900/50 text-emerald-200"
+                  : brainSc.calibrated === false ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-400"}`}>
+                {brainSc.calibrated === true ? "✓ kalibre (konv↑ → P&L↑)"
+                  : brainSc.calibrated === false ? "✗ kalibre değil" : "yetersiz veri"}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {brainSc.bands.map((b) => (
+                <div key={b.band} className="rounded-lg border border-white/10 bg-zinc-900/50 px-2 py-1.5 text-center">
+                  <div className="text-[10px] uppercase text-zinc-500">konv {b.band}</div>
+                  {b.n > 0 ? (
+                    <div className="text-sm font-semibold tabular-nums">
+                      <span className={(b.avg_pnl ?? 0) >= 0 ? "text-emerald-300" : "text-red-300"}>
+                        {(b.avg_pnl ?? 0) >= 0 ? "+" : ""}{b.avg_pnl}
+                      </span>
+                      <span className="text-zinc-500"> · {Math.round((b.win_rate ?? 0) * 100)}% · {b.n}</span>
+                    </div>
+                  ) : <div className="text-sm text-zinc-600">—</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Canlı: kapanan gerçek işlemlerden */}
         {tuning && tuning.ready && tuning.suggestions.length > 0 && (
@@ -1783,13 +2042,24 @@ export default function App() {
 
       {/* Oto-işlem önizleme (dry-run) */}
       <section className="mx-auto mt-10 max-w-5xl">
-        <button
-          type="button"
-          onClick={() => void runPreview()}
-          className="mb-3 text-lg font-semibold text-white transition hover:text-zinc-300"
-        >
-          Oto-işlem önizleme <span className="ml-1 text-sm font-normal text-zinc-500">(dry-run) {previewOn ? "▾" : "▸"}</span>
-        </button>
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void runPreview()}
+            className="text-lg font-semibold text-white transition hover:text-zinc-300"
+          >
+            Oto-işlem önizleme <span className="ml-1 text-sm font-normal text-zinc-500">(dry-run) {previewOn ? "▾" : "▸"}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void runPreviewBrain()}
+            disabled={previewBrainRunning}
+            title="Mekanik geçen adaylarda giriş beyni verdiktini de çalıştır (gir/bekle/veto + konviksiyon) — canlıdan önce beyni gözlemle (ağ-yoğun)"
+            className="rounded-md border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200 hover:bg-violet-900/50 disabled:opacity-50"
+          >
+            {previewBrainRunning ? "Beyin değerlendiriyor…" : "🧠 Beyin önizleme"}
+          </button>
+        </div>
         {previewOn && (
           preview === null ? (
             <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Yükleniyor…</p>
@@ -1810,20 +2080,33 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {preview.map((p) => (
+                    {preview.map((p) => {
+                      const verdict = p.brain
+                        ? (p.brain.wait_seconds > 0 ? "bekle" : p.brain.enter ? "girer" : "veto")
+                        : null;
+                      return (
                       <tr key={p.id} className="border-b border-white/5 hover:bg-white/[0.03]">
                         <td className="px-4 py-3">
                           <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${p.would_trade ? "bg-emerald-950/60 text-emerald-300" : "bg-zinc-800/60 text-zinc-500"}`}>
                             {p.would_trade ? `${p.side === "long" ? "LONG" : "SHORT"} açar` : "atlar"}
                           </span>
+                          {p.brain && (
+                            <span className={`ml-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
+                              verdict === "girer" ? "bg-violet-900/60 text-violet-200"
+                                : verdict === "bekle" ? "bg-amber-900/50 text-amber-200" : "bg-red-900/50 text-red-200"}`}
+                              title={p.brain.reason}>
+                              🧠 {verdict} {(p.brain.conviction).toFixed(2)}{p.brain.escalated ? " ⬆️" : ""}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3 tabular-nums text-zinc-400">{p.impact}/10</td>
                         <td className="px-4 py-3 font-semibold text-zinc-200">{p.symbol ?? "—"}</td>
                         <td className="px-4 py-3 tabular-nums text-zinc-400">{p.usdt !== null ? `$${p.usdt}` : "—"}</td>
-                        <td className="px-4 py-3 text-xs text-zinc-400">{p.reason}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{p.brain ? p.brain.reason : p.reason}</td>
                         <td className="px-4 py-3 max-w-xs truncate text-xs text-zinc-500" title={p.title}>{p.title}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

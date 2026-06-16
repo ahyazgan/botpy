@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import trader
@@ -30,6 +32,7 @@ def env(monkeypatch):
         "max_positions": 20, "tier1_skip_confirm_impact": 0, "halt_trade_on_stale": False,
         "max_news_age_sec": 0, "max_same_direction": 0, "suppress_losing_sources": False,
         "skip_already_priced_pct": 0.0, "max_funding_rate_pct": 0.0, "brain_escalate": False,
+        "brain_self_improve": False,
     }.items():
         setattr(trader.S, k, v)
     yield captured
@@ -118,6 +121,45 @@ def test_brain_verdict_stored_on_position(env):
     assert pos["brain"]["conviction"] == 0.7 and "scores" in pos["brain"]
 
 
+def test_self_improve_vetoes_negative_band(env, monkeypatch):
+    """Kendini-iyileştirme: conviction diliminin geçmişi negatifse oto-veto."""
+    trader.S.brain_self_improve = True
+    monkeypatch.setattr(trader, "brain_scorecard", lambda: {"bands": [
+        {"band": "0-0.5", "n": 0, "win_rate": None, "avg_pnl": None},
+        {"band": "0.5-0.7", "n": 8, "win_rate": 0.3, "avg_pnl": -1.5},  # negatif dilim
+        {"band": "0.7-0.85", "n": 0, "win_rate": None, "avg_pnl": None},
+        {"band": "0.85-1", "n": 0, "win_rate": None, "avg_pnl": None},
+    ]})
+    brain = lambda it, d: {"enter": True, "conviction": 0.6, "reason": "x"}  # noqa: E731
+    assert trader.maybe_auto_trade(_Item(), brain=brain) is None
+
+
+def test_self_improve_allows_positive_band(env, monkeypatch):
+    trader.S.brain_self_improve = True
+    monkeypatch.setattr(trader, "brain_scorecard", lambda: {"bands": [
+        {"band": "0-0.5", "n": 0, "win_rate": None, "avg_pnl": None},
+        {"band": "0.5-0.7", "n": 8, "win_rate": 0.7, "avg_pnl": 3.0},   # pozitif
+        {"band": "0.7-0.85", "n": 0, "win_rate": None, "avg_pnl": None},
+        {"band": "0.85-1", "n": 0, "win_rate": None, "avg_pnl": None},
+    ]})
+    brain = lambda it, d: {"enter": True, "conviction": 0.6, "reason": "x"}  # noqa: E731
+    assert trader.maybe_auto_trade(_Item(), brain=brain) is not None
+
+
+# ── trader.orderbook_imbalance (mikroyapı) ────────────────────────────────
+def test_orderbook_imbalance_skew(monkeypatch):
+    book = {"bids": [["100", "3"], ["99", "1"]], "asks": [["101", "1"], ["102", "1"]]}
+    monkeypatch.setattr(trader, "get_json", lambda *a, **k: book)
+    out = trader.orderbook_imbalance("FOOUSDT")
+    # bid_usd=300+99=399, ask_usd=101+102=203 → skew=(399-203)/602≈0.326
+    assert out["skew"] > 0.3 and out["bid_usd"] == 399 and out["ask_usd"] == 203
+
+
+def test_orderbook_imbalance_none_on_empty(monkeypatch):
+    monkeypatch.setattr(trader, "get_json", lambda *a, **k: None)
+    assert trader.orderbook_imbalance("FOOUSDT") is None
+
+
 # ── news_bot.entry_brain_decision (Claude çağrısı mock'lu) ────────────────
 import news_bot as nb  # noqa: E402
 from news_bot import NewsItem  # noqa: E402
@@ -167,6 +209,7 @@ def claude(monkeypatch):
     monkeypatch.setattr(trader, "precedent_stats", lambda **kw: {"n": 3, "win_rate": 0.67,
                                                                  "avg_pnl": 2.0, "recent_pnls": [4, 6, -2]})
     monkeypatch.setattr(trader, "brain_scorecard", lambda: {"samples": 0, "bands": [], "calibrated": None})
+    monkeypatch.setattr(trader, "orderbook_imbalance", lambda s, **kw: {"skew": 0.1, "bid_usd": 1, "ask_usd": 1})
     monkeypatch.setattr(nb, "_btc_regime", lambda: {"btc_24s_pct": 1.0, "btc_1s_pct": 0.2, "rejim": "nötr"})
     monkeypatch.setattr(trader.S, "brain_escalate", False)
     yield monkeypatch
@@ -209,6 +252,30 @@ def test_entry_brain_no_escalate_outside_band(claude):
 def test_entry_brain_none_without_claude(monkeypatch):
     monkeypatch.setattr(nb, "USE_CLAUDE", False)
     assert nb.entry_brain_decision(_news_item(), {"side": "long", "usdt": 100.0}) is None
+
+
+def test_entry_brain_backtest_skips_live_inputs(claude):
+    """backtest=True → orderbook/BTC-rejimi/küme çağrılmaz (geçmişe kurulamaz)."""
+    claude.setattr(trader, "orderbook_imbalance",
+                   lambda *a, **k: (_ for _ in ()).throw(AssertionError("orderbook çağrılmamalı")))
+    claude.setattr(nb, "_btc_regime", lambda: (_ for _ in ()).throw(AssertionError("rejim çağrılmamalı")))
+    cl = _fake_client(_dec(conviction=0.8))
+    claude.setattr(nb, "_get_anthropic", lambda: cl)
+    out = nb.entry_brain_decision(_news_item(), {"side": "long", "usdt": 100.0}, backtest=True)
+    assert out["enter"] is True
+    # ctx'te mikroyapı/rejim None gönderildi
+    sent = json.loads(cl.calls[0]["messages"][0]["content"])
+    assert sent["mikroyapi"] is None and sent["piyasa_rejimi"] is None
+
+
+# ── Beyin backtest yardımcıları ───────────────────────────────────────────
+def test_bt_summary_and_item_from_bt():
+    s = nb._bt_summary([2.0, -1.0, 3.0])
+    assert s["n"] == 3 and s["avg_net_pct"] == 1.333 and s["win_rate"] == 66.7
+    assert nb._bt_summary([])["n"] == 0
+    it = nb._item_from_bt({"symbol": "FOOUSDT", "direction": "bullish", "impact": 9,
+                           "source": "Binance", "title": "x", "time": 123})
+    assert it.symbol == "FOOUSDT" and it.coins == ["FOO"] and it.direction == "bullish"
 
 
 # ── trader.precedent_stats ────────────────────────────────────────────────

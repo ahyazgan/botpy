@@ -66,6 +66,7 @@ type Settings = {
   tier1_skip_confirm_impact: number;
   use_entry_brain: boolean;
   brain_escalate: boolean;
+  brain_self_improve: boolean;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -101,6 +102,11 @@ type Settings = {
 
 type BrainBand = { band: string; n: number; win_rate: number | null; avg_pnl: number | null };
 type BrainScorecard = { samples: number; bands: BrainBand[]; calibrated: boolean | null; escalated_n: number };
+type BtSide = { n: number; avg_net_pct: number | null; win_rate: number | null };
+type BrainBacktest = {
+  ready: boolean; reason?: string; tested?: number;
+  mechanical?: BtSide; brain_enter?: BtSide; brain_veto?: BtSide; edge_pct?: number | null;
+};
 
 type Performance = {
   total_trades: number;
@@ -450,6 +456,20 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
+  const [brainBtRunning, setBrainBtRunning] = useState(false);
+  const runBrainBacktest = async () => {
+    setBrainBtRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/brain-backtest`);
+      if (!r.ok) throw new Error(`brain-backtest ${r.status}`);
+      setBrainBt(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Beyin backtest hatası");
+    } finally {
+      setBrainBtRunning(false);
+    }
+  };
 
   const load = useCallback(async () => {
     setErr(null);
@@ -892,6 +912,20 @@ export default function App() {
                 }`}
               >
                 ⬆️ Eskalasyon: {settings.brain_escalate ? "AÇIK" : "kapalı"}
+              </button>
+            )}
+            {settings.use_entry_brain && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ brain_self_improve: !settings.brain_self_improve })}
+                title="Kendini-iyileştirme: kalibrasyondan öğren — negatif conviction dilimini oto-veto et, zayıf dilimde boyutu kıs"
+                className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                  settings.brain_self_improve
+                    ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🔁 Kendini-iyileştir: {settings.brain_self_improve ? "AÇIK" : "kapalı"}
               </button>
             )}
             <div className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-1">
@@ -1493,8 +1527,39 @@ export default function App() {
             >
               {pretradeRunning ? "Hesaplanıyor…" : "🔮 İşlemsiz ön-bilgi (backtest)"}
             </button>
+            <button
+              type="button"
+              onClick={() => void runBrainBacktest()}
+              disabled={brainBtRunning}
+              title="Arşiv sinyallerini geçmiş fiyatlarla simüle edip beynin gir/veto kararını mekanik tabanla karşılaştır — beyin edge katıyor mu (ağ-yoğun)"
+              className="rounded-md border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200 hover:bg-violet-900/50 disabled:opacity-50"
+            >
+              {brainBtRunning ? "Replay…" : "🧠 Beyin backtest"}
+            </button>
           </div>
         </div>
+
+        {/* Beyin backtest: beyin vs mekanik (offline replay) */}
+        {brainBt && (
+          <div className="mb-3 rounded-2xl border border-violet-500/30 bg-violet-950/20 px-4 py-3 text-sm">
+            {!brainBt.ready ? (
+              <p className="text-zinc-500">{brainBt.reason ?? "Yetersiz arşiv."}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-4">
+                <span className="text-xs font-semibold uppercase tracking-wider text-violet-300/80">🧠 Beyin backtest</span>
+                <span className="text-zinc-400">{brainBt.tested} sinyal</span>
+                <span>Mekanik: <b className="tabular-nums">{brainBt.mechanical?.avg_net_pct ?? "—"}%</b> · {brainBt.mechanical?.win_rate ?? "—"}% ({brainBt.mechanical?.n})</span>
+                <span>Beyin girer: <b className="tabular-nums text-emerald-300">{brainBt.brain_enter?.avg_net_pct ?? "—"}%</b> · {brainBt.brain_enter?.win_rate ?? "—"}% ({brainBt.brain_enter?.n})</span>
+                <span className="text-zinc-500">Veto: {brainBt.brain_veto?.avg_net_pct ?? "—"}% ({brainBt.brain_veto?.n})</span>
+                {brainBt.edge_pct != null && (
+                  <span className={`rounded px-2 py-0.5 font-semibold ${brainBt.edge_pct >= 0 ? "bg-emerald-900/50 text-emerald-200" : "bg-red-900/50 text-red-200"}`}>
+                    Edge {brainBt.edge_pct >= 0 ? "+" : ""}{brainBt.edge_pct}%
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Giriş beyni kalibrasyonu: conviction dilimi → gerçek isabet */}
         {brainSc && brainSc.samples > 0 && (

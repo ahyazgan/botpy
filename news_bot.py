@@ -157,6 +157,7 @@ class NewsItem:
     url: str
     published: str | None
     fetched_at: str
+    body: str = ""                  # haber gövdesi/özeti (beyin nüans için; başlıktan fazlası)
     # puanlama sonuçları
     coins: list[str] = field(default_factory=list)
     impact: int = 0                 # 1-10
@@ -195,6 +196,14 @@ class NewsItem:
             "confirmed": self.confirmed,
             "price_note": self.price_note,
         }
+
+
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _strip_html(s: str) -> str:
+    """Kaba HTML temizliği (RSS özetleri sıklıkla HTML içerir)."""
+    return _HTML_TAG.sub(" ", s).replace("&nbsp;", " ").strip()
 
 
 def _news_id(source: str, url: str, title: str) -> str:
@@ -297,6 +306,7 @@ def fetch_rss(name: str, url: str) -> list[NewsItem]:
         published = None
         if getattr(e, "published", None):
             published = str(e.published)
+        summary = getattr(e, "summary", None) or getattr(e, "description", None) or ""
         items.append(
             NewsItem(
                 id=_news_id(name, link, title),
@@ -305,6 +315,7 @@ def fetch_rss(name: str, url: str) -> list[NewsItem]:
                 url=link,
                 published=published,
                 fetched_at=_now_iso(),
+                body=_strip_html(str(summary))[:1000],
             )
         )
     return items
@@ -660,7 +671,9 @@ _ENTRY_BRAIN_SYSTEM = (
     "BTC rejimi).\n"
     "Emsal (recent_pnls/win_rate) ve kendi kalibrasyonuna AĞIRLIK ver — prior değil gerçek veri. "
     "Piyasa rejimi 'risk-off' iken alt-coin long'a temkinli ol; 'risk-on' iken cesur. "
-    "Küme: aynı coine zaten girilmiş/çok haber varsa kümülatif etki azalır.\n"
+    "Küme: aynı coine zaten girilmiş/çok haber varsa kümülatif etki azalır. "
+    "Mikroyapı (orderbook skew): +ise alıcı baskın (long lehine), -ise satıcı baskın; yön ile "
+    "çelişiyorsa temkinli ol. Haber gövdesi (varsa) başlıktaki belirsizliği netleştirir.\n"
     "- enter: yüksek risk/negatif emsalde false ile VETO et\n"
     "- wait_seconds: kurulum HENÜZ net değil ama gelişiyorsa (ör. fiyat henüz teyit etmedi, "
     "spike oturuyor) 0 yerine 30-180 ver → enter=false, sonra yeniden bakılır. Net ise 0.\n"
@@ -734,11 +747,13 @@ def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
     return resp.parsed_output
 
 
-def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, Any] | None:
+def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
+                         backtest: bool = False) -> dict[str, Any] | None:
     """Giriş anında Claude kararlı yargı. None = beyin yok/başarısız (mekanik karar geçerli).
 
     `decision`: trader.auto_decision çıktısı (side, usdt, news_source). Yan etkisiz.
-    Emsal hafızası + çok-boyutlu rubrik + çıkış önerisi + (kararsızda) iki-kademeli eskalasyon.
+    Emsal + rubrik + çıkış önerisi + (kararsızda) eskalasyon + mikroyapı/rejim/küme/tam-metin.
+    `backtest=True`: canlı-anlık girdileri (orderbook/rejim/küme) atla — offline replay için.
     """
     if not USE_CLAUDE:
         return None
@@ -748,8 +763,8 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
     ctx = {
         "haber": {
             "kaynak": src, "kaynak_tier": _source_tier(src),
-            "baslik": item.title[:200], "guc": item.impact,
-            "yon": item.direction, "gerekce": item.reason[:160],
+            "baslik": item.title[:200], "govde": (item.body or "")[:600],
+            "guc": item.impact, "yon": item.direction, "gerekce": item.reason[:160],
             "coin": item.symbol, "yas_sn": round(_news_age_sec(item) or 0),
         },
         "fiyat": {
@@ -757,13 +772,15 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
             "deg_1s_pct": item.price_60m_pct, "hacim_usd": item.volume_usd,
             "atr_pct": item.atr_pct, "teyitli": item.confirmed, "not": item.price_note[:160],
         },
+        "mikroyapi": (None if backtest or not item.symbol
+                      else trader.orderbook_imbalance(item.symbol)),
         "kaynak_gecmisi": {"kapanmis_islem": st["count"], "ort_pnl_usdt": st["avg_pnl"]},
         "emsal": {
             "kaynak_geneli": trader.precedent_stats(news_source=src),
             "ayni_coin_yon": trader.precedent_stats(symbol=item.symbol, side=side),
         },
-        "piyasa_rejimi": _btc_regime(),
-        "kume": _cluster_context(item),
+        "piyasa_rejimi": None if backtest else _btc_regime(),
+        "kume": {"son_haber": 0, "ayni_yon": 0, "ters_yon": 0} if backtest else _cluster_context(item),
         "beyin_kalibrasyon": trader.brain_scorecard(),
         "portfoy": {"ayni_yonde_acik": trader._open_side_count(side), "yon": side},
     }
@@ -1385,6 +1402,7 @@ def parse_tree_message(raw: str) -> NewsItem | None:
             coins.extend(str(c).upper() for c in v if c)
     coins = list(dict.fromkeys(coins))  # tekilleştir, sırayı koru
 
+    _body = data.get("body") or data.get("description") or ""
     item = NewsItem(
         id=_news_id(f"Tree:{src}", url or tid, title),
         source=f"⚡{src}",
@@ -1392,6 +1410,7 @@ def parse_tree_message(raw: str) -> NewsItem | None:
         url=url,
         published=published,
         fetched_at=_now_iso(),
+        body=_strip_html(str(_body))[:1000] if str(_body).strip() != title else "",
     )
     item.coins = coins  # ipucu; puanlayıcı gerekirse günceller
     return item
@@ -1962,6 +1981,7 @@ class SettingsPatch(BaseModel):
     tier1_skip_confirm_impact: int | None = None
     use_entry_brain: bool | None = None
     brain_escalate: bool | None = None
+    brain_self_improve: bool | None = None
     cooldown_sec: int | None = None
     halt_trade_on_stale: bool | None = None
     max_news_age_sec: int | None = None
@@ -2049,6 +2069,62 @@ def brain_scorecard() -> dict[str, Any]:
     """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).
     `calibrated` = yüksek konviksiyon daha yüksek ort. P&L üretiyor mu (beyin edge katıyor mu)."""
     return trader.brain_scorecard()
+
+
+def _item_from_bt(r: dict[str, Any]) -> NewsItem:
+    """Backtest sonucundan beyin için minimal NewsItem kur (fiyat alanları yok — arşiv kısıtı)."""
+    sym = r["symbol"]
+    return NewsItem(id=str(r.get("time", "")), source=r.get("source", "?"),
+                    title=r.get("title", ""), url="", published=None, fetched_at=_now_iso(),
+                    coins=[sym.replace("USDT", "")], impact=int(r.get("impact", 0)),
+                    direction=r.get("direction", "neutral"), symbol=sym, confirmed=True)
+
+
+def _bt_summary(xs: list[float]) -> dict[str, Any]:
+    if not xs:
+        return {"n": 0, "avg_net_pct": None, "win_rate": None}
+    return {"n": len(xs), "avg_net_pct": round(sum(xs) / len(xs), 3),
+            "win_rate": round(sum(1 for x in xs if x > 0) / len(xs) * 100, 1)}
+
+
+@app.get("/brain-backtest")
+def brain_backtest(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 40,
+                   sl: float | None = None, tp: float | None = None, fee: float = 0.2) -> dict[str, Any]:
+    """OFFLINE beyin replay: arşiv sinyallerini geçmiş fiyatlarla simüle edip beynin
+    gir/veto kararıyla mekanik tabanı karşılaştırır → beyin edge katıyor mu (para riske atmadan).
+
+    Kısıt: canlı-anlık girdiler (orderbook/BTC-rejimi/küme) geçmişe yeniden kurulamaz → atlanır;
+    bu, haber+emsal+kalibrasyon yargısının kazananı kaybedenden AYIRMA gücünü ölçer. Ağ-yoğun
+    (sinyal başına 1 Claude çağrısı); aynı anda tek koşar."""
+    if not USE_CLAUDE:
+        return {"ready": False, "reason": "Claude yok (ANTHROPIC_API_KEY ayarla)"}
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        cands = nbt._signals_from_rows(rows)
+        if not cands:
+            return {"ready": False, "reason": "arşiv boş veya sinyaller çok yeni", "tested": 0}
+        signals = nbt.prefetch(cands, int(hours * 60))
+        if not signals:
+            return {"ready": False, "reason": "fiyat verisi indirilemedi (Binance)", "tested": 0}
+        sl_v = sl if sl is not None else trader.S.stop_loss_pct
+        tp_v = tp if tp is not None else trader.S.take_profit_pct
+        results = nbt.simulate_all(signals, sl_v, tp_v, fee)
+        enter_net: list[float] = []
+        veto_net: list[float] = []
+        for r in results:
+            side = "long" if r["direction"] == "bullish" else "short"
+            v = entry_brain_decision(_item_from_bt(r),
+                                     {"side": side, "usdt": 100.0, "news_source": r.get("source", "")},
+                                     backtest=True)
+            entered = bool(v and v.get("enter") and not (v.get("wait_seconds", 0) > 0))
+            (enter_net if entered else veto_net).append(r["net_pct"])
+        mech_s = _bt_summary([r["net_pct"] for r in results])
+        enter_s, veto_s = _bt_summary(enter_net), _bt_summary(veto_net)
+        m, b = mech_s["avg_net_pct"], enter_s["avg_net_pct"]
+        edge = round(b - m, 3) if (m is not None and b is not None) else None
+        return {"ready": True, "tested": len(results), "sl": sl_v, "tp": tp_v,
+                "mechanical": mech_s, "brain_enter": enter_s, "brain_veto": veto_s, "edge_pct": edge}
 
 
 @app.post("/tuning/apply", dependencies=[Depends(require_token)])

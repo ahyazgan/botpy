@@ -49,6 +49,7 @@ class Settings:
     tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
     use_entry_brain: bool = False    # giriş anında Claude kararlı yargı (Tier-2 adaylarda; refleks atlanır)
     brain_escalate: bool = False     # kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci bakış
+    brain_self_improve: bool = False # kalibrasyondan öğren: negatif conviction dilimini oto-veto + boyut eğ
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
@@ -98,7 +99,8 @@ _exchange: Any = None
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
-    "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate", "cooldown_sec",
+    "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
+    "brain_self_improve", "cooldown_sec",
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
@@ -178,6 +180,26 @@ def get_funding_rate(symbol: str) -> float | None:
         return float(data["lastFundingRate"]) * 100 if data else None
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def orderbook_imbalance(symbol: str, depth: int = 20) -> dict[str, Any] | None:
+    """Emir defteri dengesizliği: üst `depth` seviyede alıcı/satıcı baskınlığı.
+
+    skew ∈ [-1,1]: +1 alıcı baskın (yukarı baskı), -1 satıcı baskın. Veri yoksa None.
+    """
+    book = get_json(f"{BINANCE_API}/depth", params={"symbol": symbol, "limit": str(depth)}, timeout=10)
+    if not book:
+        return None
+    try:
+        bid_usd = sum(float(p) * float(q) for p, q in book.get("bids", []))
+        ask_usd = sum(float(p) * float(q) for p, q in book.get("asks", []))
+    except (TypeError, ValueError):
+        return None
+    tot = bid_usd + ask_usd
+    if tot <= 0:
+        return None
+    return {"skew": round((bid_usd - ask_usd) / tot, 3),
+            "bid_usd": round(bid_usd), "ask_usd": round(ask_usd)}
 
 
 def _funding_cost_pct(symbol: str, side: str) -> float | None:
@@ -349,6 +371,18 @@ def brain_scorecard() -> dict[str, Any]:
                          for i in range(len(filled) - 1))
     return {"samples": len(rows), "bands": bands, "calibrated": calibrated,
             "escalated_n": sum(1 for c in rows if c["brain"].get("escalated"))}
+
+
+_BRAIN_SELF_IMPROVE_MIN = 5   # bir conviction dilimini yargılamak için min örnek
+
+
+def _brain_band_stats(conviction: float) -> dict[str, Any] | None:
+    """Verili conviction'ın düştüğü kalibrasyon dilimi (kendini-iyileştirme için)."""
+    sc = brain_scorecard()
+    for (name, lo, hi), band in zip(_BRAIN_BANDS, sc["bands"]):
+        if lo <= conviction < hi:
+            return band
+    return None
 
 
 def _check_risk(symbol: str, usdt: float) -> None:
@@ -892,6 +926,16 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                 return None
             conv = verdict.get("conviction")
             if conv is not None:
+                # Kendini-iyileştirme: bu conviction dilimi geçmişte negatifse oto-veto; zayıfsa boyutu kıs
+                if S.brain_self_improve:
+                    band = _brain_band_stats(float(conv))
+                    if band and band["n"] >= _BRAIN_SELF_IMPROVE_MIN and band["avg_pnl"] is not None:
+                        if band["avg_pnl"] < 0:
+                            log.info("Kendini-iyileştirme VETO | %s | konv-dilimi %s negatif (ort %s)",
+                                     item.symbol, band["band"], band["avg_pnl"])
+                            return None
+                        if band["win_rate"] is not None and band["win_rate"] < 0.5:
+                            usdt = round(usdt * 0.75, 2)   # zayıf dilim → boyutu kıs
                 usdt = round(usdt * max(0.5, min(1.5, float(conv) + 0.5)), 2)  # 0.5→1.0x,1.0→1.5x
             sl_mult = {"tight": 0.6, "wide": 1.5}.get(verdict.get("sl_tightness", "normal"), 1.0)
             hm = verdict.get("hold_minutes")

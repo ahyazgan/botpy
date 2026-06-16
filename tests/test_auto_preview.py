@@ -21,6 +21,7 @@ def env(monkeypatch):
         "suppress_losing_sources": False, "reduce_after_losses": 0, "cooldown_sec": 0,
         "max_positions": 20, "auto_trade": False, "tier1_skip_confirm_impact": 0,
         "halt_trade_on_stale": True, "max_news_age_sec": 0, "max_same_direction": 0,
+        "max_funding_rate_pct": 0.0,
     }.items():
         setattr(trader.S, k, v)
     monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
@@ -135,6 +136,48 @@ def test_decision_same_direction_under_cap(env):
     trader._positions = [{"side": "long"}]  # type: ignore[assignment]
     d = trader.auto_decision(_Item(impact=10, symbol="BARUSDT"))
     assert d["would_trade"] is True
+
+
+# ── Bearish/short + funding kapısı (Faz 3) ───────────────────────────────
+def test_decision_futures_allows_short(env):
+    """Futures modunda bearish haber short açabilir (spot'ta yasak)."""
+    trader.S.market = "futures"
+    d = trader.auto_decision(_Item(impact=9, direction="bearish"))
+    assert d["would_trade"] is True and d["side"] == "short"
+
+
+def test_decision_funding_gate_blocks_costly_long(env, monkeypatch):
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: 0.10)  # long %0.10 öder
+    d = trader.auto_decision(_Item(impact=9, direction="bullish"))
+    assert d["would_trade"] is False and "funding" in d["reason"]
+
+
+def test_decision_funding_gate_allows_favorable_short(env, monkeypatch):
+    """Pozitif funding'de short funding ALIR (maliyet negatif) → geçer."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: 0.10)  # short maliyeti -0.10
+    d = trader.auto_decision(_Item(impact=9, direction="bearish"))
+    assert d["would_trade"] is True and d["side"] == "short"
+
+
+def test_decision_funding_gate_off_no_network(env, monkeypatch):
+    """Kapalıyken (0) funding ağ çağrısı yapılmaz."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.0
+    monkeypatch.setattr(trader, "get_funding_rate",
+                        lambda s: (_ for _ in ()).throw(AssertionError("çağrılmamalı")))
+    assert trader.auto_decision(_Item(impact=9, direction="bullish"))["would_trade"] is True
+
+
+def test_decision_funding_none_does_not_block(env, monkeypatch):
+    """Funding verisi alınamazsa kapı engellemez (fail-open)."""
+    trader.S.market = "futures"
+    trader.S.max_funding_rate_pct = 0.05
+    monkeypatch.setattr(trader, "get_funding_rate", lambda s: None)
+    assert trader.auto_decision(_Item(impact=9, direction="bullish"))["would_trade"] is True
 
 
 def test_decision_is_side_effect_free(env):

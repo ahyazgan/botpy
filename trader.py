@@ -32,6 +32,7 @@ from netutil import get_json
 log = logging.getLogger(__name__)
 
 BINANCE_API = "https://api.binance.com/api/v3"
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"   # futures (funding rate)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_state.json")
 
 
@@ -76,6 +77,7 @@ class Settings:
     suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
     min_source_samples: int = 8      # bir kaynağı yargılamak için gereken min kapanmış işlem
     skip_already_priced_pct: float = 0.0   # >0: 24s'te bu % haber yönünde oynamışsa girme (chase önleme)
+    max_funding_rate_pct: float = 0.0  # >0 (futures): yön funding'e ters & maliyet bu %'yi geçerse girme
 
 
 S = Settings()
@@ -98,6 +100,7 @@ _PERSIST_KEYS = (
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
+    "max_funding_rate_pct",
 )
 
 
@@ -156,6 +159,26 @@ def get_price(symbol: str) -> float | None:
         return float(data["price"]) if data else None
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def get_funding_rate(symbol: str) -> float | None:
+    """Binance futures anlık funding oranı (% cinsinden, 8 saatlik). Hata/yoksa None.
+
+    Pozitif → longlar shortlara öder (long maliyeti). Negatif → tersi.
+    """
+    data = get_json(f"{BINANCE_FAPI}/premiumIndex", params={"symbol": symbol}, timeout=10)
+    try:
+        return float(data["lastFundingRate"]) * 100 if data else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _funding_cost_pct(symbol: str, side: str) -> float | None:
+    """Bu yön için funding MALİYETİ (% — pozitif=ödüyorsun). Veri yoksa None."""
+    fr = get_funding_rate(symbol)
+    if fr is None:
+        return None
+    return fr if side == "long" else -fr
 
 
 def _estimate_fill(symbol: str, is_long: bool, usdt: float) -> dict[str, Any] | None:
@@ -749,6 +772,12 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         st = source_stats(news_source)
         if st["count"] >= S.min_source_samples and st["avg_pnl"] < 0:
             return no(f"kaynak negatif beklenti ({news_source} avg={st['avg_pnl']})")
+    # Funding kapısı (futures): yön funding'e ters & taşıma maliyeti yüksekse girme.
+    # Yalnız uygun adaylarda 1 ağ çağrısı; spot'ta ya da kapalıyken hiç çağrılmaz.
+    if S.market == "futures" and S.max_funding_rate_pct > 0:
+        cost = _funding_cost_pct(symbol, side)
+        if cost is not None and cost > S.max_funding_rate_pct:
+            return no(f"funding maliyeti yüksek (%{cost:+.3f} > %{S.max_funding_rate_pct})")
     # Boyut: conviction (güce göre) + kayıp serisi freni
     usdt = S.trade_usdt
     if S.size_by_impact:

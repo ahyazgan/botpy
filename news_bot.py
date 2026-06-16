@@ -1723,6 +1723,7 @@ class SettingsPatch(BaseModel):
     suppress_losing_sources: bool | None = None
     min_source_samples: int | None = None
     skip_already_priced_pct: float | None = None
+    max_funding_rate_pct: float | None = None
 
 
 @app.get("/settings")

@@ -13,7 +13,7 @@
   Done when: feed-stale halt (`halt_trade_on_stale`) + latency kapısı (`max_news_age_sec`) +
   aynı-yön korelasyon limiti (`max_same_direction`); auto_decision/maybe_auto_trade context alır;
   /auto-preview yansıtır; testler; mypy+ruff+pytest yeşil; commit.
-- [ ] Faz 2 — Oto-kalibrasyon (POST /tuning/apply)
+- [x] Faz 2 — Oto-kalibrasyon (POST /tuning/apply)  (daa8466)
   Done when: `trader.apply_tuning` öneriyi korkuluklarla uygular (auto_min_impact taban + kaynak
   susturma); endpoint; testler; yeşil; commit.
 - [ ] Faz 3 — Bearish/short (futures funding kapısı)

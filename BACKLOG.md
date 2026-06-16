@@ -44,6 +44,10 @@
 - [x] /auto-preview'a beyin verdikti (canlıdan önce gözlem)
   Done when: /auto-preview?brain=true entry_brain_decision verdiktini döner; panelde 🧠 Beyin önizleme
   butonu + tabloda gir/bekle/veto rozeti; testler; yeşil; commit.
+- [x] Beyin karar günlüğü + veto hesap verebilirliği
+  Done when: storage.brain_decisions tablosu + add/list; _log_brain_decision her canlı kararı yazar;
+  /brain-log + /brain-veto-review (vetolanan sinyalleri geçmiş fiyatla sına — kaybedeni mi eledi);
+  panelde 🧪 Veto denetimi; testler; ruff+mypy+pytest+build yeşil; commit.
 
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.

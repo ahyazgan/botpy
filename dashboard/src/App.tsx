@@ -107,6 +107,10 @@ type BrainBacktest = {
   ready: boolean; reason?: string; tested?: number;
   mechanical?: BtSide; brain_enter?: BtSide; brain_veto?: BtSide; edge_pct?: number | null;
 };
+type BrainVetoReview = {
+  ready: boolean; reason?: string; n: number;
+  avg_net_pct?: number | null; win_rate?: number | null; verdict?: string;
+};
 
 type Performance = {
   total_trades: number;
@@ -473,6 +477,20 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Beyin backtest hatası");
     } finally {
       setBrainBtRunning(false);
+    }
+  };
+  const [brainVeto, setBrainVeto] = useState<BrainVetoReview | null>(null);
+  const [brainVetoRunning, setBrainVetoRunning] = useState(false);
+  const runBrainVeto = async () => {
+    setBrainVetoRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/brain-veto-review`);
+      if (!r.ok) throw new Error(`brain-veto-review ${r.status}`);
+      setBrainVeto(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Veto denetimi hatası");
+    } finally {
+      setBrainVetoRunning(false);
     }
   };
 
@@ -1552,8 +1570,36 @@ export default function App() {
             >
               {brainBtRunning ? "Replay…" : "🧠 Beyin backtest"}
             </button>
+            <button
+              type="button"
+              onClick={() => void runBrainVeto()}
+              disabled={brainVetoRunning}
+              title="Beynin vetoladığı/beklettiği sinyalleri geçmiş fiyatla sına — vetolar kaybedeni mi eledi (avg net < 0 = doğru)"
+              className="rounded-md border border-rose-500/40 bg-rose-950/40 px-3 py-1 text-xs font-semibold text-rose-200 hover:bg-rose-900/50 disabled:opacity-50"
+            >
+              {brainVetoRunning ? "Sınanıyor…" : "🧪 Veto denetimi"}
+            </button>
           </div>
         </div>
+
+        {/* Veto denetimi: vetolanan sinyaller gerçekten kaybettirir miydi */}
+        {brainVeto && (
+          <div className="mb-3 rounded-2xl border border-rose-500/30 bg-rose-950/20 px-4 py-3 text-sm">
+            {!brainVeto.ready ? (
+              <p className="text-zinc-500">{brainVeto.reason ?? "Yetersiz veri."}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-4">
+                <span className="text-xs font-semibold uppercase tracking-wider text-rose-300/80">🧪 Veto denetimi</span>
+                <span className="text-zinc-400">{brainVeto.n} vetolanmış sinyal</span>
+                <span>Simüle ort. net: <b className={`tabular-nums ${(brainVeto.avg_net_pct ?? 0) < 0 ? "text-emerald-300" : "text-red-300"}`}>{brainVeto.avg_net_pct ?? "—"}%</b></span>
+                <span className="text-zinc-500">{brainVeto.win_rate ?? "—"}% kazanırdı</span>
+                <span className={`rounded px-2 py-0.5 font-semibold ${(brainVeto.avg_net_pct ?? 0) < 0 ? "bg-emerald-900/50 text-emerald-200" : "bg-red-900/50 text-red-200"}`}>
+                  {brainVeto.verdict}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Beyin backtest: beyin vs mekanik (offline replay) */}
         {brainBt && (

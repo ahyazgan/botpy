@@ -826,14 +826,41 @@ def _clear_defer(iid: str) -> None:
     _brain_tries.pop(iid, None)
 
 
+def _verdict_of(v: dict[str, Any]) -> str:
+    """Beyin çıktısından karar etiketi: wait | enter | veto."""
+    if int(v.get("wait_seconds", 0) or 0) > 0:
+        return "wait"
+    return "enter" if v.get("enter") else "veto"
+
+
+def _log_brain_decision(item: NewsItem, side: str, v: dict[str, Any]) -> None:
+    """Bir canlı beyin kararını kalıcı günlüğe yaz (veto/bekle hesap verebilirliği). Hata yutar."""
+    try:
+        get_store().add_brain_decision({
+            "news_id": item.id, "source": item.source, "title": item.title[:120],
+            "symbol": item.symbol, "side": side, "impact": item.impact,
+            "direction": item.direction, "verdict": _verdict_of(v),
+            "conviction": v.get("conviction"), "sl_tightness": v.get("sl_tightness"),
+            "hold_minutes": v.get("hold_minutes"), "wait_seconds": v.get("wait_seconds"),
+            "escalated": v.get("escalated"), "model": v.get("model"),
+            "reason": v.get("reason"), "scores": v.get("scores"),
+            "published": item.published or item.fetched_at,
+            "price_24h_pct": item.price_24h_pct, "price_15m_pct": item.price_15m_pct,
+            "atr_pct": item.atr_pct,
+        })
+    except Exception as e:
+        log.warning("Beyin kararı günlüğe yazılamadı: %s", e)
+
+
 def _brain_for_trade(item: NewsItem, decision: dict[str, Any]) -> dict[str, Any] | None:
     """Canlı işlem yolunda beyin: 'bekle' (wait_seconds) kararını erteleme olarak yönetir.
 
-    entry_brain_decision saf kalır; deferral bookkeeping burada. Net kararda erteleme temizlenir.
+    entry_brain_decision saf kalır; deferral bookkeeping + karar günlüğü burada.
     """
     v = entry_brain_decision(item, decision)
     if v is None:
         return None
+    _log_brain_decision(item, decision.get("side", "") or "", v)   # her kararı günlüğe yaz
     wait = int(v.get("wait_seconds", 0) or 0)
     if wait > 0:
         with _deferred_lock:
@@ -2081,6 +2108,45 @@ def brain_scorecard() -> dict[str, Any]:
     """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).
     `calibrated` = yüksek konviksiyon daha yüksek ort. P&L üretiyor mu (beyin edge katıyor mu)."""
     return trader.brain_scorecard()
+
+
+@app.get("/brain-log")
+def brain_log(limit: int = 200, verdict: str | None = None) -> dict[str, Any]:
+    """Giriş beyni karar günlüğü (gir/bekle/veto), en yeniden eskiye. `verdict` ile filtrele.
+    Veto/bekle kararları da kaydedilir — scorecard yalnız girilenleri görür, bu hepsini."""
+    return {"decisions": get_store().list_brain_decisions(limit=limit, verdict=verdict)}
+
+
+@app.get("/brain-veto-review")
+def brain_veto_review(hours: float = 4.0, limit: int = 300,
+                      sl: float | None = None, tp: float | None = None,
+                      fee: float = 0.2) -> dict[str, Any]:
+    """Veto/bekle hesap verebilirliği: beynin VETOLADIĞI sinyalleri geçmiş fiyatla simüle et.
+    `avg_net_pct` < 0 → vetolar kaybedeni eledi (DOĞRU); > 0 → kazananı kaçırdı. Ağ-yoğun."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = [r for r in get_store().list_brain_decisions(limit=limit)
+                if r["verdict"] in ("veto", "wait")]
+        brain_rows = [{"symbol": r.get("symbol"), "direction": r.get("direction"),
+                       "published": r.get("published"), "fetched_at": r.get("published"),
+                       "impact": r.get("impact") or 0, "title": r.get("title") or "",
+                       "source": r.get("source", "?")} for r in rows]
+        cands = nbt._signals_from_rows(brain_rows)
+        if not cands:
+            return {"ready": False, "reason": "fiyat geçmişi olan vetolanmış karar yok", "n": 0}
+        signals = nbt.prefetch(cands, int(hours * 60))
+        if not signals:
+            return {"ready": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        sl_v = sl if sl is not None else trader.S.stop_loss_pct
+        tp_v = tp if tp is not None else trader.S.take_profit_pct
+        results = nbt.simulate_all(signals, sl_v, tp_v, fee)
+        s = _bt_summary([r["net_pct"] for r in results])
+        avg = s["avg_net_pct"]
+        s["ready"] = True
+        s["verdict"] = ("vetolar DOĞRU (kaybedeni eledi)" if (avg is not None and avg < 0)
+                        else "vetolar kazananı kaçırdı" if (avg is not None and avg > 0)
+                        else "nötr / yetersiz")
+        return s
 
 
 def _item_from_bt(r: dict[str, Any]) -> NewsItem:

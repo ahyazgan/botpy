@@ -343,6 +343,33 @@ def test_wait_defers_then_resolves(monkeypatch):
     assert item.id not in nb._brain_due   # net karar → erteleme temizlendi
 
 
+# ── Beyin karar günlüğü (storage + _log_brain_decision + /brain-log) ──────
+def test_storage_brain_decision_roundtrip(tmp_path):
+    from storage import Store
+    st = Store(str(tmp_path / "bd.db"))
+    st.add_brain_decision({"news_id": "a", "symbol": "FOOUSDT", "side": "long", "verdict": "veto",
+                           "conviction": 0.3, "escalated": True, "reason": "chase",
+                           "scores": {"chase_risk": 0.8}, "direction": "bullish"})
+    st.add_brain_decision({"news_id": "b", "symbol": "BARUSDT", "verdict": "enter",
+                           "conviction": 0.9, "direction": "bearish"})
+    alld = st.list_brain_decisions()
+    assert len(alld) == 2 and alld[0]["news_id"] == "b"   # en yeni önce
+    vetos = st.list_brain_decisions(verdict="veto")
+    assert len(vetos) == 1 and vetos[0]["scores"] == {"chase_risk": 0.8} and vetos[0]["escalated"] is True
+    st.close()
+
+
+def test_log_brain_decision_derives_verdict(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(nb, "get_store", lambda: type("S", (), {"add_brain_decision": staticmethod(lambda d: captured.update(d))})())
+    nb._log_brain_decision(_news_item(), "long", {"enter": False, "wait_seconds": 0, "conviction": 0.2, "reason": "x"})
+    assert captured["verdict"] == "veto"
+    nb._log_brain_decision(_news_item(), "long", {"enter": True, "wait_seconds": 60, "conviction": 0.5})
+    assert captured["verdict"] == "wait"   # wait_seconds>0 → bekle
+    nb._log_brain_decision(_news_item(), "long", {"enter": True, "wait_seconds": 0, "conviction": 0.8})
+    assert captured["verdict"] == "enter"
+
+
 # ── Küme bağlamı ──────────────────────────────────────────────────────────
 def test_cluster_context_counts_recent_same_coin(monkeypatch):
     now_iso = nb._now_iso()

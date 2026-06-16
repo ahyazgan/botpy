@@ -189,6 +189,34 @@ CREATE TABLE IF NOT EXISTS news_closed_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_nct_closed ON news_closed_trades(closed_at);
+
+CREATE TABLE IF NOT EXISTS brain_decisions (
+    row_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,          -- karar zamanı (utcnow)
+    news_id      TEXT,
+    source       TEXT,
+    title        TEXT,
+    symbol       TEXT,
+    side         TEXT,
+    impact       INTEGER,
+    direction    TEXT,
+    verdict      TEXT,                   -- enter | wait | veto
+    conviction   REAL,
+    sl_tightness TEXT,
+    hold_minutes INTEGER,
+    wait_seconds INTEGER,
+    escalated    INTEGER,                -- 0/1
+    model        TEXT,
+    reason       TEXT,
+    scores       TEXT,                   -- JSON
+    published    TEXT,                   -- sinyal zamanı (veto-review klines için)
+    price_24h_pct REAL,
+    price_15m_pct REAL,
+    atr_pct      REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brain_ts ON brain_decisions(ts);
+CREATE INDEX IF NOT EXISTS idx_brain_verdict ON brain_decisions(verdict);
 """
 
 _NCT_COLUMNS = (
@@ -218,6 +246,12 @@ _SIGNAL_COLUMNS = (
     "id", "ts", "source", "title", "url", "published", "fetched_at", "coins",
     "impact", "direction", "reason", "scorer", "symbol", "price_24h_pct",
     "price_15m_pct", "volume_usd", "confirmed", "price_note",
+)
+_BRAIN_COLUMNS = (
+    "ts", "news_id", "source", "title", "symbol", "side", "impact", "direction",
+    "verdict", "conviction", "sl_tightness", "hold_minutes", "wait_seconds",
+    "escalated", "model", "reason", "scores", "published", "price_24h_pct",
+    "price_15m_pct", "atr_pct",
 )
 
 
@@ -636,6 +670,44 @@ class Store:
             d = dict(r)
             d["id"] = d.pop("trade_id")
             d.pop("row_id", None)
+            out.append(d)
+        return out
+
+    # ── Giriş beyni karar günlüğü ────────────────────────────────────────
+    def add_brain_decision(self, d: dict[str, Any]) -> None:
+        """Bir giriş beyni kararını (gir/bekle/veto) kalıcı günlüğe yaz. Hata yutmaz çağıran."""
+        row = {c: d.get(c) for c in _BRAIN_COLUMNS}
+        row["ts"] = _utcnow()
+        row["escalated"] = 1 if d.get("escalated") else 0
+        if isinstance(row.get("scores"), (dict, list)):
+            row["scores"] = json.dumps(row["scores"], ensure_ascii=False)
+        cols = ", ".join(_BRAIN_COLUMNS)
+        placeholders = ", ".join(f":{c}" for c in _BRAIN_COLUMNS)
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO brain_decisions ({cols}) VALUES ({placeholders})", row)
+            self._conn.commit()
+
+    def list_brain_decisions(self, limit: int = 200, verdict: str | None = None) -> list[dict[str, Any]]:
+        """Beyin kararları, en yeniden eskiye. `verdict` ile filtrele (enter/wait/veto)."""
+        q = "SELECT * FROM brain_decisions"
+        params: list[Any] = []
+        if verdict:
+            q += " WHERE verdict = ?"
+            params.append(verdict)
+        q += " ORDER BY row_id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d.pop("row_id", None)
+            d["escalated"] = bool(d.get("escalated"))
+            try:
+                d["scores"] = json.loads(d["scores"]) if d.get("scores") else {}
+            except (ValueError, TypeError):
+                d["scores"] = {}
             out.append(d)
         return out
 

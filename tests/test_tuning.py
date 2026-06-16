@@ -68,6 +68,53 @@ def test_tuning_endpoint(env, monkeypatch):
     assert out["ready"] is True and "by_impact" in out and "by_tier" in out
 
 
+# ── Oto-kalibrasyon: apply_tuning + POST /tuning/apply (Faz 2) ──────────────
+def test_apply_not_ready_does_nothing(env, monkeypatch):
+    monkeypatch.setattr(trader.S, "suppress_losing_sources", False)
+    monkeypatch.setattr(trader, "_closed", [_c(1.0) for _ in range(5)])
+    out = trader.apply_tuning(trader.suggest_tuning())
+    assert out["applied"] is False and out["changes"] == []
+    assert trader.S.auto_min_impact == 7   # değişmedi
+
+
+def test_apply_raises_auto_min_impact(env, monkeypatch):
+    closed = [_c(-3.0, impact=7) for _ in range(6)] + [_c(5.0, impact=9) for _ in range(6)]
+    monkeypatch.setattr(trader, "_closed", closed)
+    monkeypatch.setattr(trader, "_save_state", lambda: None)
+    out = trader.apply_tuning(trader.suggest_tuning())
+    assert out["applied"] is True
+    assert trader.S.auto_min_impact == 9
+    assert any(c["field"] == "auto_min_impact" and c["to"] == 9 for c in out["changes"])
+
+
+def test_apply_respects_floor(env, monkeypatch):
+    # güç 5 kârlı, eşik düşürme önerisi → ama taban 7'nin altına inmez
+    closed = [_c(5.0, impact=5) for _ in range(12)]
+    monkeypatch.setattr(trader, "_closed", closed)
+    monkeypatch.setattr(trader, "_save_state", lambda: None)
+    trader.apply_tuning(trader.suggest_tuning(), min_impact_floor=7)
+    assert trader.S.auto_min_impact == 7   # tabana kıstırıldı, 5'e düşmedi
+
+
+def test_apply_enables_source_suppression(env, monkeypatch):
+    monkeypatch.setattr(trader.S, "suppress_losing_sources", False)
+    closed = [_c(-1.0, impact=9, news_source="ZayifKaynak") for _ in range(10)]
+    monkeypatch.setattr(trader, "_closed", closed)
+    monkeypatch.setattr(trader, "_save_state", lambda: None)
+    out = trader.apply_tuning(trader.suggest_tuning())
+    assert trader.S.suppress_losing_sources is True
+    assert any(c["field"] == "suppress_losing_sources" for c in out["changes"])
+
+
+def test_apply_endpoint(env, monkeypatch):
+    monkeypatch.setattr(trader, "_closed", [_c(5.0, impact=9) for _ in range(12)])
+    monkeypatch.setattr(trader, "_save_state", lambda: None)
+    monkeypatch.setattr(nb, "notify_remote", lambda msg: None)
+    c = TestClient(nb.app)
+    out = c.post("/tuning/apply").json()
+    assert "applied" in out and "changes" in out
+
+
 # ── İşlemsiz ön-bilgi: backtest sonuçlarından öneri (suggest_from_backtest) ──
 def _bt(net_pct, impact=9, source="Binance"):
     return {"net_pct": net_pct, "impact": impact, "source": source,

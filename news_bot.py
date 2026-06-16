@@ -1777,6 +1777,21 @@ def get_tuning() -> dict[str, Any]:
     return trader.suggest_tuning(tier_of=_source_tier)
 
 
+@app.post("/tuning/apply", dependencies=[Depends(require_token)])
+def post_tuning_apply(min_impact_floor: int = 7) -> dict[str, Any]:
+    """Öğrenen beynin önerilerini KORKULUKLARLA otomatik uygula (oto-kalibrasyon).
+
+    Kapanan gerçek işlemlerden `suggest_tuning` çalıştırır; güvenli ayarları (auto_min_impact
+    tabana kıstırılmış + kaynak susturma) uygular. Risk/boyut ayarlarına dokunmaz. Yeterli
+    örnek yoksa hiçbir şey değiştirmez. Uygulanan değişiklikleri döner."""
+    sug = trader.suggest_tuning(tier_of=_source_tier)
+    result = trader.apply_tuning(sug, min_impact_floor=min_impact_floor)
+    if result["applied"]:
+        notify_remote("⚙️ Oto-kalibrasyon: " + ", ".join(
+            f"{c['field']} {c['from']}→{c['to']}" for c in result["changes"]))
+    return result
+
+
 @app.get("/tuning/pretrade")
 def get_tuning_pretrade(
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 1000,

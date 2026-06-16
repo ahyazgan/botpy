@@ -1039,6 +1039,36 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
                                 tier_of=tier_of, unit=" USDT")
 
 
+def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> dict[str, Any]:
+    """Öğrenen beynin önerilerini KORKULUKLARLA uygula (oto-kalibrasyon).
+
+    Yalnızca güvenli ayarları otomatik değiştirir:
+    - `auto_min_impact`: önerilen eşik (tabana [min_impact_floor] ve 10'a kıstırılır)
+    - kaynak susturma: negatif-beklenti önerisi varsa `suppress_losing_sources` aç
+
+    Risk tavanları/boyut/kaldıraç gibi para-büyüklüğü ayarlarına DOKUNMAZ. Yeterli
+    örnek yoksa (`ready=False`) hiçbir şey değiştirmez. Uygulanan değişiklikleri döner.
+    """
+    if not suggestion.get("ready"):
+        return {"applied": False, "reason": "yeterli örnek yok",
+                "samples": suggestion.get("samples", 0), "changes": []}
+    changes: list[dict[str, Any]] = []
+    for s in suggestion.get("suggestions", []):
+        if s["type"] == "auto_min_impact":
+            new = max(min_impact_floor, min(10, int(s["suggested"])))
+            if new != S.auto_min_impact:
+                changes.append({"field": "auto_min_impact", "from": S.auto_min_impact, "to": new})
+                S.auto_min_impact = new
+        elif s["type"] in ("suppress_source", "suppress_tier") and not S.suppress_losing_sources:
+            changes.append({"field": "suppress_losing_sources", "from": False, "to": True})
+            S.suppress_losing_sources = True
+    if changes:
+        with _lock:
+            _save_state()
+        log.info("Oto-kalibrasyon uygulandı: %s", changes)
+    return {"applied": bool(changes), "samples": suggestion.get("samples", 0), "changes": changes}
+
+
 def suggest_from_backtest(results: list[dict[str, Any]], tier_of: Any = None) -> dict[str, Any]:
     """İşlemsiz ÖN-BİLGİ: backtest sonuçlarından (arşiv simülasyonu) aynı önerileri üret.
 

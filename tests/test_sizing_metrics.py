@@ -39,7 +39,7 @@ def auto_env(monkeypatch):
     captured = {}
 
     def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source="",
-                   impact=None, atr_pct=None):
+                   impact=None, atr_pct=None, sl_mult=1.0, time_stop_min=None):
         captured["usdt"] = usdt
         captured["side"] = side
         captured["impact"] = impact

@@ -65,6 +65,7 @@ type Settings = {
   auto_require_confirm: boolean;
   tier1_skip_confirm_impact: number;
   use_entry_brain: boolean;
+  brain_escalate: boolean;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -873,6 +874,20 @@ export default function App() {
             >
               🧠 Giriş beyni: {settings.use_entry_brain ? "AÇIK" : "kapalı"}
             </button>
+            {settings.use_entry_brain && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ brain_escalate: !settings.brain_escalate })}
+                title="İki-kademeli: kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci derin bakış"
+                className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                  settings.brain_escalate
+                    ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                ⬆️ Eskalasyon: {settings.brain_escalate ? "AÇIK" : "kapalı"}
+              </button>
+            )}
             <div className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-1">
               {(["spot", "futures"] as const).map((m) => (
                 <button

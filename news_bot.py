@@ -625,42 +625,68 @@ def score_with_claude(items: list[NewsItem]) -> None:
 # ── Giriş beyni: girişin tam anında kararlı son yargı ────────────────────
 # Mekanik kapıları geçen Tier-2 adaylarda çalışır. Puanlayıcının görmediği her şeyi
 # (canlı fiyat hareketi + ATR + funding + kaynağın geçmiş beklentisi + portföy) görür.
-ENTRY_BRAIN_MODEL = "claude-haiku-4-5"
+ENTRY_BRAIN_MODEL = os.environ.get("ENTRY_BRAIN_MODEL", "claude-haiku-4-5")
+# İki-kademeli: kararsız konviksiyonda (bant içi) daha güçlü modele ikinci bakış
+ENTRY_BRAIN_ESCALATE_MODEL = os.environ.get("ENTRY_BRAIN_ESCALATE_MODEL", "claude-sonnet-4-6")
+ENTRY_ESCALATE_LOW, ENTRY_ESCALATE_HIGH = 0.4, 0.6
 
 
 class _EntryDecision(BaseModel):
     enter: bool           # gerçekten girilsin mi (veto yetkisi)
     conviction: float     # 0-1: kurulumun gücü (boyutu ölçekler)
     direction: str        # bullish | bearish | neutral (haber yönünü teyit/düzelt)
+    # çok-boyutlu rubrik (0-1; risk alanlarında yüksek=kötü, kalite alanlarında yüksek=iyi)
+    chase_risk: float     # zaten fiyatlanmış / hareketi kovalama riski
+    fade_risk: float      # 15dk-1s çelişkisi / sönme riski
+    liquidity: float      # likidite yeterliliği (yüksek=iyi)
+    source_quality: float # kaynak güvenilirliği/geçmişi (yüksek=iyi)
+    correlation_risk: float  # aynı yönde küme / BTC-korele risk
+    # çıkış önerisi (kuruluma göre)
+    sl_tightness: str     # tight | normal | wide
+    hold_minutes: int     # önerilen time-stop (0 = öneri yok)
     reason: str           # kısa Türkçe gerekçe
 
 
 _ENTRY_BRAIN_SYSTEM = (
     "Sen disiplinli bir kripto haber-trade risk yöneticisisin. Sana, teyit kapılarını "
     "geçmiş bir oto-işlem ADAYI verilecek (JSON): haber + canlı fiyat hareketi + bu "
-    "kaynağın geçmiş beklentisi + portföy durumu. Görevin SON YARGI: bu girişe gerçekten "
-    "girilmeli mi ve ne kadar konviksiyonla?\n"
-    "Değerlendir: zaten fiyatlanmış mı (24s büyük hareket → chase riski), 15dk ve 1s "
-    "çelişiyor mu (fade riski), kaynak negatif beklentili mi, aynı yönde küme/BTC-korele "
-    "risk var mı, likidite/oynaklık (hacim, ATR) ve funding maliyeti makul mu.\n"
-    "- enter: kurulum zayıf/riskliyse false ile VETO et\n"
-    "- conviction: 0-1 (1 = çok temiz, yüksek-olasılık kurulum; şüphede düşük tut)\n"
-    "- direction: haber yönünü teyit et; fiyat/bağlam ters ya da belirsizse düzelt (neutral)\n"
+    "kaynağın geçmiş beklentisi + benzer geçmiş işlemlerin EMSAL sonucu + portföy durumu. "
+    "Görevin SON YARGI: bu girişe gerçekten girilmeli mi, ne kadar konviksiyonla, hangi çıkışla?\n"
+    "Önce her boyutu 0-1 puanla: chase_risk (24s büyük hareket → kovalama), fade_risk "
+    "(15dk-1s çelişkisi → sönme), liquidity (hacim yeterli mi, yüksek=iyi), source_quality "
+    "(kaynak tier + emsal/kaynak geçmişi, yüksek=iyi), correlation_risk (aynı yönde küme). "
+    "Emsal sonuçları (recent_pnls/win_rate) varsa onlara AĞIRLIK ver — prior değil gerçek "
+    "track record.\n"
+    "- enter: yüksek risk veya negatif emsalde false ile VETO et\n"
+    "- conviction: 0-1 (1 = temiz, yüksek-olasılık; şüphede düşük tut)\n"
+    "- direction: haber yönünü teyit et; fiyat/bağlam ters/belirsizse düzelt (neutral)\n"
+    "- sl_tightness: oynak/belirsizde 'tight', net trend + iyi likiditede 'wide', aksi 'normal'\n"
+    "- hold_minutes: haber edge'inin süresi (hızlı spike 15-30, yapısal haber 60-120, yoksa 0)\n"
     "- reason: en fazla 15 kelimelik Türkçe gerekçe\n"
     "Sermaye korunması önce gelir: şüphede kal = düşük conviction veya veto."
 )
+
+
+def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
+    resp = client.messages.parse(
+        model=model, max_tokens=500, system=_ENTRY_BRAIN_SYSTEM,
+        messages=[{"role": "user", "content": json.dumps(ctx, ensure_ascii=False)}],
+        output_format=_EntryDecision,
+    )
+    return resp.parsed_output
 
 
 def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, Any] | None:
     """Giriş anında Claude kararlı yargı. None = beyin yok/başarısız (mekanik karar geçerli).
 
     `decision`: trader.auto_decision çıktısı (side, usdt, news_source). Yan etkisiz.
+    Emsal hafızası + çok-boyutlu rubrik + çıkış önerisi + (kararsızda) iki-kademeli eskalasyon.
     """
     if not USE_CLAUDE:
         return None
     src = getattr(item, "source", "") or ""
+    side = decision.get("side") or ""
     st = trader.source_stats(src)
-    same_dir = trader._open_side_count(decision.get("side") or "")
     ctx = {
         "haber": {
             "kaynak": src, "kaynak_tier": _source_tier(src),
@@ -674,20 +700,36 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any]) -> dict[str, 
             "atr_pct": item.atr_pct, "teyitli": item.confirmed, "not": item.price_note[:160],
         },
         "kaynak_gecmisi": {"kapanmis_islem": st["count"], "ort_pnl_usdt": st["avg_pnl"]},
-        "portfoy": {"ayni_yonde_acik": same_dir, "yon": decision.get("side")},
+        "emsal": {
+            "kaynak_geneli": trader.precedent_stats(news_source=src),
+            "ayni_coin_yon": trader.precedent_stats(symbol=item.symbol, side=side),
+        },
+        "portfoy": {"ayni_yonde_acik": trader._open_side_count(side), "yon": side},
     }
     client = _get_anthropic()
-    resp = client.messages.parse(
-        model=ENTRY_BRAIN_MODEL,
-        max_tokens=400,
-        system=_ENTRY_BRAIN_SYSTEM,
-        messages=[{"role": "user", "content": json.dumps(ctx, ensure_ascii=False)}],
-        output_format=_EntryDecision,
-    )
-    r = resp.parsed_output
-    conv = max(0.0, min(1.0, float(r.conviction)))
-    return {"enter": bool(r.enter), "conviction": conv,
-            "direction": r.direction, "reason": (r.reason or "")[:160]}
+    r = _brain_call(client, ENTRY_BRAIN_MODEL, ctx)
+    model_used, escalated = ENTRY_BRAIN_MODEL, False
+    # İki-kademeli: kararsız bantta daha güçlü modele ikinci bakış (nihai karar onun)
+    conv0 = max(0.0, min(1.0, float(r.conviction)))
+    if (trader.S.brain_escalate and ENTRY_ESCALATE_LOW <= conv0 <= ENTRY_ESCALATE_HIGH
+            and ENTRY_BRAIN_ESCALATE_MODEL != ENTRY_BRAIN_MODEL):
+        try:
+            r = _brain_call(client, ENTRY_BRAIN_ESCALATE_MODEL, ctx)
+            model_used, escalated = ENTRY_BRAIN_ESCALATE_MODEL, True
+        except Exception as e:
+            log.warning("Beyin eskalasyonu başarısız, haiku kararı geçerli: %s", e)
+    return {
+        "enter": bool(r.enter), "conviction": max(0.0, min(1.0, float(r.conviction))),
+        "direction": r.direction, "sl_tightness": r.sl_tightness,
+        "hold_minutes": max(0, int(r.hold_minutes)), "reason": (r.reason or "")[:160],
+        "scores": {
+            "chase_risk": round(float(r.chase_risk), 2), "fade_risk": round(float(r.fade_risk), 2),
+            "liquidity": round(float(r.liquidity), 2),
+            "source_quality": round(float(r.source_quality), 2),
+            "correlation_risk": round(float(r.correlation_risk), 2),
+        },
+        "model": model_used, "escalated": escalated,
+    }
 
 
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
@@ -816,6 +858,10 @@ def _fmt_trade_msg(pos: dict[str, Any], opened: bool) -> str:
         body = f"{side} {sym} · {pos.get('usdt', 0):.0f} USDT @ {pos.get('entry_price')}"
         sl, tp = pos.get("sl_price"), pos.get("tp_price")
         tail = f"SL {sl} · TP {tp}" if (sl or tp) else ""
+        brain = pos.get("brain")
+        if brain:  # giriş beyni yargısı (şeffaflık)
+            esc = " ⬆️" if brain.get("escalated") else ""
+            tail += f"\n🧠 konv {brain.get('conviction')}{esc} · {brain.get('reason', '')}"
     else:
         pnl, pct = pos.get("pnl"), pos.get("pnl_pct")
         emoji = "🟩" if (pnl or 0) >= 0 else "🟥"
@@ -1777,6 +1823,7 @@ class SettingsPatch(BaseModel):
     auto_require_confirm: bool | None = None
     tier1_skip_confirm_impact: int | None = None
     use_entry_brain: bool | None = None
+    brain_escalate: bool | None = None
     cooldown_sec: int | None = None
     halt_trade_on_stale: bool | None = None
     max_news_age_sec: int | None = None

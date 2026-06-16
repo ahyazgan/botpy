@@ -68,3 +68,15 @@ def test_atr_falls_back_without_value(clean):
     pos = trader.place_trade("FOOUSDT", "long", atr_pct=None)
     assert pos["sl_price"] == pytest.approx(97.0) and pos["tp_price"] == pytest.approx(106.0)
     assert pos["atr_pct"] is None
+
+
+def test_sl_mult_tightens_stop(clean):
+    """Giriş beyni sl_mult'i SL%'yi ölçekler (tight=0.6 → %3→%1.8)."""
+    pos = trader.place_trade("FOOUSDT", "long", sl_mult=0.6)
+    assert pos["sl_price"] == pytest.approx(98.2)   # -%1.8 (3*0.6)
+    assert pos["tp_price"] == pytest.approx(106.0)  # TP değişmez
+
+
+def test_time_stop_min_stored_on_position(clean):
+    pos = trader.place_trade("FOOUSDT", "long", time_stop_min=45)
+    assert pos["time_stop_min"] == 45

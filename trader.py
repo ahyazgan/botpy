@@ -48,6 +48,7 @@ class Settings:
     auto_require_confirm: bool = True
     tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
     use_entry_brain: bool = False    # giriş anında Claude kararlı yargı (Tier-2 adaylarda; refleks atlanır)
+    brain_escalate: bool = False     # kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci bakış
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
@@ -97,7 +98,7 @@ _exchange: Any = None
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
-    "tier1_skip_confirm_impact", "use_entry_brain", "cooldown_sec",
+    "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate", "cooldown_sec",
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
@@ -298,6 +299,27 @@ def source_stats(news_source: str) -> dict[str, Any]:
     return {"count": len(rows), "avg_pnl": round(sum(c["pnl"] for c in rows) / len(rows), 2)}
 
 
+def precedent_stats(*, news_source: str | None = None, symbol: str | None = None,
+                    side: str | None = None, limit: int = 10) -> dict[str, Any]:
+    """Emsal: benzer kapanmış işlemlerin gerçek sonucu (kaynak/sembol/yön filtreli).
+
+    Beyne 'bu tür kurulum geçmişte ne yaptı' verir. {n, win_rate, avg_pnl, recent_pnls}.
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None
+                and (news_source is None or c.get("news_source") == news_source)
+                and (symbol is None or c.get("symbol") == symbol)
+                and (side is None or c.get("side") == side)]
+    rows = rows[-limit:]
+    n = len(rows)
+    if not n:
+        return {"n": 0, "win_rate": None, "avg_pnl": None, "recent_pnls": []}
+    wins = sum(1 for c in rows if c["pnl"] > 0)
+    return {"n": n, "win_rate": round(wins / n, 2),
+            "avg_pnl": round(sum(c["pnl"] for c in rows) / n, 2),
+            "recent_pnls": [round(c["pnl"], 2) for c in rows]}
+
+
 def _check_risk(symbol: str, usdt: float) -> None:
     """Risk limitlerini ihlal eden işlemde RuntimeError fırlatır."""
     _reset_daily_if_needed()
@@ -355,7 +377,8 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
 def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
                 news_source: str = "", impact: int | None = None,
-                atr_pct: float | None = None) -> dict[str, Any]:
+                atr_pct: float | None = None, sl_mult: float = 1.0,
+                time_stop_min: int | None = None) -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -407,6 +430,9 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
     if S.use_atr_exits and atr_pct and atr_pct > 0:
         sl_pct = max(0.5, min(15.0, S.atr_sl_mult * atr_pct))
         tp_pct = max(1.0, min(30.0, S.atr_tp_mult * atr_pct))
+    # Giriş beyni çıkış önerisi: SL sıkılığı (tight/normal/wide → sl_mult)
+    if sl_mult != 1.0 and sl_pct > 0:
+        sl_pct = max(0.5, min(15.0, sl_pct * sl_mult))
 
     # SL/TP fiyatları
     sl_price = tp_price = None
@@ -442,6 +468,7 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "impact": impact,
         "reason": reason,
         "atr_pct": round(atr_pct, 3) if (S.use_atr_exits and atr_pct) else None,
+        "time_stop_min": int(time_stop_min) if time_stop_min else None,
     }
     with _lock:
         _positions.append(pos)
@@ -701,9 +728,10 @@ def monitor_positions() -> list[dict[str, Any]]:
                 hit = "stop-loss"
             elif tp and cur <= tp:
                 hit = "take-profit"
-        if hit is None and S.time_stop_min > 0:
+        eff_ts = p.get("time_stop_min") or S.time_stop_min   # pozisyon-bazlı (beyin) > global
+        if hit is None and eff_ts and eff_ts > 0:
             opened = _parse_dt(p.get("opened_at"))
-            if opened and (now - opened).total_seconds() >= S.time_stop_min * 60:
+            if opened and (now - opened).total_seconds() >= eff_ts * 60:
                 hit = "time-stop"
         if hit:
             try:
@@ -820,26 +848,35 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
     if not d["would_trade"]:
         return None
     usdt = d["usdt"]
+    verdict: dict[str, Any] | None = None
+    sl_mult = 1.0
+    hold_min: int | None = None
     # Giriş beyni: mekanik kapıları geçen Tier-2 (refleks olmayan) adayda son yargı.
-    # enter=False → veto; conviction → boyutu ölçekler. Refleks girişte hız için atlanır.
+    # enter=False → veto; conviction → boyut; sl_tightness/hold_minutes → çıkış. Refleks atlanır.
     if brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks":
-        v = _consult_brain(brain, item, d)
-        if v is not None:
-            if not v.get("enter", True):
-                log.info("Giriş beyni VETO | %s | %s", item.symbol, v.get("reason", ""))
+        verdict = _consult_brain(brain, item, d)
+        if verdict is not None:
+            if not verdict.get("enter", True):
+                log.info("Giriş beyni VETO | %s | %s", item.symbol, verdict.get("reason", ""))
                 return None
-            conv = v.get("conviction")
+            conv = verdict.get("conviction")
             if conv is not None:
-                mult = max(0.5, min(1.5, float(conv) + 0.5))  # conviction 0.5→1.0x, 1.0→1.5x
-                usdt = round(usdt * mult, 2)
+                usdt = round(usdt * max(0.5, min(1.5, float(conv) + 0.5)), 2)  # 0.5→1.0x,1.0→1.5x
+            sl_mult = {"tight": 0.6, "wide": 1.5}.get(verdict.get("sl_tightness", "normal"), 1.0)
+            hm = verdict.get("hold_minutes")
+            hold_min = int(hm) if hm and int(hm) > 0 else None
     try:
-        return place_trade(item.symbol, d["side"], usdt=usdt, source="auto",
-                           news_source=d["news_source"], impact=int(item.impact),
-                           reason=getattr(item, "reason", ""),
-                           atr_pct=getattr(item, "atr_pct", None))
+        pos = place_trade(item.symbol, d["side"], usdt=usdt, source="auto",
+                          news_source=d["news_source"], impact=int(item.impact),
+                          reason=getattr(item, "reason", ""),
+                          atr_pct=getattr(item, "atr_pct", None),
+                          sl_mult=sl_mult, time_stop_min=hold_min)
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
         return None
+    if verdict is not None:
+        pos["brain"] = verdict   # şeffaflık: konviksiyon + rubrik + gerekçe pozisyonda saklanır
+    return pos
 
 
 # ── Performans ───────────────────────────────────────────────────────────

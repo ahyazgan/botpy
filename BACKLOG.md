@@ -22,6 +22,9 @@
 - [x] Faz 4 — ATR volatilite SL/TP  (9a3840f)
   Done when: confirm'de `atr_pct` hesapla; `use_atr_exits`/`atr_sl_mult`/`atr_tp_mult` ile place_trade
   dinamik SL/TP; testler; yeşil; commit.
+- [x] Panel kontrolleri — yeni oto-trade ayarları  (44142a1)
+  Done when: güvenlik kapıları/ATR/funding toggle+slider + oto-kalibrasyon "uygula" butonu;
+  tsc+vite build yeşil; commit.
 
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.

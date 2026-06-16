@@ -37,10 +37,13 @@
   Done when: brain_scorecard + /brain-scorecard + panel şeridi + ctx geri besleme; _btc_regime piyasa
   rejimi; _cluster_context küme; wait_seconds bekle/izle erteleme (_brain_for_trade + recheck loop);
   testler; ruff+mypy+pytest+build yeşil; commit.
-- [x] Beyin uzman-seviye (backtest + kendini-iyileştirme + mikroyapı + tam metin)
+- [x] Beyin uzman-seviye (backtest + kendini-iyileştirme + mikroyapı + tam metin)  (ea4ebeb)
   Done when: /brain-backtest offline replay (beyin vs mekanik edge); brain_self_improve oto-veto+boyut;
   orderbook_imbalance mikroyapı; NewsItem.body tam metin; panel backtest butonu+self-improve toggle;
   testler; ruff+mypy+pytest+build yeşil; commit.
+- [x] /auto-preview'a beyin verdikti (canlıdan önce gözlem)
+  Done when: /auto-preview?brain=true entry_brain_decision verdiktini döner; panelde 🧠 Beyin önizleme
+  butonu + tabloda gir/bekle/veto rozeti; testler; yeşil; commit.
 
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.

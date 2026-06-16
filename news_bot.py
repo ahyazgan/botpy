@@ -1718,25 +1718,37 @@ def reconcile() -> dict[str, Any]:
 
 
 @app.get("/auto-preview")
-def auto_preview(limit: int = 20) -> dict[str, Any]:
+def auto_preview(limit: int = 20, brain: bool = False) -> dict[str, Any]:
     """Mevcut güçlü haberler için oto-işlem kararı önizlemesi (çalıştırmadan).
 
     Her haber için hangi gerekçeyle işlem açılır/açılmaz ve hangi boyutta — config
     kalibrasyonu için. Global oto-işlem kapalı olsa da değerlendirir (yan etkisiz).
+
+    `brain=true`: mekanik kapıları geçen (Tier-2) adaylarda **giriş beyni verdiktini** de
+    çalıştırır (gir/bekle/veto + konviksiyon + rubrik) — canlıdan önce beyni gözlemle. Her
+    aday için 1 Claude çağrısı (ağ-yoğun); talep üzerine kullan, 15s polling'e koyma.
     """
     threshold = get_news_settings()["alert_threshold"]
     with _cache_lock:
         items = [n for n in _news if n.impact >= threshold][:limit]
+    use_brain = brain and USE_CLAUDE
     preview = []
     for it in items:
         d = trader.auto_decision(it, **_trade_context(it))
-        preview.append({
+        row: dict[str, Any] = {
             "id": it.id, "title": it.title[:80], "symbol": it.symbol,
             "impact": it.impact, "direction": it.direction,
             "would_trade": d["would_trade"], "reason": d["reason"],
             "side": d["side"], "usdt": d["usdt"],
-        })
-    return {"preview": preview, "auto_trade_on": trader.S.auto_trade}
+        }
+        # Beyin verdikti: yalnız mekanik geçen + refleks olmayan adayda (canlı yolla aynı koşul)
+        if use_brain and d["would_trade"] and d["reason"] != "tier1-refleks":
+            try:
+                row["brain"] = entry_brain_decision(it, d)
+            except Exception as e:
+                log.warning("Önizleme beyin hatası (%s): %s", it.symbol, e)
+        preview.append(row)
+    return {"preview": preview, "auto_trade_on": trader.S.auto_trade, "brain_used": use_brain}
 
 
 def _closed_trades(limit: int) -> list[dict[str, Any]]:

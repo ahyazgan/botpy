@@ -216,6 +216,11 @@ type AutoPreviewRow = {
   reason: string;
   side: string | null;
   usdt: number | null;
+  brain?: {
+    enter: boolean; wait_seconds: number; conviction: number; direction: string;
+    sl_tightness: string; hold_minutes: number; reason: string; escalated: boolean;
+    scores: Record<string, number>;
+  } | null;
 };
 
 type DailySummary = {
@@ -708,15 +713,26 @@ export default function App() {
     }
   };
 
+  const [previewBrainRunning, setPreviewBrainRunning] = useState(false);
+  const fetchPreview = async (brain: boolean) => {
+    try {
+      const r = await fetch(`${API_BASE}/auto-preview${brain ? "?brain=true" : ""}`);
+      if (r.ok) setPreview((await r.json()).preview ?? []);
+    } catch {
+      setPreview([]);
+    }
+  };
   const runPreview = async () => {
     setPreviewOn((v) => !v);
-    if (preview === null) {
-      try {
-        const r = await fetch(`${API_BASE}/auto-preview`);
-        if (r.ok) setPreview((await r.json()).preview ?? []);
-      } catch {
-        setPreview([]);
-      }
+    if (preview === null) await fetchPreview(false);
+  };
+  const runPreviewBrain = async () => {
+    setPreviewBrainRunning(true);
+    if (!previewOn) setPreviewOn(true);
+    try {
+      await fetchPreview(true);
+    } finally {
+      setPreviewBrainRunning(false);
     }
   };
 
@@ -1980,13 +1996,24 @@ export default function App() {
 
       {/* Oto-işlem önizleme (dry-run) */}
       <section className="mx-auto mt-10 max-w-5xl">
-        <button
-          type="button"
-          onClick={() => void runPreview()}
-          className="mb-3 text-lg font-semibold text-white transition hover:text-zinc-300"
-        >
-          Oto-işlem önizleme <span className="ml-1 text-sm font-normal text-zinc-500">(dry-run) {previewOn ? "▾" : "▸"}</span>
-        </button>
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void runPreview()}
+            className="text-lg font-semibold text-white transition hover:text-zinc-300"
+          >
+            Oto-işlem önizleme <span className="ml-1 text-sm font-normal text-zinc-500">(dry-run) {previewOn ? "▾" : "▸"}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void runPreviewBrain()}
+            disabled={previewBrainRunning}
+            title="Mekanik geçen adaylarda giriş beyni verdiktini de çalıştır (gir/bekle/veto + konviksiyon) — canlıdan önce beyni gözlemle (ağ-yoğun)"
+            className="rounded-md border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200 hover:bg-violet-900/50 disabled:opacity-50"
+          >
+            {previewBrainRunning ? "Beyin değerlendiriyor…" : "🧠 Beyin önizleme"}
+          </button>
+        </div>
         {previewOn && (
           preview === null ? (
             <p className="rounded-2xl border border-white/10 bg-zinc-900/40 p-4 text-sm text-zinc-500">Yükleniyor…</p>
@@ -2007,20 +2034,33 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {preview.map((p) => (
+                    {preview.map((p) => {
+                      const verdict = p.brain
+                        ? (p.brain.wait_seconds > 0 ? "bekle" : p.brain.enter ? "girer" : "veto")
+                        : null;
+                      return (
                       <tr key={p.id} className="border-b border-white/5 hover:bg-white/[0.03]">
                         <td className="px-4 py-3">
                           <span className={`rounded-md px-2 py-0.5 text-xs font-bold ${p.would_trade ? "bg-emerald-950/60 text-emerald-300" : "bg-zinc-800/60 text-zinc-500"}`}>
                             {p.would_trade ? `${p.side === "long" ? "LONG" : "SHORT"} açar` : "atlar"}
                           </span>
+                          {p.brain && (
+                            <span className={`ml-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
+                              verdict === "girer" ? "bg-violet-900/60 text-violet-200"
+                                : verdict === "bekle" ? "bg-amber-900/50 text-amber-200" : "bg-red-900/50 text-red-200"}`}
+                              title={p.brain.reason}>
+                              🧠 {verdict} {(p.brain.conviction).toFixed(2)}{p.brain.escalated ? " ⬆️" : ""}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3 tabular-nums text-zinc-400">{p.impact}/10</td>
                         <td className="px-4 py-3 font-semibold text-zinc-200">{p.symbol ?? "—"}</td>
                         <td className="px-4 py-3 tabular-nums text-zinc-400">{p.usdt !== null ? `$${p.usdt}` : "—"}</td>
-                        <td className="px-4 py-3 text-xs text-zinc-400">{p.reason}</td>
+                        <td className="px-4 py-3 text-xs text-zinc-400">{p.brain ? p.brain.reason : p.reason}</td>
                         <td className="px-4 py-3 max-w-xs truncate text-xs text-zinc-500" title={p.title}>{p.title}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

@@ -201,4 +201,30 @@ def test_auto_preview_endpoint(monkeypatch, tmp_path, env):
     assert d["auto_trade_on"] is False
     assert len(d["preview"]) == 1
     assert d["preview"][0]["would_trade"] is True and d["preview"][0]["usdt"] == 100.0
+    assert "brain" not in d["preview"][0]   # brain=false → beyin çalışmaz
+    store.close()
+
+
+def test_auto_preview_brain_verdict(monkeypatch, tmp_path, env):
+    """brain=true → mekanik geçen adayda beyin verdikti döner (yan etkisiz)."""
+    store = Store(str(tmp_path / "apb.db"))
+    monkeypatch.setattr(nb, "_store", store)
+    monkeypatch.setattr(nb, "_settings_loaded", True)
+    monkeypatch.setattr(nb, "_news_settings", {"alert_threshold": 7, "remote_notify": True})
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    monkeypatch.setattr(nb, "entry_brain_decision",
+                        lambda it, d: {"enter": True, "wait_seconds": 0, "conviction": 0.8,
+                                       "direction": "bullish", "sl_tightness": "normal",
+                                       "hold_minutes": 30, "reason": "temiz", "escalated": False,
+                                       "scores": {"chase_risk": 0.2}})
+    monkeypatch.setattr(nb, "_news", [
+        NewsItem(id="a", source="TreeNews", title="strong", url="u", published=None,
+                 fetched_at="2026-06-14T00:00:00+00:00", coins=["FOO"], impact=9,
+                 direction="bullish", symbol="FOOUSDT", confirmed=True),
+    ])
+    c = TestClient(nb.app)
+    d = c.get("/auto-preview?brain=true").json()
+    assert d["brain_used"] is True
+    assert d["preview"][0]["brain"]["conviction"] == 0.8
+    assert trader._positions == []   # yan etki yok
     store.close()

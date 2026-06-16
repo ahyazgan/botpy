@@ -7,6 +7,22 @@
 
 ## Now (üstten alta, ara vermeden)
 
+### Epic: Akıllı oto-trade güçlendirme (haber→otomatik işlem)
+
+- [ ] Faz 1 — Güvenlik kapıları (auto_decision)
+  Done when: feed-stale halt (`halt_trade_on_stale`) + latency kapısı (`max_news_age_sec`) +
+  aynı-yön korelasyon limiti (`max_same_direction`); auto_decision/maybe_auto_trade context alır;
+  /auto-preview yansıtır; testler; mypy+ruff+pytest yeşil; commit.
+- [ ] Faz 2 — Oto-kalibrasyon (POST /tuning/apply)
+  Done when: `trader.apply_tuning` öneriyi korkuluklarla uygular (auto_min_impact taban + kaynak
+  susturma); endpoint; testler; yeşil; commit.
+- [ ] Faz 3 — Bearish/short (futures funding kapısı)
+  Done when: futures short zaten açık; `max_funding_rate_pct` ile funding'e ters pahalı yönde girme;
+  `get_funding_rate`; testler; yeşil; commit.
+- [ ] Faz 4 — ATR volatilite SL/TP
+  Done when: confirm'de `atr_pct` hesapla; `use_atr_exits`/`atr_sl_mult`/`atr_tp_mult` ile place_trade
+  dinamik SL/TP; testler; yeşil; commit.
+
 - [x] Tarayıcı bildirimi + ses uyarısı (güçlü sinyal gelince)  (3286a7a)
   Done when: panel açıkken yeni güç ≥ eşik sinyalde Notification API bildirimi + kısa bip; aç/kapat toggle (localStorage); tekrar bildirim yok; tsc+build yeşil; commit.
 - [x] Açık pozisyonda canlı SL/TP düzenleme  (da9ffd6)

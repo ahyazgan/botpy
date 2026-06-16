@@ -47,6 +47,10 @@ class Settings:
     auto_require_confirm: bool = True
     tier1_skip_confirm_impact: int = 0  # >0: bu güç ve üstü "net" haberde teyit BEKLEME (refleks giriş)
     cooldown_sec: int = 1800
+    # Güvenlik kapıları (oto-işlem)
+    halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
+    max_news_age_sec: int = 0          # >0: haber bu kadar saniyeden eskiyse girme (hareket bitti)
+    max_same_direction: int = 0        # >0: aynı yönde açık pozisyon sayısı tavanı (korelasyon riski)
     # Otomatik çıkış
     use_sl_tp: bool = True
     stop_loss_pct: float = 3.0       # -%3'te zarar durdur
@@ -87,6 +91,7 @@ _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
     "tier1_skip_confirm_impact", "cooldown_sec",
+    "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
@@ -683,18 +688,34 @@ def _can_auto_trade(symbol: str) -> bool:
     return True
 
 
+def _open_side_count(side: str) -> int:
+    """Şu an aynı yönde (long/short) açık pozisyon sayısı (korelasyon kapısı)."""
+    with _lock:
+        return sum(1 for p in _positions if p["side"] == side)
+
+
 def _size_multiplier(impact: int) -> float:
     """Conviction çarpanı: yüksek güç = büyük pozisyon. 8'de 1.0x, [0.5x, 1.5x] arası."""
     return max(0.5, min(1.5, 1.0 + (impact - 8) * 0.25))
 
 
-def auto_decision(item: Any) -> dict[str, Any]:
+def auto_decision(item: Any, *, feed_stale: bool = False,
+                  news_age_sec: float | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
 
     Global `auto_trade` anahtarını dikkate almaz (kalibrasyon/önizleme için her
     sinyali değerlendirir). Dönen: {would_trade, reason, side, usdt, news_source}.
+
+    `feed_stale`: haber akışı (WS) kopuk mu — güvenlik durdurması için çağıran geçirir.
+    `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
     """
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
+    # Güvenlik kapısı: akış kopukken kör girme (gerçek-zamanlı teyit güvenilmez)
+    if S.halt_trade_on_stale and feed_stale:
+        return no("haber akışı kopuk — güvenlik durdurması")
+    # Güvenlik kapısı: haber çok eskiyse hareket büyük olasılıkla bitmiştir
+    if S.max_news_age_sec > 0 and news_age_sec is not None and news_age_sec > S.max_news_age_sec:
+        return no(f"haber çok eski ({news_age_sec:.0f}s > {S.max_news_age_sec}s)")
     if item.impact < S.auto_min_impact:
         return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
     # Tier-1 "net" haber (hack/ETF/büyük listeleme vb. — yüksek güç): teyit beklemeden
@@ -715,6 +736,9 @@ def auto_decision(item: Any) -> dict[str, Any]:
         return no("spot'ta short yok")
     if not _can_auto_trade(symbol):
         return no("cooldown / limit / zaten açık pozisyon")
+    # Korelasyon kapısı: aynı yönde çok pozisyon = tek bahis (BTC-korele küme riski)
+    if S.max_same_direction > 0 and _open_side_count(side) >= S.max_same_direction:
+        return no(f"aynı yönde pozisyon limiti ({S.max_same_direction})")
     if S.skip_already_priced_pct > 0:
         m = getattr(item, "price_24h_pct", None)
         if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
@@ -735,10 +759,11 @@ def auto_decision(item: Any) -> dict[str, Any]:
             "side": side, "usdt": round(usdt, 2), "news_source": news_source}
 
 
-def maybe_auto_trade(item: Any) -> dict[str, Any] | None:
+def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
+                     news_age_sec: float | None = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
-    d = auto_decision(item)
+    d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec)
     if not d["would_trade"]:
         return None
     try:

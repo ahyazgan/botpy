@@ -20,6 +20,7 @@ def env(monkeypatch):
         "trade_usdt": 100.0, "size_by_impact": False, "skip_already_priced_pct": 0.0,
         "suppress_losing_sources": False, "reduce_after_losses": 0, "cooldown_sec": 0,
         "max_positions": 20, "auto_trade": False, "tier1_skip_confirm_impact": 0,
+        "halt_trade_on_stale": True, "max_news_age_sec": 0, "max_same_direction": 0,
     }.items():
         setattr(trader.S, k, v)
     monkeypatch.setattr(trader, "_can_auto_trade", lambda s: True)
@@ -88,6 +89,52 @@ def test_decision_tier1_disabled_by_default(env):
 def test_decision_conviction_size(env):
     trader.S.size_by_impact = True
     assert trader.auto_decision(_Item(impact=10))["usdt"] == 150.0
+
+
+# ── Güvenlik kapıları (Faz 1) ────────────────────────────────────────────
+def test_decision_feed_stale_halts(env):
+    """Akış kopukken oto-işlem durur (halt_trade_on_stale)."""
+    d = trader.auto_decision(_Item(impact=10), feed_stale=True)
+    assert d["would_trade"] is False and "kopuk" in d["reason"]
+
+
+def test_decision_feed_stale_ignored_when_disabled(env):
+    trader.S.halt_trade_on_stale = False
+    d = trader.auto_decision(_Item(impact=10), feed_stale=True)
+    assert d["would_trade"] is True
+
+
+def test_decision_news_too_old(env):
+    trader.S.max_news_age_sec = 300
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=600)
+    assert d["would_trade"] is False and "eski" in d["reason"]
+
+
+def test_decision_news_fresh_enough(env):
+    trader.S.max_news_age_sec = 300
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=120)
+    assert d["would_trade"] is True
+
+
+def test_decision_age_gate_off_by_default(env):
+    """max_news_age_sec=0 → yaş yok sayılır (geriye uyumlu)."""
+    d = trader.auto_decision(_Item(impact=10), news_age_sec=99999)
+    assert d["would_trade"] is True
+
+
+def test_decision_same_direction_cap(env):
+    trader.S.max_same_direction = 2
+    monkey = [{"side": "long"}, {"side": "long"}]
+    trader._positions = monkey  # type: ignore[assignment]
+    d = trader.auto_decision(_Item(impact=10, symbol="BARUSDT"))
+    assert d["would_trade"] is False and "aynı yönde" in d["reason"]
+
+
+def test_decision_same_direction_under_cap(env):
+    trader.S.max_same_direction = 2
+    trader._positions = [{"side": "long"}]  # type: ignore[assignment]
+    d = trader.auto_decision(_Item(impact=10, symbol="BARUSDT"))
+    assert d["would_trade"] is True
 
 
 def test_decision_is_side_effect_free(env):

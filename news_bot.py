@@ -884,6 +884,19 @@ def _too_old(item: NewsItem) -> bool:
     return datetime.now(timezone.utc) - t > timedelta(hours=MAX_NEWS_AGE_HOURS)
 
 
+def _news_age_sec(item: NewsItem) -> float | None:
+    """Haberin yaşı (saniye) — latency kapısı için. Zaman yoksa None."""
+    t = _parse_time(item.published) or _parse_time(item.fetched_at)
+    if t is None:
+        return None
+    return (datetime.now(timezone.utc) - t).total_seconds()
+
+
+def _trade_context(item: NewsItem) -> dict[str, Any]:
+    """Oto-işlem güvenlik kapıları için bağlam (akış durumu + haber yaşı)."""
+    return {"feed_stale": _ws_feed_stale(), "news_age_sec": _news_age_sec(item)}
+
+
 def _prune_news() -> None:
     """Feed'de zaten duran gürültü/eski haberleri temizle."""
     with _cache_lock:
@@ -978,7 +991,7 @@ def process_items(
             _archive_signal(it)
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
-            pos = trader.maybe_auto_trade(it)
+            pos = trader.maybe_auto_trade(it, **_trade_context(it))
             if pos:
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
@@ -1436,7 +1449,7 @@ def auto_preview(limit: int = 20) -> dict[str, Any]:
         items = [n for n in _news if n.impact >= threshold][:limit]
     preview = []
     for it in items:
-        d = trader.auto_decision(it)
+        d = trader.auto_decision(it, **_trade_context(it))
         preview.append({
             "id": it.id, "title": it.title[:80], "symbol": it.symbol,
             "impact": it.impact, "direction": it.direction,
@@ -1687,6 +1700,9 @@ class SettingsPatch(BaseModel):
     auto_require_confirm: bool | None = None
     tier1_skip_confirm_impact: int | None = None
     cooldown_sec: int | None = None
+    halt_trade_on_stale: bool | None = None
+    max_news_age_sec: int | None = None
+    max_same_direction: int | None = None
     use_sl_tp: bool | None = None
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None

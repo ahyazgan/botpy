@@ -225,6 +225,59 @@ def get_price(symbol: str) -> float | None:
         return None
 
 
+# Fiyat önbelleği: izleme döngüsü (8s) fiyatları tazeler; /positions buradan
+# anında okur (her seferinde Binance'e ~700ms ağ gidiş-dönüşü yapmadan).
+_price_cache: dict[str, tuple[float, float]] = {}   # symbol -> (price, ts)
+_PRICE_TTL = 10.0   # saniye — bu yaştan taze önbellek geçerli
+
+
+def get_prices(symbols: list[str]) -> dict[str, float]:
+    """Birden çok sembolün fiyatını TEK Binance çağrısında çek (seri N çağrı yerine).
+
+    Boş liste → {}. Tekli özel durumu da tek istek. Hata/eksikte o sembol atlanır.
+    Pozisyon sayısı arttıkça /positions gecikmesini O(N)→O(1) çağrıya indirir.
+    Çekilen fiyatlar önbelleğe yazılır (cached_prices kullanır).
+    """
+    uniq = sorted({s for s in symbols if s})
+    if not uniq:
+        return {}
+    # Binance: ?symbols=["BTCUSDT","ETHUSDT"] (JSON dizi, boşluksuz)
+    sym_param = "[" + ",".join(f'"{s}"' for s in uniq) + "]"
+    data = get_json(f"{BINANCE_API}/ticker/price", params={"symbols": sym_param}, timeout=10)
+    out: dict[str, float] = {}
+    if isinstance(data, list):
+        now = time.time()
+        for row in data:
+            try:
+                sym = row["symbol"]
+                price = float(row["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            out[sym] = price
+            _price_cache[sym] = (price, now)
+    return out
+
+
+def cached_prices(symbols: list[str], max_age: float = _PRICE_TTL) -> dict[str, float]:
+    """Fiyatları önce önbellekten oku (taze ise); eksik/bayatları TEK çağrıda çek.
+
+    İzleme döngüsü her 8s get_prices ile önbelleği tazelediği için /positions
+    çoğu zaman ağ çağrısı yapmadan anında döner.
+    """
+    now = time.time()
+    fresh: dict[str, float] = {}
+    missing: list[str] = []
+    for s in {x for x in symbols if x}:
+        c = _price_cache.get(s)
+        if c is not None and now - c[1] <= max_age:
+            fresh[s] = c[0]
+        else:
+            missing.append(s)
+    if missing:
+        fresh.update(get_prices(missing))   # çeker + önbelleğe yazar
+    return fresh
+
+
 def get_funding_rate(symbol: str) -> float | None:
     """Binance futures anlık funding oranı (% cinsinden, 8 saatlik). Hata/yoksa None.
 
@@ -895,10 +948,12 @@ def close_all(reason: str = "toplu-kapat") -> dict[str, Any]:
 def get_positions() -> tuple[list[dict[str, Any]], float]:
     with _lock:
         snap = list(_positions)
+    # Fiyatları önbellekten oku (izleme döngüsü 8s'de tazeler) — panel anında dönsün
+    prices = cached_prices([p["symbol"] for p in snap])
     out: list[dict[str, Any]] = []
     total = 0.0
     for p in snap:
-        cur = get_price(p["symbol"])
+        cur = prices.get(p["symbol"])
         pnl, pct = _pnl(p, cur)
         row = dict(p)
         row["current_price"] = cur
@@ -962,9 +1017,11 @@ def monitor_positions() -> list[dict[str, Any]]:
     closed: list[dict[str, Any]] = []
     with _lock:
         snap = list(_positions)
+    # Tüm fiyatları TEK çağrıda çek (seri N HTTP yerine) — izleme döngüsü hızlı kalsın
+    prices = get_prices([p["symbol"] for p in snap])
     now = datetime.now(timezone.utc)
     for p in snap:
-        cur = get_price(p["symbol"])
+        cur = prices.get(p["symbol"])
         if cur is None:
             continue
         is_long = p["side"] == "long"

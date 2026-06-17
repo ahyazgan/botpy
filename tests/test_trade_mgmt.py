@@ -57,7 +57,7 @@ def test_time_stop_closes_stale(clean, monkeypatch):
     trader.S.time_stop_min = 30
     old = (datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat()
     monkeypatch.setattr(trader, "_positions", [_pos(opened_at=old, tp_price=200.0)])
-    monkeypatch.setattr(trader, "get_price", lambda s: 100.5)   # hareket yok
+    monkeypatch.setattr(trader, "get_prices", lambda syms: {s: 100.5 for s in syms})   # hareket yok
     closed = trader.monitor_positions()
     assert len(closed) == 1 and closed[0]["close_reason"] == "time-stop"
 
@@ -66,7 +66,7 @@ def test_time_stop_respects_age(clean, monkeypatch):
     trader.S.time_stop_min = 30
     fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     monkeypatch.setattr(trader, "_positions", [_pos(opened_at=fresh, tp_price=200.0)])
-    monkeypatch.setattr(trader, "get_price", lambda s: 100.5)
+    monkeypatch.setattr(trader, "get_prices", lambda syms: {s: 100.5 for s in syms})
     assert trader.monitor_positions() == []
 
 
@@ -74,7 +74,7 @@ def test_breakeven_moves_sl_to_entry(clean, monkeypatch):
     trader.S.breakeven_pct = 2.0
     p = _pos(entry=100.0, sl_price=97.0)
     monkeypatch.setattr(trader, "_positions", [p])
-    monkeypatch.setattr(trader, "get_price", lambda s: 103.0)   # +%3 > breakeven %2
+    monkeypatch.setattr(trader, "get_prices", lambda syms: {s: 103.0 for s in syms})   # +%3 > breakeven %2
     trader.monitor_positions()
     assert p["sl_price"] == 100.0 and p["breakeven_done"] is True
 
@@ -84,7 +84,7 @@ def test_partial_tp_scales_out(clean, monkeypatch):
     trader.S.partial_tp_frac = 0.5
     p = _pos(entry=100.0, usdt=100.0, tp_price=200.0)
     monkeypatch.setattr(trader, "_positions", [p])
-    monkeypatch.setattr(trader, "get_price", lambda s: 106.0)   # +%6 > partial %5
+    monkeypatch.setattr(trader, "get_prices", lambda syms: {s: 106.0 for s in syms})   # +%6 > partial %5
     closed = trader.monitor_positions()
     assert len(closed) == 1 and closed[0]["close_reason"] == "partial-tp"
     assert closed[0]["usdt"] == 50.0           # yarısı kapandı

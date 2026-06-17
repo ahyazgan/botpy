@@ -1325,9 +1325,54 @@ def _news_age_sec(item: NewsItem) -> float | None:
     return (datetime.now(timezone.utc) - t).total_seconds()
 
 
+_PORTFOLIO_CORR_LIMIT = 30   # korelasyon için kaç mum (CONFIRM_INTERVAL bazında)
+_corr_cache: dict[str, tuple[float, list[float]]] = {}   # symbol -> (monotonic_ts, getiri_serisi)
+_CORR_CACHE_TTL = 120.0      # getiri serisi cache (saniye) — aynı turda tekrar çekme
+
+
+def _return_series(session: requests.Session, symbol: str) -> list[float]:
+    """Bir parite için getiri serisi (kapanışlardan), TTL cache'li. Hata → boş liste."""
+    now = time.monotonic()
+    hit = _corr_cache.get(symbol)
+    if hit and now - hit[0] < _CORR_CACHE_TTL:
+        return hit[1]
+    try:
+        candles = get_json(
+            f"{BINANCE_API}/klines",
+            params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(_PORTFOLIO_CORR_LIMIT)},
+            timeout=REQUEST_TIMEOUT, session=session)
+        closes = [float(c[4]) for c in candles] if isinstance(candles, list) else []
+        series = trader._returns(closes)
+    except Exception as e:
+        log.debug("Getiri serisi çekilemedi (%s): %s", symbol, e)
+        series = []
+    _corr_cache[symbol] = (now, series)
+    return series
+
+
+def _portfolio_series(item: NewsItem) -> dict[str, list[float]] | None:
+    """Portföy korelasyon-yükü için yeni aday + açık pozisyon coinlerinin getiri serileri.
+
+    Yalnız portfolio_risk AÇIK + açık pozisyon VAR + adayın sembolü varsa kline çeker
+    (aksi halde None — boşuna ağ yok). Cache'li, hatalar boş seriye düşer (nötr).
+    """
+    if not trader.S.portfolio_risk or not item.symbol:
+        return None
+    open_syms = set(trader.open_symbols())
+    if not open_syms:
+        return None
+    syms = open_syms | {item.symbol}
+    sess = requests.Session()
+    try:
+        return {s: _return_series(sess, s) for s in syms}
+    finally:
+        sess.close()
+
+
 def _trade_context(item: NewsItem) -> dict[str, Any]:
-    """Oto-işlem güvenlik kapıları için bağlam (akış durumu + haber yaşı)."""
-    return {"feed_stale": _ws_feed_stale(), "news_age_sec": _news_age_sec(item)}
+    """Oto-işlem güvenlik kapıları için bağlam (akış durumu + haber yaşı + portföy serisi)."""
+    return {"feed_stale": _ws_feed_stale(), "news_age_sec": _news_age_sec(item),
+            "price_series": _portfolio_series(item)}
 
 
 def _prune_news() -> None:

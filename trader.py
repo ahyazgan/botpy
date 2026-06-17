@@ -94,6 +94,10 @@ class Settings:
     kelly_min_trades: int = 20       # bu kadar kapanmış işlem yoksa Kelly nötr (gürültüden öğrenme yok)
     risk_parity: bool = False        # vol-hedef: SL mesafesi geniş işlemde boyutu kıs (sabit USDT-risk)
     target_risk_usdt: float = 0.0    # >0 ise risk-eşitleme hedefi; 0 → trade_usdt'nin %stop_loss'u
+    # Portföy-seviye risk: açık pozisyonlar korelasyonluysa "tek bahis" → boyutu kıs
+    portfolio_risk: bool = False     # korelasyon-farkında boyut: yeni pozisyon mevcutlarla koreleyse küçült
+    corr_threshold: float = 0.6      # bu korelasyonun üstündeki açık pozisyon "aynı bahis" sayılır
+    max_portfolio_heat: float = 2.5  # etkin (korelasyon-düzeltilmiş) pozisyon sayısı tavanı
     # Hacim Beyni — profesyonel haber-trade hacim mantığı
     size_by_volume: bool = False     # likidite-katmanlı boyut: ince coinde küçül (exit-trap önleme)
     min_rel_volume: float = 0.0      # >0: RVOL (göreceli hacim) bu katın altındaysa girme (hacimsiz=fake)
@@ -142,6 +146,7 @@ _PERSIST_KEYS = (
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "size_by_kelly", "kelly_fraction", "kelly_min_trades",
     "risk_parity", "target_risk_usdt",
+    "portfolio_risk", "corr_threshold", "max_portfolio_heat",
     "size_by_volume", "min_rel_volume", "rvol_scale_by_impact", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
@@ -1167,6 +1172,12 @@ def close_all(reason: str = "toplu-kapat") -> dict[str, Any]:
     }
 
 
+def open_symbols() -> list[str]:
+    """Açık pozisyonların sembolleri (ağsız — portföy korelasyonu için hızlı erişim)."""
+    with _lock:
+        return [p["symbol"] for p in _positions if p.get("symbol")]
+
+
 def get_positions() -> tuple[list[dict[str, Any]], float]:
     with _lock:
         snap = list(_positions)
@@ -1466,12 +1477,66 @@ def _risk_parity_factor(usdt: float, stop_pct: float | None) -> float:
     return round(max(_KELLY_MIN_MULT, min(_KELLY_MAX_MULT, target / actual_risk)), 3)
 
 
+def _returns(closes: list[float]) -> list[float]:
+    """Kapanış serisinden basit getiri serisi (ardışık % değişim). Saf."""
+    out: list[float] = []
+    for a, b in zip(closes, closes[1:]):
+        if a > 0:
+            out.append((b - a) / a)
+    return out
+
+
+def _corr(xs: list[float], ys: list[float]) -> float | None:
+    """İki getiri serisinin Pearson korelasyonu (eşit boya kırpılır). <3 nokta/sıfır var → None."""
+    n = min(len(xs), len(ys))
+    if n < 3:
+        return None
+    return _pearson(xs[-n:], ys[-n:])
+
+
+def _portfolio_heat(new_sym: str, new_side: str,
+                    series: dict[str, list[float]]) -> dict[str, Any]:
+    """Yeni pozisyonun açık pozisyonlarla korelasyon-yükü ("tek bahis" riski). Saf.
+
+    `series`: {symbol: getiri_serisi} (yeni + açık coinler). Açık pozisyonlardan AYNI
+    YÖNDE olup yeni adayla |korelasyon| ≥ corr_threshold olanlar "aynı bahis" sayılır.
+    `heat` = 1 (yeni) + Σ korelasyon-ağırlık (ters yön korelasyonu yükü düşürür — hedge).
+    `factor` = boyut çarpanı: heat tavanı (max_portfolio_heat) aşılırsa kıs ([0.25,1.0]).
+    Veri yoksa nötr (heat=1, factor=1.0) — eksik veri ceza değil.
+    """
+    with _lock:
+        opens = [(p["symbol"], p["side"]) for p in _positions if p["symbol"] != new_sym]
+    new_ret = series.get(new_sym, [])
+    correlated: list[dict[str, Any]] = []
+    heat = 1.0
+    for sym, side in opens:
+        c = _corr(new_ret, series.get(sym, []))
+        if c is None:
+            continue
+        # Aynı yön + pozitif korelasyon → yük artar; ters yön + pozitif korelasyon → hedge (azalır)
+        signed = c if side == new_side else -c
+        if abs(c) >= S.corr_threshold:
+            correlated.append({"symbol": sym, "corr": round(c, 2), "side": side})
+        heat += max(-0.5, min(1.0, signed))   # tek pozisyonun katkısı [-0.5, 1.0]
+    heat = max(0.0, round(heat, 2))
+    if heat <= S.max_portfolio_heat:
+        factor = 1.0
+    else:
+        # Tavanı aşan ısı oranında kıs (en fazla 0.25x)
+        factor = max(0.25, round(S.max_portfolio_heat / heat, 3))
+    return {"heat": heat, "factor": factor, "correlated": correlated, "n_open": len(opens)}
+
+
 def auto_decision(item: Any, *, feed_stale: bool = False,
-                  news_age_sec: float | None = None) -> dict[str, Any]:
+                  news_age_sec: float | None = None,
+                  price_series: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
 
     Global `auto_trade` anahtarını dikkate almaz (kalibrasyon/önizleme için her
     sinyali değerlendirir). Dönen: {would_trade, reason, side, usdt, news_source}.
+
+    `price_series`: {symbol: getiri_serisi} — portföy korelasyon-yükü için (yeni aday +
+    açık coinler). Çağıran (ağlı) doldurur; yoksa portföy-risk nötr (saf/ağsız kalır).
 
     `feed_stale`: haber akışı (WS) kopuk mu — güvenlik durdurması için çağıran geçirir.
     `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
@@ -1554,8 +1619,17 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # canlı yolda ATR çıkışı açıksa ATR'den, değilse sabit stop_loss_pct'ten gelir.
     if S.risk_parity:
         usdt *= _risk_parity_factor(usdt, _effective_stop_pct(getattr(item, "atr_pct", None)))
-    return {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
-            "side": side, "usdt": round(usdt, 2), "news_source": news_source}
+    # Portföy-seviye: yeni pozisyon mevcut açık pozisyonlarla koreleyse "tek bahis" → kıs.
+    # price_series çağırandan gelir (ağlı); yoksa nötr.
+    heat_info: dict[str, Any] | None = None
+    if S.portfolio_risk and price_series:
+        heat_info = _portfolio_heat(symbol, side, price_series)
+        usdt *= heat_info["factor"]
+    out = {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
+           "side": side, "usdt": round(usdt, 2), "news_source": news_source}
+    if heat_info is not None:
+        out["portfolio_heat"] = heat_info
+    return out
 
 
 def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str, Any] | None:
@@ -1569,10 +1643,12 @@ def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str,
 
 def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                      news_age_sec: float | None = None,
-                     brain: Any = None) -> dict[str, Any] | None:
+                     brain: Any = None,
+                     price_series: dict[str, list[float]] | None = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
-    d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec)
+    d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
+                      price_series=price_series)
     if not d["would_trade"]:
         return None
     usdt = d["usdt"]

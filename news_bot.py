@@ -176,6 +176,8 @@ class NewsItem:
     reason: str = ""
     scorer: str = "rule"            # rule | claude
     mismatch: bool = False          # başlık↔gövde çelişkisi (clickbait/şişirilmiş başlık)
+    source_count: int = 1           # aynı olayı bildiren farklı kaynak sayısı (çapraz-doğrulama)
+    confirming_sources: list[str] = field(default_factory=list)  # teyit eden kaynaklar
     # fiyat teyidi (Binance)
     symbol: str | None = None       # işlem yapılacak parite (örn. BTCUSDT)
     price_24h_pct: float | None = None
@@ -779,6 +781,67 @@ def _cluster_context(item: NewsItem) -> dict[str, Any]:
     return {"son_haber": same + opp, "ayni_yon": same, "ters_yon": opp}
 
 
+# ── Çoklu-haber füzyonu: aynı olayı farklı kaynaklardan çapraz-doğrula ───────
+FUSE_NEWS = True              # aynı coin+yön+pencere'deki farklı kaynakları say → güven
+FUSE_WINDOW_MIN = 20          # bu pencerede (dk) aynı olay sayılır
+FUSE_MAX_IMPACT_BONUS = 2     # çok-kaynak teyidi impact'i en fazla bu kadar artırır (cap'li)
+
+
+def _fuse_event(item: NewsItem, snapshot: list[NewsItem]) -> dict[str, Any]:
+    """Bu haberi aynı olayı bildiren DİĞER KAYNAKLARLA çapraz-doğrula (saf, ağsız).
+
+    Aynı coin + aynı yön + FUSE_WINDOW_MIN penceresinde FARKLI kaynaktan gelen haberler
+    "teyit" sayılır (tek kaynak vs 3 kaynak = farklı güven). Döner: {source_count,
+    confirming_sources, impact_bonus}. Tek kaynak → bonus 0. Bonus = min(kaynak−1,
+    FUSE_MAX_IMPACT_BONUS) — her ek bağımsız kaynak +1, cap'li. Aynı kaynağın tekrarı
+    (echo) sayılmaz; nötr yön katkı yapmaz.
+    """
+    coin = item.symbol or (item.coins[0] if item.coins else None)
+    base_src = (item.source or "").lower().strip()
+    if not coin or item.direction == "neutral":
+        return {"source_count": 1, "confirming_sources": [], "impact_bonus": 0}
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=FUSE_WINDOW_MIN)
+    confirming: set[str] = set()
+    for n in snapshot:
+        if n.id == item.id or n.direction != item.direction:
+            continue
+        n_coin = n.symbol or (n.coins[0] if n.coins else None)
+        if n_coin != coin:
+            continue
+        nsrc = (n.source or "").lower().strip()
+        if not nsrc or nsrc == base_src:   # echo/aynı kaynak → güven katmaz
+            continue
+        t = _parse_time(n.published) or _parse_time(n.fetched_at)
+        if t is None or t < cutoff:
+            continue
+        confirming.add(n.source)
+    source_count = 1 + len(confirming)
+    bonus = min(len(confirming), FUSE_MAX_IMPACT_BONUS)
+    return {"source_count": source_count, "confirming_sources": sorted(confirming),
+            "impact_bonus": bonus}
+
+
+def _apply_fusion(items: list[NewsItem]) -> None:
+    """Yeni haberleri çoklu-kaynak füzyonuyla zenginleştir (yerinde günceller).
+
+    Her item için aynı olayı bildiren farklı kaynakları sayar; çok-kaynak teyidi
+    impact'i artırır (cap 10). source_count/confirming_sources item'a yazılır → beyin
+    ve panel görür. Snapshot tüm haber havuzu (yeni + eski, pencere içi süzülür).
+    """
+    if not FUSE_NEWS:
+        return
+    with _cache_lock:
+        snapshot = list(_news)
+    for it in items:
+        f = _fuse_event(it, snapshot)
+        it.source_count = f["source_count"]
+        it.confirming_sources = f["confirming_sources"]
+        if f["impact_bonus"] > 0 and it.impact < 10:
+            it.impact = min(10, it.impact + f["impact_bonus"])
+            extra = f"{f['source_count']} kaynak teyidi"
+            it.reason = (it.reason + f" [{extra}]")[:160] if it.reason else extra
+
+
 def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
     resp = client.messages.parse(
         model=model, max_tokens=500, system=_ENTRY_BRAIN_SYSTEM,
@@ -820,6 +883,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
             "guc": item.impact, "yon": item.direction, "gerekce": item.reason[:160],
             "coin": item.symbol, "yas_sn": round(_news_age_sec(item) or 0),
             "baslik_govde_celiskisi": item.mismatch,  # clickbait/şişirme tespit edildi mi
+            "kaynak_teyidi": item.source_count,       # kaç farklı kaynak aynı olayı bildirdi
         },
         "fiyat": {
             "deg_24s_pct": item.price_24h_pct, "deg_15dk_pct": item.price_15m_pct,
@@ -1458,6 +1522,10 @@ def process_items(
             score_with_claude(new_items)
         except Exception as e:
             log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
+
+    # Faz 3 — Çoklu-kaynak füzyonu: aynı olayı bildiren farklı kaynaklar impact'i artırır
+    # (nihai skordan sonra → eşik/oto-işlem çapraz-doğrulanmış gücü görür)
+    _apply_fusion(new_items)
 
     # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
     alerts = [it for it in new_items if it.impact >= threshold]

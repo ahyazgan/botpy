@@ -38,6 +38,8 @@ type NewsItem = {
   reason: string;
   scorer: string;
   mismatch?: boolean;
+  source_count?: number;
+  confirming_sources?: string[];
   symbol: string | null;
   price_24h_pct: number | null;
   price_15m_pct: number | null;
@@ -1533,6 +1535,12 @@ export default function App() {
                         <span className="rounded-md border border-amber-600/40 bg-amber-950/40 px-1.5 py-0.5 font-semibold text-amber-300"
                           title="Başlık↔gövde çelişkisi: başlık iddialı ama gövde belirsiz/söylenti (clickbait). İmpact kıstırıldı.">
                           ⚠ clickbait
+                        </span>
+                      )}
+                      {(n.source_count ?? 1) > 1 && (
+                        <span className="rounded-md border border-sky-600/40 bg-sky-950/40 px-1.5 py-0.5 font-semibold text-sky-300"
+                          title={`Çok-kaynak teyidi: ${n.confirming_sources?.join(", ") ?? ""} aynı olayı bildirdi. İmpact artırıldı.`}>
+                          ✓{n.source_count} kaynak
                         </span>
                       )}
                       <span className="text-zinc-700">·</span>

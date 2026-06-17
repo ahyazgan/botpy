@@ -175,6 +175,7 @@ class NewsItem:
     direction: str = "neutral"      # bullish | bearish | neutral
     reason: str = ""
     scorer: str = "rule"            # rule | claude
+    mismatch: bool = False          # başlık↔gövde çelişkisi (clickbait/şişirilmiş başlık)
     # fiyat teyidi (Binance)
     symbol: str | None = None       # işlem yapılacak parite (örn. BTCUSDT)
     price_24h_pct: float | None = None
@@ -569,6 +570,7 @@ class _ItemScore(BaseModel):
     impact: int           # 1-10
     direction: str        # bullish | bearish | neutral
     reason: str
+    mismatch: bool = False  # başlık gövdeyle çelişiyor mu (clickbait/şişirilmiş başlık)
 
 
 class _ScoreBatch(BaseModel):
@@ -584,14 +586,20 @@ _SCORE_SYSTEM = (
     "- kaynak:diğer = belirsiz kaynak — temkinli\n"
     "- 'sonNs:Mx (yorgun)' = bu coin son N saatte M kez haber oldu; haber zaten "
     "fiyatlanmış olabilir, ek haberin marjinal etkisi azdır — etkiyi bir miktar düşür\n"
+    "Bazı kayıtlarda başlığın altında '» gövde:' ile haber metni özeti verilir. "
+    "BAŞLIK ile GÖVDE çelişiyorsa (başlık iddialı/sansasyonel ama gövde belirsiz, "
+    "söylenti, 'olabilir/iddia ediliyor', eski olay, ilgisiz coin → clickbait/şişirme) "
+    "mismatch=true ver ve impact'i DÜŞÜR (şişirilmiş başlığa kanma). Gövde başlığı "
+    "doğruluyorsa mismatch=false.\n"
     "Her başlık için tek bir JSON kaydı üret:\n"
     "- index: başlığın numarası\n"
     "- coins: etkilenen coin ticker'ları (örn. ['BTC','SOL']); net coin yoksa boş liste\n"
     "- impact: 1-10 piyasa etkisi (10 = piyasayı anında sert hareket ettirir: hack, "
     "iflas, ETF onayı, büyük borsa listelemesi, yasak, dava; 1 = önemsiz/genel yorum). "
-    "Kaynak güvenilirliği ve yorgunluğu bu skoru ayarlar.\n"
+    "Kaynak güvenilirliği, yorgunluğu ve başlık-gövde çelişkisi bu skoru ayarlar.\n"
     "- direction: 'bullish' (fiyatı yukarı), 'bearish' (aşağı) veya 'neutral'\n"
     "- reason: en fazla 12 kelimelik Türkçe gerekçe\n"
+    "- mismatch: başlık gövdeyle çelişiyor mu (true/false)\n"
     "Sadece istenen yapıyı döndür."
 )
 
@@ -600,14 +608,27 @@ _SCORE_SYSTEM = (
 # sınırına (max_tokens) sığsın — büyük gruplarda JSON kesilir.
 CLAUDE_BATCH = 25
 
+# Başlık↔gövde çelişkisi (clickbait) tespit edilen haberde impact tavanı:
+# şişirilmiş başlık ne derse desin etki en fazla bu (refleks/Tier-1 girişi engeller).
+_MISMATCH_IMPACT_CAP = 6
+
+
+def _score_line(i: int, it: NewsItem, now: datetime, ctx: list[NewsItem]) -> str:
+    """Puanlama prompt'unda bir haber satırı: başlık + (varsa) gövde özeti.
+
+    Gövde verilirse Claude başlık↔gövde çelişkisini (clickbait/şişirme) görebilir.
+    """
+    line = f"{i}. [{it.source} · {_item_context(it, now, ctx)}] {it.title}"
+    body = (it.body or "").strip()
+    if body:
+        line += f"\n   » gövde: {body[:300]}"
+    return line
+
 
 def _score_chunk(client: Any, chunk: list[NewsItem], recent: list[NewsItem] | None = None) -> None:
     now = datetime.now(timezone.utc)
     ctx = recent if recent is not None else chunk
-    listing = "\n".join(
-        f"{i}. [{it.source} · {_item_context(it, now, ctx)}] {it.title}"
-        for i, it in enumerate(chunk)
-    )
+    listing = "\n".join(_score_line(i, it, now, ctx) for i, it in enumerate(chunk))
     resp = client.messages.parse(
         model=CLAUDE_MODEL,
         max_tokens=4000,
@@ -625,6 +646,11 @@ def _score_chunk(client: Any, chunk: list[NewsItem], recent: list[NewsItem] | No
         it.impact = max(0, min(10, int(r.impact)))
         it.direction = r.direction if r.direction in ("bullish", "bearish", "neutral") else "neutral"
         it.reason = (r.reason or "")[:160]
+        it.mismatch = bool(getattr(r, "mismatch", False))
+        # Başlık↔gövde çelişkisi: şişirilmiş başlığa kanma — deterministik impact tavanı
+        if it.mismatch and it.impact > _MISMATCH_IMPACT_CAP:
+            it.impact = _MISMATCH_IMPACT_CAP
+            it.reason = (it.reason + " [başlık-gövde çelişkisi]")[:160]
         it.scorer = "claude"
 
 
@@ -793,6 +819,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
             "baslik": item.title[:200], "govde": (item.body or "")[:600],
             "guc": item.impact, "yon": item.direction, "gerekce": item.reason[:160],
             "coin": item.symbol, "yas_sn": round(_news_age_sec(item) or 0),
+            "baslik_govde_celiskisi": item.mismatch,  # clickbait/şişirme tespit edildi mi
         },
         "fiyat": {
             "deg_24s_pct": item.price_24h_pct, "deg_15dk_pct": item.price_15m_pct,

@@ -37,6 +37,7 @@ type NewsItem = {
   direction: Direction;
   reason: string;
   scorer: string;
+  mismatch?: boolean;
   symbol: string | null;
   price_24h_pct: number | null;
   price_15m_pct: number | null;
@@ -90,6 +91,7 @@ type Settings = {
   target_risk_usdt: number;
   size_by_volume: boolean;
   min_rel_volume: number;
+  rvol_scale_by_impact: boolean;
   max_book_frac: number;
   time_stop_min: number;
   breakeven_pct: number;
@@ -1207,6 +1209,14 @@ export default function App() {
               <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Sinyal kalitesi · Hacim</p>
               <NumField label="Zaten-fiyatlanmış atla % (0=kapalı)" value={settings.skip_already_priced_pct} onSave={(v) => patchSettings({ skip_already_priced_pct: v })} />
               <NumField label="Min. RVOL — hacim normalin kaçı (0=kapalı)" value={settings.min_rel_volume} onSave={(v) => patchSettings({ min_rel_volume: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ rvol_scale_by_impact: !settings.rvol_scale_by_impact })}
+                title="İmpact-ölçekli RVOL: yüksek-güç haber daha çok hacim bekler (gerçek büyük haber piyasayı oransal hareketlendirir; impact 9 ama RVOL 1x = şüpheli). Eşik = min RVOL × (1 + 0.15×(güç−8)), taban×[0.5,2]."
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.rvol_scale_by_impact ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                📈 İmpact-ölçekli RVOL: {settings.rvol_scale_by_impact ? "AÇIK" : "kapalı"}
+              </button>
               <NumField label="Maks. orderbook payı 0-1 (örn 0.10, 0=kapalı)" value={settings.max_book_frac} onSave={(v) => patchSettings({ max_book_frac: v })} />
               <button
                 type="button"
@@ -1480,6 +1490,12 @@ export default function App() {
                           {c}
                         </span>
                       ))}
+                      {n.mismatch && (
+                        <span className="rounded-md border border-amber-600/40 bg-amber-950/40 px-1.5 py-0.5 font-semibold text-amber-300"
+                          title="Başlık↔gövde çelişkisi: başlık iddialı ama gövde belirsiz/söylenti (clickbait). İmpact kıstırıldı.">
+                          ⚠ clickbait
+                        </span>
+                      )}
                       <span className="text-zinc-700">·</span>
                       <span>{timeAgo(n.published ?? n.fetched_at)}</span>
                       {n.reason && (<><span className="text-zinc-700">·</span><span className="italic text-zinc-500">{n.reason}</span></>)}

@@ -94,6 +94,7 @@ class Settings:
     # Hacim Beyni — profesyonel haber-trade hacim mantığı
     size_by_volume: bool = False     # likidite-katmanlı boyut: ince coinde küçül (exit-trap önleme)
     min_rel_volume: float = 0.0      # >0: RVOL (göreceli hacim) bu katın altındaysa girme (hacimsiz=fake)
+    rvol_scale_by_impact: bool = False  # impact-ölçekli RVOL eşiği: yüksek-güç haber daha çok hacim bekler
     max_book_frac: float = 0.0       # >0: pozisyon orderbook derinliğinin en fazla bu oranı olsun (örn 0.10)
     # Sinyal kalitesi / öğrenme
     suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
@@ -137,7 +138,7 @@ _PERSIST_KEYS = (
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "size_by_kelly", "kelly_fraction", "kelly_min_trades",
     "risk_parity", "target_risk_usdt",
-    "size_by_volume", "min_rel_volume", "max_book_frac",
+    "size_by_volume", "min_rel_volume", "rvol_scale_by_impact", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
@@ -1274,6 +1275,21 @@ def _liquidity_factor(volume_usd: float | None) -> float:
     return 0.25
 
 
+def _required_rvol(impact: int) -> float:
+    """Bu haberin geçmesi için gereken RVOL eşiği — impact'e göre ölçekli (opt-in).
+
+    Gerçek büyük haber piyasayı oransal hareketlendirir: impact 9-10 haberde 1.0x RVOL
+    (normal hacim) şüphelidir (fake/fiyatlanmış). Taban `min_rel_volume`; her impact
+    puanı 8'in üstünde eşiği +%15 yükseltir, altında gevşetir. rvol_scale_by_impact
+    kapalıysa sabit min_rel_volume. Korkuluk: eşik en fazla taban×2.
+    """
+    base = S.min_rel_volume
+    if not S.rvol_scale_by_impact or base <= 0:
+        return base
+    scaled = base * (1.0 + 0.15 * (impact - 8))
+    return round(max(base * 0.5, min(base * 2.0, scaled)), 2)
+
+
 # Kelly çarpanı [alt, üst] kıstırması — tam-Kelly bile asla 1.5x'i aşmaz (risk tavanı)
 _KELLY_MIN_MULT = 0.25
 _KELLY_MAX_MULT = 1.5
@@ -1409,11 +1425,13 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
                               or (side == "short" and m <= -S.skip_already_priced_pct)):
             return no(f"zaten fiyatlanmış (24s %{m:+.1f})")
     # RVOL kapısı: hacim hareketi onaylamıyorsa haber muhtemelen fake → girme.
-    # (Veri yoksa engelleme — eksik veri ≠ düşük hacim.)
+    # (Veri yoksa engelleme — eksik veri ≠ düşük hacim.) Eşik impact-ölçekli olabilir:
+    # yüksek-güç haber daha çok hacim bekler (büyük haber piyasayı oransal hareketlendirir).
     if S.min_rel_volume > 0:
         rv = getattr(item, "rel_volume", None)
-        if rv is not None and rv < S.min_rel_volume:
-            return no(f"hacim zayıf (RVOL {rv:.1f}x < {S.min_rel_volume:.1f}x)")
+        req = _required_rvol(int(item.impact))
+        if rv is not None and rv < req:
+            return no(f"hacim zayıf (RVOL {rv:.1f}x < {req:.1f}x)")
     # Öğrenilen-veto: bu haber geçmişte ANLAMLI zarar eden bir koşullu segmente düşüyorsa girme
     if S.use_learned_vetoes:
         hit = _learned_veto_hit(item)

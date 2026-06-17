@@ -17,7 +17,7 @@ def env(monkeypatch):
     captured: dict = {}
 
     def fake_place(symbol, side, usdt=None, source="manual", reason="", news_source="",
-                   impact=None, atr_pct=None, sl_mult=1.0, time_stop_min=None):
+                   impact=None, atr_pct=None, sl_mult=1.0, time_stop_min=None, **kwargs):
         captured["usdt"] = usdt
         captured["side"] = side
         captured["sl_mult"] = sl_mult

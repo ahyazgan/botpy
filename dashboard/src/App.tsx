@@ -95,6 +95,8 @@ type Settings = {
   suppress_losing_sources: boolean;
   min_source_samples: number;
   skip_already_priced_pct: number;
+  auto_tune: boolean;
+  use_learned_vetoes: boolean;
   halt_trade_on_stale: boolean;
   max_news_age_sec: number;
   max_same_direction: number;
@@ -1735,17 +1737,47 @@ export default function App() {
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-lg font-semibold text-white">
             🧠 Öğrenen beyin
-            <span className="ml-2 text-sm font-normal text-zinc-500">(öneri — otomatik uygulanmaz)</span>
+            <span className="ml-2 text-sm font-normal text-zinc-500">
+              {settings?.auto_tune ? "(kapalı döngü AÇIK — kendi kendine öğreniyor)" : "(öneri — otomatik uygulanmaz)"}
+            </span>
           </h2>
           <div className="flex flex-wrap gap-2">
+            {settings && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ auto_tune: !settings.auto_tune })}
+                title="Kapalı döngü: her işlem kapandığında öğrenen beyin önerilerini korkuluklarla OTO-uygular (eşik/kaynak/RVOL/süre-stop; risk/boyut ayarlarına dokunmaz)"
+                className={`rounded-md border px-3 py-1 text-xs font-semibold transition ${
+                  settings.auto_tune
+                    ? "border-emerald-500/50 bg-emerald-950/50 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🔁 Oto-öğren: {settings.auto_tune ? "AÇIK" : "kapalı"}
+              </button>
+            )}
+            {settings && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ use_learned_vetoes: !settings.use_learned_vetoes })}
+                title="Koşullu öğrenme: geçmişte ANLAMLI zarar eden segmentte (örn. kaynak X + düşük RVOL) otomatik girme — tek-boyutun kaçırdığı etkileşim"
+                className={`rounded-md border px-3 py-1 text-xs font-semibold transition ${
+                  settings.use_learned_vetoes
+                    ? "border-emerald-500/50 bg-emerald-950/50 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🚫 Öğrenilen-veto: {settings.use_learned_vetoes ? "AÇIK" : "kapalı"}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => void applyTuning()}
               disabled={tuningApplying}
-              title="Önerileri korkuluklarla otomatik uygula: auto_min_impact tabana kıstırılır + negatif kaynak susturulur (risk/boyut ayarlarına dokunmaz)"
+              title="Önerileri korkuluklarla bir kez uygula: auto_min_impact tabana kıstırılır + negatif kaynak susturulur + RVOL/süre-stop (risk/boyut ayarlarına dokunmaz)"
               className="rounded-md border border-amber-500/40 bg-amber-950/40 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/50 disabled:opacity-50"
             >
-              {tuningApplying ? "Uygulanıyor…" : "🤖 Oto-kalibrasyonu uygula"}
+              {tuningApplying ? "Uygulanıyor…" : "🤖 Şimdi uygula (tek sefer)"}
             </button>
             <button
               type="button"

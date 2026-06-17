@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -92,6 +93,8 @@ class Settings:
     suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
     min_source_samples: int = 8      # bir kaynağı yargılamak için gereken min kapanmış işlem
     skip_already_priced_pct: float = 0.0   # >0: 24s'te bu % haber yönünde oynamışsa girme (chase önleme)
+    auto_tune: bool = False          # kapalı döngü: öğrenen beyin önerilerini OTO-uygula (korkuluklu)
+    use_learned_vetoes: bool = False # koşullu öğrenme: anlamlı-negatif segmentte (kaynak×rvol vb.) girme
     max_funding_rate_pct: float = 0.0  # >0 (futures): yön funding'e ters & maliyet bu %'yi geçerse girme
 
 
@@ -126,7 +129,7 @@ _PERSIST_KEYS = (
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
-    "max_funding_rate_pct",
+    "max_funding_rate_pct", "auto_tune", "use_learned_vetoes",
 )
 
 
@@ -647,7 +650,8 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
                 source: str = "manual", reason: str = "",
                 news_source: str = "", impact: int | None = None,
                 atr_pct: float | None = None, sl_mult: float = 1.0,
-                time_stop_min: int | None = None) -> dict[str, Any]:
+                time_stop_min: int | None = None,
+                rel_volume: float | None = None) -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -758,10 +762,12 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "tp_price": tp_price,
         "trailing_pct": S.trailing_stop_pct,
         "high_water": price,
+        "peak": price, "trough": price,   # MFE/MAE izleme (segment SL/TP öğrenme)
         "opened_at": _now(),
         "source": source,
         "news_source": news_source,
         "impact": impact,
+        "rel_volume": rel_volume,   # öğrenme: hacim (RVOL) dilimine göre beklenti
         "reason": reason,
         "atr_pct": round(atr_pct, 3) if (S.use_atr_exits and atr_pct) else None,
         "time_stop_min": int(time_stop_min) if time_stop_min else None,
@@ -844,6 +850,17 @@ def close_position(pid: str, reason: str = "manuel", exchange_close: bool = True
     pos["pnl"] = pnl
     pos["pnl_pct"] = pct
     pos["close_reason"] = reason
+    # MFE/MAE (segment SL/TP öğrenme): haber yönünde en iyi/en kötü % hareket
+    entry = pos.get("entry_price") or 0.0
+    if entry > 0:
+        peak = pos.get("peak") or entry
+        trough = pos.get("trough") or entry
+        if pos["side"] == "long":
+            pos["mfe_pct"] = round((peak - entry) / entry * 100, 3)
+            pos["mae_pct"] = round((entry - trough) / entry * 100, 3)
+        else:
+            pos["mfe_pct"] = round((entry - trough) / entry * 100, 3)
+            pos["mae_pct"] = round((peak - entry) / entry * 100, 3)
     with _lock:
         _closed.append(pos)
         _reset_daily_if_needed()
@@ -1029,6 +1046,15 @@ def monitor_positions() -> list[dict[str, Any]]:
         gain = ((cur - entry) / entry * 100) * (1 if is_long else -1)  # haber yönünde % kazanç
         changed = False
 
+        # 0) MFE/MAE izleme (öğrenme: segment SL/TP). Fiyatın EN YÜKSEK (peak) ve
+        #    EN DÜŞÜK (trough) uçlarını sakla → kapanışta mfe%/mae% hesaplanır.
+        peak = p.get("peak") or entry
+        trough = p.get("trough") or entry
+        if cur > peak:
+            p["peak"] = cur
+        elif cur < trough:
+            p["trough"] = cur
+
         # 1) Trailing stop: kâr yönünde ilerledikçe stop'u çek
         tr = p.get("trailing_pct", 0) or 0
         if tr > 0:
@@ -1188,6 +1214,12 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         rv = getattr(item, "rel_volume", None)
         if rv is not None and rv < S.min_rel_volume:
             return no(f"hacim zayıf (RVOL {rv:.1f}x < {S.min_rel_volume:.1f}x)")
+    # Öğrenilen-veto: bu haber geçmişte ANLAMLI zarar eden bir koşullu segmente düşüyorsa girme
+    if S.use_learned_vetoes:
+        hit = _learned_veto_hit(item)
+        if hit is not None:
+            return no(f"öğrenilen-veto [{hit['kind']}: {'×'.join(map(str, hit['key']))}] "
+                      f"ort. {hit['avg_pnl']} ({hit['n']} örnek)")
     news_source = getattr(item, "source", "") or ""
     if S.suppress_losing_sources and news_source:
         st = source_stats(news_source)
@@ -1261,7 +1293,8 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                           news_source=d["news_source"], impact=int(item.impact),
                           reason=getattr(item, "reason", ""),
                           atr_pct=getattr(item, "atr_pct", None),
-                          sl_mult=sl_mult, time_stop_min=hold_min)
+                          sl_mult=sl_mult, time_stop_min=hold_min,
+                          rel_volume=getattr(item, "rel_volume", None))
     except OrderError as e:
         log.warning("Oto-işlem emri başarısız (%s): %s", item.symbol, e)
         _note_order_result(False)   # üst üste hata → devre kesici
@@ -1448,25 +1481,215 @@ def get_performance() -> dict[str, Any]:
 MIN_LEARN_SAMPLES = 10   # öneri üretmek için gereken min kapanmış işlem
 _MIN_BUCKET_SAMPLES = 4  # bir dilimi/kaynağı yargılamak için min örnek
 
+# RVOL (göreceli hacim) dilimleri — hangi hacim seviyesi kâr ediyor öğrenmek için
+_RVOL_BANDS = (("<1.0", 0.0, 1.0), ("1.0-1.5", 1.0, 1.5), ("1.5-3", 1.5, 3.0), (">=3", 3.0, 1e9))
+
+
+def _rvol_band(rv: float | None) -> str | None:
+    """Bir RVOL değerinin düştüğü dilim etiketi (öğrenme bucket'ı için)."""
+    if rv is None:
+        return None
+    for name, lo, hi in _RVOL_BANDS:
+        if lo <= rv < hi:
+            return name
+    return None
+
+
+def _hold_minutes(c: dict[str, Any]) -> float | None:
+    """Bir kapanan işlemin tutma süresi (dakika): closed_at - opened_at."""
+    a, b = _parse_dt(c.get("opened_at")), _parse_dt(c.get("closed_at"))
+    if a is None or b is None:
+        return None
+    return max(0.0, (b - a).total_seconds() / 60.0)
+
+
+def _opened_hour(c: dict[str, Any]) -> int | None:
+    """Bir işlemin açıldığı saat (UTC, 0-23) — saat-dilimi öğrenmesi için."""
+    dt = _parse_dt(c.get("opened_at"))
+    return dt.hour if dt is not None else None
+
+
+def _impact_band(impact: Any) -> str | None:
+    """Güç dilimi (koşullu edge için kaba grup): ≥9 = net/yüksek, ≤8 = sınırda."""
+    if impact is None:
+        return None
+    return "≥9" if int(impact) >= 9 else "≤8"
+
+
+# Koşullu (çok-değişkenli) edge boyutları: tek-boyutun kaçırdığı etkileşimler.
+# Her biri (etiket, anahtar-fonksiyon). Anahtar bir tuple; herhangi bir alanı
+# None ise o işlem o boyutta sayılmaz.
+_COND_DIMS: tuple[tuple[str, Any], ...] = (
+    ("kaynak×rvol", lambda c: (c.get("news_source"), _rvol_band(c.get("rel_volume")))),
+    ("güç×rvol", lambda c: (_impact_band(c.get("impact")), _rvol_band(c.get("rel_volume")))),
+    ("kaynak×yön", lambda c: (c.get("news_source"), c.get("side"))),
+)
+
+
+def _conditional_edges(trades: list[dict[str, Any]], value_key: str = "pnl",
+                       *, top: int = 8) -> list[dict[str, Any]]:
+    """Çok-değişkenli ANLAMLI edge'ler: 'X kaynağı sadece RVOL<1'de kaybettiriyor' gibi.
+
+    Tek-boyutlu marjinal ortalamaların gizlediği koşullu kuralları bulur (Simpson).
+    Yalnız istatistiksel anlamlı (GA 0'ı dışlayan) segmentleri, |beklenti|'ye göre döner.
+    """
+    edges: list[dict[str, Any]] = []
+    for label, kf in _COND_DIMS:
+        groups: dict[tuple, list[float]] = {}
+        for c in trades:
+            k = kf(c)
+            if k is None or any(x is None for x in k):
+                continue
+            groups.setdefault(k, []).append(float(c[value_key]))
+        for k, vals in groups.items():
+            if len(vals) < _MIN_BUCKET_SAMPLES:
+                continue
+            ci = _expectancy_ci(vals)
+            if not ci["significant"]:
+                continue
+            edges.append({
+                "dim": label, "kind": label, "key": list(k),
+                "condition": " & ".join(str(x) for x in k),
+                "n": ci["n"], "avg_pnl": ci["mean"],
+                "ci_lo": ci["ci_lo"], "ci_hi": ci["ci_hi"],
+                "positive": ci["ci_lo"] > 0,
+            })
+    edges.sort(key=lambda e: abs(e["avg_pnl"]), reverse=True)
+    return edges[:top]
+
+
+# Öğrenilen-veto: anlamlı-negatif koşullu segmentler. Monitor hook'u tazeler
+# (refresh_learned_vetoes); auto_decision use_learned_vetoes açıkken kontrol eder.
+_learned_vetoes: list[dict[str, Any]] = []
+
+
+def _item_segment(item: Any, kind: str) -> tuple | None:
+    """Bir haber item'ının verili koşul-boyutundaki segment anahtarı (veto eşleştirme)."""
+    rv = _rvol_band(getattr(item, "rel_volume", None))
+    src = getattr(item, "source", None)
+    side = "long" if getattr(item, "direction", "") == "bullish" else (
+        "short" if getattr(item, "direction", "") == "bearish" else None)
+    if kind == "kaynak×rvol":
+        return (src, rv)
+    if kind == "güç×rvol":
+        return (_impact_band(getattr(item, "impact", None)), rv)
+    if kind == "kaynak×yön":
+        return (src, side)
+    return None
+
+
+def refresh_learned_vetoes() -> int:
+    """Kapanan işlemlerden anlamlı-negatif koşullu segmentleri öğren (veto listesi).
+
+    Monitor hook'undan çağrılır; use_learned_vetoes açıkken auto_decision bunları eler.
+    Dönen: aktif veto sayısı.
+    """
+    global _learned_vetoes
+    with _lock:
+        closed = [c for c in _closed if c.get("pnl") is not None]
+    edges = _conditional_edges(closed, "pnl")
+    _learned_vetoes = [{"kind": e["kind"], "key": e["key"], "avg_pnl": e["avg_pnl"], "n": e["n"]}
+                       for e in edges if not e["positive"]]
+    return len(_learned_vetoes)
+
+
+def _learned_veto_hit(item: Any) -> dict[str, Any] | None:
+    """item öğrenilmiş anlamlı-negatif bir segmente düşüyorsa o vetoyu döner, yoksa None."""
+    for v in _learned_vetoes:
+        seg = _item_segment(item, v["kind"])
+        if seg is not None and list(seg) == v["key"]:
+            return v
+    return None
+
+
+# İstatistiksel güven: ham ortalama yerine güven aralığı / Wilson alt sınırı kullan
+# ki beyin AZ örnekli gürültüyü "edge" sanmasın (kapalı döngüde kritik).
+_Z = 1.96   # %95 güven (normal yaklaşım)
+
+
+def _expectancy_ci(values: list[float]) -> dict[str, Any]:
+    """Bir değer kümesinin ortalaması + %95 güven aralığı (normal yaklaşım).
+
+    `significant`: aralık 0'ı dışlıyor mu (anlamlı pozitif/negatif). n<2 → anlamsız.
+    """
+    n = len(values)
+    if n == 0:
+        return {"mean": 0.0, "ci_lo": 0.0, "ci_hi": 0.0, "n": 0, "significant": False}
+    mean = sum(values) / n
+    if n < 2:
+        return {"mean": round(mean, 3), "ci_lo": round(mean, 3), "ci_hi": round(mean, 3),
+                "n": n, "significant": False}
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    se = math.sqrt(var) / math.sqrt(n)
+    lo, hi = mean - _Z * se, mean + _Z * se
+    return {"mean": round(mean, 3), "ci_lo": round(lo, 3), "ci_hi": round(hi, 3),
+            "n": n, "significant": lo > 0 or hi < 0}
+
+
+def _wilson_lo(wins: int, n: int) -> float:
+    """Kazanma oranı için Wilson skor aralığının ALT sınırı (%95). Az örnekte ihtiyatlı."""
+    if n == 0:
+        return 0.0
+    p = wins / n
+    z2 = _Z * _Z
+    denom = 1 + z2 / n
+    centre = p + z2 / (2 * n)
+    margin = _Z * math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)
+    return round(max(0.0, (centre - margin) / denom), 3)
+
+
+def _regime_check(trades: list[dict[str, Any]], value_key: str = "pnl") -> dict[str, Any]:
+    """Rejim-kayması: SON yarı ile ESKİ yarının beklentisi belirgin farklı mı.
+
+    İşlemleri zamana göre sırala, ikiye böl, iki yarının %95 GA'sını karşılaştır.
+    `shifted`: aralıklar çakışmıyor (dağılım değişti) → eski veri güncel piyasayı
+    yansıtmıyor olabilir; öğrenmede son veriye daha çok güven. `improving`: son>eski.
+    """
+    timed: list[tuple[datetime, dict[str, Any]]] = []
+    for c in trades:
+        t = _parse_dt(c.get("closed_at")) or _parse_dt(c.get("opened_at"))
+        if t is not None:
+            timed.append((t, c))
+    if len(timed) < 2 * _MIN_BUCKET_SAMPLES:
+        return {"ready": False, "shifted": False}
+    timed.sort(key=lambda x: x[0])
+    mid = len(timed) // 2
+    older = _expectancy_ci([float(c[value_key]) for _, c in timed[:mid]])
+    recent = _expectancy_ci([float(c[value_key]) for _, c in timed[mid:]])
+    # GA'lar çakışmıyorsa dağılım değişmiş (rejim kayması)
+    shifted = recent["ci_hi"] < older["ci_lo"] or recent["ci_lo"] > older["ci_hi"]
+    return {"ready": True, "shifted": shifted, "improving": recent["mean"] > older["mean"],
+            "recent_avg": recent["mean"], "older_avg": older["mean"],
+            "recent_n": recent["n"], "older_n": older["n"]}
+
 
 def _bucket_stats(trades: list[dict[str, Any]], key_fn: Any,
                   value_key: str = "pnl") -> dict[str, dict[str, Any]]:
-    """trades'i key_fn'e göre grupla: {key: {count, pnl, avg_pnl, win_rate}}.
+    """trades'i key_fn'e göre grupla: her dilim için sayım + beklenti + İSTATİSTİKSEL GÜVEN.
+
+    Döner: {key: {count, pnl, avg_pnl, win_rate, ci_lo, ci_hi, significant, wilson_lo}}.
+    `significant`: ort. beklentinin %95 GA'sı 0'ı dışlıyor mu (gürültü değil, gerçek edge).
     value_key: kâr alanı — canlı işlemde 'pnl' (USDT), backtest'te 'net_pct' (%)."""
-    out: dict[str, dict[str, Any]] = {}
+    vals: dict[str, list[float]] = {}
+    wins: dict[str, int] = {}
     for c in trades:
         k = key_fn(c)
         if k is None:
             continue
-        d = out.setdefault(str(k), {"count": 0, "pnl": 0.0, "wins": 0})
+        sk = str(k)
         v = float(c[value_key])
-        d["count"] += 1
-        d["pnl"] = round(d["pnl"] + v, 3)
-        if v > 0:
-            d["wins"] += 1
-    for d in out.values():
-        d["avg_pnl"] = round(d["pnl"] / d["count"], 3)
-        d["win_rate"] = round(d["wins"] / d["count"] * 100, 1)
+        vals.setdefault(sk, []).append(v)
+        wins[sk] = wins.get(sk, 0) + (1 if v > 0 else 0)
+    out: dict[str, dict[str, Any]] = {}
+    for sk, vlist in vals.items():
+        n = len(vlist)
+        ci = _expectancy_ci(vlist)
+        out[sk] = {
+            "count": n, "pnl": round(sum(vlist), 3), "wins": wins[sk],
+            "avg_pnl": ci["mean"], "win_rate": round(wins[sk] / n * 100, 1),
+            "ci_lo": ci["ci_lo"], "ci_hi": ci["ci_hi"],
+            "significant": ci["significant"], "wilson_lo": _wilson_lo(wins[sk], n),
+        }
     return out
 
 
@@ -1482,52 +1705,138 @@ def _suggest_from_trades(trades: list[dict[str, Any]], *, value_key: str, source
     by_source = _bucket_stats(trades, lambda c: c.get(source_key) or None, value_key)
     by_tier = (_bucket_stats(trades, lambda c: tier_of(c.get(source_key) or "") if c.get(source_key) else None, value_key)
                if tier_of else {})
+    # Çok-boyutlu öğrenme: yön / coin / saat-dilimi / RVOL (hacim) dilimi
+    by_direction = _bucket_stats(trades, lambda c: c.get("side") or None, value_key)
+    by_coin = _bucket_stats(trades, lambda c: c.get("symbol") or None, value_key)
+    by_hour = _bucket_stats(trades, _opened_hour, value_key)
+    by_rvol = _bucket_stats(trades, lambda c: _rvol_band(c.get("rel_volume")), value_key)
+    dims = {"by_impact": by_impact, "by_tier": by_tier, "by_source": by_source,
+            "by_direction": by_direction, "by_coin": by_coin, "by_hour": by_hour, "by_rvol": by_rvol}
 
     suggestions: list[dict[str, Any]] = []
     if n < MIN_LEARN_SAMPLES:
         return {"ready": False, "samples": n, "min_samples": MIN_LEARN_SAMPLES,
-                "suggestions": [], "by_impact": by_impact, "by_tier": by_tier,
-                "by_source": by_source}
+                "suggestions": [], **dims}
 
-    # 1) auto_min_impact: beklentiyi (o eşik ve üstü ort. kâr) en yükseğe çıkaran eşik
+    # 1) auto_min_impact: beklentiyi en yükseğe çıkaran eşik — ANLAMLI pozitif olmalı
+    #    (o eşik ve üstü beklentinin %95 GA alt sınırı > 0; gürültüye göre eşik oynatma).
     impacts = sorted(int(k) for k in by_impact)
     best_t, best_avg = None, None
     for t in impacts:
-        rows = [c for c in trades if c.get("impact") and int(c["impact"]) >= t]
+        rows = [float(c[value_key]) for c in trades if c.get("impact") and int(c["impact"]) >= t]
         if len(rows) < _MIN_BUCKET_SAMPLES:
             continue
-        avg = round(sum(float(c[value_key]) for c in rows) / len(rows), 3)
-        if best_avg is None or avg > best_avg:
-            best_t, best_avg = t, avg
-    if best_t is not None and best_avg is not None and best_avg > 0 and best_t != S.auto_min_impact:
+        ci = _expectancy_ci(rows)
+        if ci["ci_lo"] <= 0:        # anlamlı pozitif değil → güvenme
+            continue
+        if best_avg is None or ci["mean"] > best_avg:
+            best_t, best_avg = t, ci["mean"]
+    if best_t is not None and best_avg is not None and best_t != S.auto_min_impact:
         verb = "yükselt" if best_t > S.auto_min_impact else "düşür"
         suggestions.append({
             "type": "auto_min_impact", "current": S.auto_min_impact, "suggested": best_t,
             "message": f"Oto min. gücü {S.auto_min_impact}→{best_t} {verb}: güç ≥{best_t} "
-                       f"ort. {best_avg}{unit} (pozitif beklenti).",
+                       f"ort. {best_avg}{unit} (istatistiksel anlamlı pozitif).",
         })
 
-    # 2) kaynak-tier: yeterli örnekli ve negatif beklentili tier'i kıs
+    # 2) kaynak-tier: ANLAMLI negatif beklentili (GA üst sınırı < 0) tier'i kıs
     for tier, d in by_tier.items():
-        if d["count"] >= MIN_LEARN_SAMPLES and d["avg_pnl"] < 0:
+        if d["count"] >= MIN_LEARN_SAMPLES and d["significant"] and d["ci_hi"] < 0:
             suggestions.append({
                 "type": "suppress_tier", "tier": tier, "avg_pnl": d["avg_pnl"], "count": d["count"],
-                "message": f"'{tier}' kaynak sınıfı negatif beklentili (ort. {d['avg_pnl']}{unit}, "
-                           f"{d['count']} örnek) — bu sınıfı kısmayı/güç eşiğini artırmayı düşün.",
+                "message": f"'{tier}' kaynak sınıfı ANLAMLI negatif (ort. {d['avg_pnl']}{unit}, "
+                           f"GA≤{d['ci_hi']}, {d['count']} örnek) — bu sınıfı kıs/eşiği artır.",
             })
 
-    # 3) tek kaynak: negatif beklentili kaynağı sustur (suppress_losing_sources ile)
+    # 3) tek kaynak: ANLAMLI negatif beklentili kaynağı sustur (gürültü değil, gerçek)
     for src, d in by_source.items():
-        if d["count"] >= S.min_source_samples and d["avg_pnl"] < 0:
+        if d["count"] >= S.min_source_samples and d["significant"] and d["ci_hi"] < 0:
             suggestions.append({
                 "type": "suppress_source", "source": src, "avg_pnl": d["avg_pnl"], "count": d["count"],
-                "message": f"Kaynak '{src}' negatif beklentili (ort. {d['avg_pnl']}{unit}, "
-                           f"{d['count']} örnek) — 'kaybeden kaynağı sustur' bunu zaten eler.",
+                "message": f"Kaynak '{src}' ANLAMLI negatif (ort. {d['avg_pnl']}{unit}, "
+                           f"GA≤{d['ci_hi']}, {d['count']} örnek) — 'kaybeden kaynağı sustur' eler.",
+            })
+
+    # 4) min_rel_volume: düşük-RVOL dilim(ler)i negatif, üst dilim pozitifse hacim eşiği öner
+    #    (hacimsiz haber = fake → girme). En düşük POZİTİF beklentili dilimin tabanını öner.
+    rv_ok = [(lo, by_rvol[name]) for name, lo, _ in _RVOL_BANDS
+             if name in by_rvol and by_rvol[name]["count"] >= _MIN_BUCKET_SAMPLES]
+    if len(rv_ok) >= 2:
+        # ANLAMLI: düşük dilim GA üst<0 (gerçek negatif), üst dilim GA alt>0 (gerçek pozitif)
+        neg_low = any(lo < 1.5 and d["significant"] and d["ci_hi"] < 0 for lo, d in rv_ok)
+        pos_bands = [lo for lo, d in rv_ok if d["significant"] and d["ci_lo"] > 0]
+        if neg_low and pos_bands:
+            cutoff = max(1.0, min(pos_bands))   # ilk pozitif dilimin tabanı (≥1.0)
+            if abs(cutoff - S.min_rel_volume) >= 0.25:
+                suggestions.append({
+                    "type": "min_rel_volume", "current": S.min_rel_volume, "suggested": cutoff,
+                    "message": f"Min RVOL {S.min_rel_volume}→{cutoff}: düşük hacimli dilim negatif, "
+                               f"≥{cutoff}x pozitif beklenti — hacimsiz/fake haberleri eler.",
+                })
+
+    # 5) time_stop: kaybedenler kazananlardan belirgin uzun tutuluyorsa süre-stop öner
+    #    (edge sönünce kes). Kazananların ort. tutma süresi × 1.5 makul tavan.
+    win_h = [h for c in trades if (h := _hold_minutes(c)) is not None and float(c[value_key]) > 0]
+    loss_h = [h for c in trades if (h := _hold_minutes(c)) is not None and float(c[value_key]) <= 0]
+    if len(win_h) >= _MIN_BUCKET_SAMPLES and len(loss_h) >= _MIN_BUCKET_SAMPLES:
+        avg_win, avg_loss = sum(win_h) / len(win_h), sum(loss_h) / len(loss_h)
+        if avg_loss > avg_win * 1.5:
+            sug = round(avg_win * 1.5)
+            if sug > 0 and (S.time_stop_min == 0 or abs(sug - S.time_stop_min) >= 10):
+                suggestions.append({
+                    "type": "time_stop", "current": S.time_stop_min, "suggested": sug,
+                    "message": f"Süre-stop {S.time_stop_min}→{sug}dk: kaybedenler ort. {avg_loss:.0f}dk "
+                               f"tutuluyor, kazananlar {avg_win:.0f}dk — geç çıkış zarar büyütüyor.",
+                })
+
+    # 6b) segment SL/TP: gerçekleşen MFE/MAE'den optimal stop/hedef öğren
+    #     SL ≈ kazananların MAE'sinin p75'i (kazananları erken stop'lama),
+    #     TP ≈ tüm işlemlerin MFE medyanı (gerçekçi yakalanabilir hedef).
+    win_mae = sorted(c["mae_pct"] for c in trades
+                     if c.get("mae_pct") is not None and float(c[value_key]) > 0)
+    all_mfe = sorted(c["mfe_pct"] for c in trades if c.get("mfe_pct") is not None)
+    if len(win_mae) >= MIN_LEARN_SAMPLES and len(all_mfe) >= MIN_LEARN_SAMPLES:
+        sl_sug = round(min(15.0, max(0.5, win_mae[int(len(win_mae) * 0.75)] * 1.1)), 1)
+        tp_sug = round(min(30.0, max(1.0, all_mfe[len(all_mfe) // 2])), 1)
+        if sl_sug > 0 and abs(sl_sug - S.stop_loss_pct) >= 0.5:
+            suggestions.append({
+                "type": "stop_loss_pct", "current": S.stop_loss_pct, "suggested": sl_sug,
+                "message": f"SL {S.stop_loss_pct}→{sl_sug}%: kazananların %75'i {sl_sug}% "
+                           f"içinde dipledi — daha sıkı SL kazananları erken stop'luyor.",
+            })
+        if tp_sug > 0 and abs(tp_sug - S.take_profit_pct) >= 0.5:
+            suggestions.append({
+                "type": "take_profit_pct", "current": S.take_profit_pct, "suggested": tp_sug,
+                "message": f"TP {S.take_profit_pct}→{tp_sug}%: işlemlerin medyan en-iyi hareketi "
+                           f"{tp_sug}% — hedef gerçekçi yakalanabilir seviyeye.",
+            })
+
+    # 6) rejim-kayması: son yarı eski yarıdan ANLAMLI farklıysa uyar (eski veriye güvenme)
+    regime = _regime_check(trades, value_key)
+    if regime.get("shifted"):
+        yon = "iyileşme" if regime["improving"] else "BOZULMA"
+        suggestions.append({
+            "type": "regime_shift", "improving": regime["improving"],
+            "recent_avg": regime["recent_avg"], "older_avg": regime["older_avg"],
+            "message": f"Rejim kayması ({yon}): son dönem ort. {regime['recent_avg']}{unit} "
+                       f"vs eski {regime['older_avg']}{unit} — eski veriye dayalı kararları "
+                       f"{'gözden geçir' if not regime['improving'] else 'güncelle'}.",
+        })
+
+    # 7) koşullu edge'ler: tek-boyutun kaçırdığı etkileşimler (kaynak×rvol vb.)
+    cond = _conditional_edges(trades, value_key)
+    for e in cond:
+        if not e["positive"]:   # anlamlı NEGATİF koşul → kaçın
+            suggestions.append({
+                "type": "conditional_avoid", "kind": e["kind"], "condition": e["condition"],
+                "avg_pnl": e["avg_pnl"], "count": e["n"],
+                "message": f"Koşullu kaçın [{e['dim']}: {e['condition']}]: ANLAMLI negatif "
+                           f"(ort. {e['avg_pnl']}{unit}, {e['n']} örnek) — bu kombinasyonda girme.",
             })
 
     return {"ready": True, "samples": n, "min_samples": MIN_LEARN_SAMPLES,
-            "suggestions": suggestions, "by_impact": by_impact, "by_tier": by_tier,
-            "by_source": by_source}
+            "suggestions": suggestions, "regime": regime,
+            "conditional_edges": cond, **dims}
 
 
 def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
@@ -1539,6 +1848,18 @@ def suggest_tuning(tier_of: Any = None) -> dict[str, Any]:
         closed = [c for c in _closed if c.get("pnl") is not None]
     return _suggest_from_trades(closed, value_key="pnl", source_key="news_source",
                                 tier_of=tier_of, unit=" USDT")
+
+
+def auto_apply_tuning(tier_of: Any = None) -> dict[str, Any]:
+    """Kapalı döngü: auto_tune AÇIKSA öğrenen beyin önerilerini korkuluklarla oto-uygula.
+
+    auto_tune kapalıyken hiçbir şey yapmaz (no-op). Açıkken suggest_tuning + apply_tuning
+    zincirini koşar; yalnız güvenli ayarları (eşik/kaynak/RVOL/süre-stop) değiştirir,
+    para-büyüklüğü/risk tavanlarına dokunmaz. Uygulanan değişiklikleri döner.
+    """
+    if not S.auto_tune:
+        return {"applied": False, "reason": "auto_tune kapalı", "changes": []}
+    return apply_tuning(suggest_tuning(tier_of=tier_of))
 
 
 def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> dict[str, Any]:
@@ -1564,6 +1885,26 @@ def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> di
         elif s["type"] in ("suppress_source", "suppress_tier") and not S.suppress_losing_sources:
             changes.append({"field": "suppress_losing_sources", "from": False, "to": True})
             S.suppress_losing_sources = True
+        elif s["type"] == "min_rel_volume":
+            new_rv = max(0.0, min(5.0, round(float(s["suggested"]), 2)))   # korkuluk: [0,5]
+            if abs(new_rv - S.min_rel_volume) >= 0.25:
+                changes.append({"field": "min_rel_volume", "from": S.min_rel_volume, "to": new_rv})
+                S.min_rel_volume = new_rv
+        elif s["type"] == "time_stop":
+            new_ts = max(0, min(720, int(s["suggested"])))   # korkuluk: [0,720]dk (12s)
+            if new_ts > 0 and (S.time_stop_min == 0 or abs(new_ts - S.time_stop_min) >= 10):
+                changes.append({"field": "time_stop_min", "from": S.time_stop_min, "to": new_ts})
+                S.time_stop_min = new_ts
+        elif s["type"] == "stop_loss_pct":
+            new_sl = max(0.5, min(15.0, round(float(s["suggested"]), 1)))   # korkuluk [0.5,15]
+            if abs(new_sl - S.stop_loss_pct) >= 0.5:
+                changes.append({"field": "stop_loss_pct", "from": S.stop_loss_pct, "to": new_sl})
+                S.stop_loss_pct = new_sl
+        elif s["type"] == "take_profit_pct":
+            new_tp = max(1.0, min(30.0, round(float(s["suggested"]), 1)))   # korkuluk [1,30]
+            if abs(new_tp - S.take_profit_pct) >= 0.5:
+                changes.append({"field": "take_profit_pct", "from": S.take_profit_pct, "to": new_tp})
+                S.take_profit_pct = new_tp
     if changes:
         with _lock:
             _save_state()

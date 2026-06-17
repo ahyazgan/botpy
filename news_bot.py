@@ -785,6 +785,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
         "fiyat": {
             "deg_24s_pct": item.price_24h_pct, "deg_15dk_pct": item.price_15m_pct,
             "deg_1s_pct": item.price_60m_pct, "hacim_usd": item.volume_usd,
+            "rvol": item.rel_volume,   # göreceli hacim: >1.5x haber gerçek, hacimsiz=fake
             "atr_pct": item.atr_pct, "teyitli": item.confirmed, "not": item.price_note[:160],
         },
         "mikroyapi": (None if backtest or not item.symbol
@@ -1436,9 +1437,23 @@ def _persist_closed(pos: dict[str, Any]) -> None:
 def _monitor_loop(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
+            closed_any = False
             for pos in trader.monitor_positions():
                 _persist_closed(pos)
                 notify_remote(_fmt_trade_msg(pos, opened=False))
+                closed_any = True
+            # Kapalı döngü öğrenme: yeni işlem kapandıysa, auto_tune açıksa
+            # öğrenen beyin önerilerini korkuluklarla oto-uygula (kapalıyken no-op)
+            if closed_any:
+                try:
+                    res = trader.auto_apply_tuning(tier_of=_source_tier)
+                    if res.get("changes"):
+                        log.info("Oto-öğrenme uygulandı: %s", res["changes"])
+                        notify_remote("🧠 Oto-öğrenme: " + ", ".join(
+                            f"{c['field']} {c['from']}→{c['to']}" for c in res["changes"]))
+                    trader.refresh_learned_vetoes()   # koşullu öğrenilen-veto listesini tazele
+                except Exception as e:
+                    log.warning("Oto-öğrenme hatası: %s", e)
         except Exception as e:
             log.warning("Pozisyon izleme hatası: %s", e)
         try:
@@ -2181,6 +2196,8 @@ class SettingsPatch(BaseModel):
     min_source_samples: int | None = None
     skip_already_priced_pct: float | None = None
     max_funding_rate_pct: float | None = None
+    auto_tune: bool | None = None
+    use_learned_vetoes: bool | None = None
 
 
 @app.get("/settings")

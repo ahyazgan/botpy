@@ -488,8 +488,109 @@ def brain_scorecard() -> dict[str, Any]:
     if len(filled) >= 2:
         calibrated = all(filled[i]["avg_pnl"] <= filled[i + 1]["avg_pnl"]
                          for i in range(len(filled) - 1))
+    # Kalibrasyon bilimi: conviction'ı kazanma-olasılığı tahmini gibi ölç (gerçek=kârlı mı 1/0)
+    pairs = [(float(c["brain"]["conviction"]), 1 if c["pnl"] > 0 else 0) for c in rows]
+    sci = _calibration_science(pairs)
     return {"samples": len(rows), "bands": bands, "calibrated": calibrated,
-            "escalated_n": sum(1 for c in rows if c["brain"].get("escalated"))}
+            "escalated_n": sum(1 for c in rows if c["brain"].get("escalated")),
+            "escalation": _escalation_accuracy(rows),
+            "rubric": _rubric_correlation(rows),
+            **sci}
+
+
+def _calibration_science(pairs: list[tuple[float, int]]) -> dict[str, Any]:
+    """Conviction tahmininin kalibrasyon bilimi: Brier + ECE + reliability + base-rate.
+
+    `pairs`: [(conviction 0-1, outcome 0/1), ...]. Conviction'ı kazanma-olasılığı
+    tahmini gibi değerlendirir.
+      brier = mean((conviction − outcome)²)  (0=mükemmel, 0.25=şans, düşük iyi)
+      ece   = Σ |bin'in ort.conviction − bin'in ort.isabet| × ağırlık  (kalibrasyon hatası)
+      reliability = [{bin, predicted, actual, n}, ...]  (diyagram noktaları)
+      overconfident: ort.conviction > ort.isabet (beyin kendine fazla güveniyor)
+    """
+    n = len(pairs)
+    if n == 0:
+        return {"brier": None, "ece": None, "reliability": [], "base_rate": None,
+                "mean_conviction": None, "overconfident": None}
+    brier = sum((p - o) ** 2 for p, o in pairs) / n
+    base_rate = sum(o for _, o in pairs) / n
+    mean_conv = sum(p for p, _ in pairs) / n
+    # 5 eşit-genişlik bin (0-0.2, ..., 0.8-1.0) — reliability diyagram
+    rel: list[dict[str, Any]] = []
+    ece = 0.0
+    for i in range(5):
+        lo, hi = i * 0.2, (i + 1) * 0.2 + (0.01 if i == 4 else 0.0)
+        b = [(p, o) for p, o in pairs if lo <= p < hi]
+        if not b:
+            rel.append({"bin": f"{i*0.2:.1f}-{(i+1)*0.2:.1f}", "predicted": None,
+                        "actual": None, "n": 0})
+            continue
+        bn = len(b)
+        pred = sum(p for p, _ in b) / bn
+        act = sum(o for _, o in b) / bn
+        ece += (bn / n) * abs(pred - act)
+        rel.append({"bin": f"{i*0.2:.1f}-{(i+1)*0.2:.1f}", "predicted": round(pred, 3),
+                    "actual": round(act, 3), "n": bn})
+    return {"brier": round(brier, 4), "ece": round(ece, 4), "reliability": rel,
+            "base_rate": round(base_rate, 3), "mean_conviction": round(mean_conv, 3),
+            "overconfident": mean_conv > base_rate}
+
+
+def _escalation_accuracy(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Eskalasyon (Haiku→Sonnet) gerçekten isabet katıyor mu: eskale vs eskale-olmayan.
+
+    Eskale edilen işlemler kararsız bant adaylarıydı — Sonnet'in ikinci bakışı bunları
+    kurtardı mı (yüksek win-rate/avg_pnl) yoksa para mı yaktı? İstatistik canlı yoldan.
+    """
+    esc = [c for c in rows if c["brain"].get("escalated")]
+    base = [c for c in rows if not c["brain"].get("escalated")]
+
+    def _agg(b: list[dict[str, Any]]) -> dict[str, Any]:
+        if not b:
+            return {"n": 0, "win_rate": None, "avg_pnl": None}
+        wins = sum(1 for c in b if c["pnl"] > 0)
+        return {"n": len(b), "win_rate": round(wins / len(b), 2),
+                "avg_pnl": round(sum(c["pnl"] for c in b) / len(b), 2)}
+
+    return {"escalated": _agg(esc), "base": _agg(base)}
+
+
+_RUBRIC_KEYS = ("chase_risk", "fade_risk", "liquidity", "source_quality", "correlation_risk")
+
+
+def _rubric_correlation(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Rubrik alt-skorları (chase/fade/liquidity/...) gerçek sonuçla korele mi.
+
+    Her rubrik skoru ile P&L arasında Pearson korelasyonu. Beklenti: chase_risk/
+    fade_risk/correlation_risk NEGATİF (yüksek=kötü), liquidity/source_quality POZİTİF.
+    İşaret beklentiyle ters/sıfırsa o rubrik boyutu sinyal taşımıyor → beyin gürültü
+    üretiyor. Saf; <3 örnek veya sabit skor → None.
+    """
+    out: dict[str, Any] = {}
+    for key in _RUBRIC_KEYS:
+        xs: list[float] = []
+        ys: list[float] = []
+        for c in rows:
+            sc = c["brain"].get("scores")
+            if isinstance(sc, dict) and sc.get(key) is not None:
+                xs.append(float(sc[key]))
+                ys.append(float(c["pnl"]))
+        out[key] = _pearson(xs, ys)
+    return out
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson korelasyon katsayısı (saf). <3 nokta veya sıfır varyans → None."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return round(sxy / math.sqrt(sxx * syy), 3)
 
 
 _BRAIN_SELF_IMPROVE_MIN = 5   # bir conviction dilimini yargılamak için min örnek

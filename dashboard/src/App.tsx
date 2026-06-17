@@ -115,7 +115,15 @@ type Settings = {
 };
 
 type BrainBand = { band: string; n: number; win_rate: number | null; avg_pnl: number | null };
-type BrainScorecard = { samples: number; bands: BrainBand[]; calibrated: boolean | null; escalated_n: number };
+type RelBin = { bin: string; predicted: number | null; actual: number | null; n: number };
+type EscAgg = { n: number; win_rate: number | null; avg_pnl: number | null };
+type BrainScorecard = {
+  samples: number; bands: BrainBand[]; calibrated: boolean | null; escalated_n: number;
+  brier: number | null; ece: number | null; reliability: RelBin[];
+  base_rate: number | null; mean_conviction: number | null; overconfident: boolean | null;
+  escalation: { escalated: EscAgg; base: EscAgg };
+  rubric: Record<string, number | null>;
+};
 type BtSide = { n: number; avg_net_pct: number | null; win_rate: number | null };
 type BrainBacktest = {
   ready: boolean; reason?: string; tested?: number;
@@ -1895,6 +1903,52 @@ export default function App() {
                 {brainSc.calibrated === true ? "✓ kalibre (konv↑ → P&L↑)"
                   : brainSc.calibrated === false ? "✗ kalibre değil" : "yetersiz veri"}
               </span>
+              {brainSc.brier != null && (
+                <span className="rounded bg-zinc-800 px-2 py-0.5 font-mono text-zinc-300" title="Brier skoru: conviction kazanma-olasılığı tahmini olarak ne kadar isabetli (0=mükemmel, 0.25=şans, düşük iyi)">
+                  Brier {brainSc.brier}
+                </span>
+              )}
+              {brainSc.ece != null && (
+                <span className="rounded bg-zinc-800 px-2 py-0.5 font-mono text-zinc-300" title="Expected Calibration Error: tahmin edilen vs gerçek isabet farkı (düşük iyi)">
+                  ECE {brainSc.ece}
+                </span>
+              )}
+              {brainSc.overconfident != null && (
+                <span className={`rounded px-2 py-0.5 font-semibold ${brainSc.overconfident ? "bg-amber-900/50 text-amber-200" : "bg-emerald-900/50 text-emerald-200"}`}
+                  title={`Ort. conviction ${brainSc.mean_conviction} vs gerçek kazanma oranı ${brainSc.base_rate}`}>
+                  {brainSc.overconfident ? "⚠ aşırı-güvenli" : "✓ güven dengeli"}
+                </span>
+              )}
+            </div>
+            {/* Reliability diyagramı: bin başına tahmin vs gerçek isabet */}
+            <div className="mb-2 flex items-end gap-1.5">
+              {brainSc.reliability.map((r) => (
+                <div key={r.bin} className="flex flex-1 flex-col items-center gap-0.5" title={`${r.bin}: tahmin ${r.predicted ?? "—"}, gerçek ${r.actual ?? "—"} (${r.n})`}>
+                  <div className="flex h-12 w-full items-end justify-center gap-px">
+                    <div className="w-1/2 rounded-t bg-violet-500/40" style={{ height: `${(r.predicted ?? 0) * 100}%` }} />
+                    <div className={`w-1/2 rounded-t ${(r.actual ?? 0) >= (r.predicted ?? 0) ? "bg-emerald-500/60" : "bg-red-500/60"}`} style={{ height: `${(r.actual ?? 0) * 100}%` }} />
+                  </div>
+                  <div className="text-[9px] text-zinc-600">{r.bin}</div>
+                </div>
+              ))}
+            </div>
+            {/* Rubrik korelasyon + eskalasyon-isabet */}
+            <div className="mb-2 flex flex-wrap gap-1.5 text-[11px]">
+              {Object.entries(brainSc.rubric).filter(([, v]) => v != null).map(([k, v]) => {
+                const expectPos = k === "liquidity" || k === "source_quality";
+                const good = expectPos ? (v as number) > 0 : (v as number) < 0;
+                return (
+                  <span key={k} className={`rounded px-1.5 py-0.5 font-mono ${good ? "bg-emerald-950/40 text-emerald-300" : "bg-red-950/40 text-red-300"}`}
+                    title={`${k} ↔ P&L korelasyonu ${v}. Beklenen işaret: ${expectPos ? "+" : "−"}. ${good ? "sinyal taşıyor" : "ters/gürültü"}`}>
+                    {k.replace("_risk", "").replace("_quality", "-q")} {(v as number) >= 0 ? "+" : ""}{v}
+                  </span>
+                );
+              })}
+              {brainSc.escalation.escalated.n > 0 && (
+                <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300" title="Eskale edilen (Sonnet) vs eskale-olmayan (Haiku) işlemlerin gerçek sonucu">
+                  eskal {brainSc.escalation.escalated.avg_pnl ?? "—"} ({brainSc.escalation.escalated.n}) vs taban {brainSc.escalation.base.avg_pnl ?? "—"} ({brainSc.escalation.base.n})
+                </span>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {brainSc.bands.map((b) => (

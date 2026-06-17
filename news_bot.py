@@ -762,6 +762,18 @@ def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
     return resp.parsed_output
 
 
+def _brain_calib_summary() -> dict[str, Any]:
+    """Beynin context'ine giren HAFİF kalibrasyon özeti (ham diyagram değil — token tasarrufu).
+
+    Beyin kendi geçmiş isabetini görür (aşırı-güven düzeltir) ama her çağrıda büyük
+    reliability/rubric dizilerini taşımaz. Panel/uç ham veriyi /brain-scorecard'tan alır.
+    """
+    sc = trader.brain_scorecard()
+    return {"ornek": sc.get("samples"), "kalibre": sc.get("calibrated"),
+            "brier": sc.get("brier"), "asiri_guvenli": sc.get("overconfident"),
+            "ort_konviksiyon": sc.get("mean_conviction"), "gercek_oran": sc.get("base_rate")}
+
+
 def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
                          backtest: bool = False) -> dict[str, Any] | None:
     """Giriş anında Claude kararlı yargı. None = beyin yok/başarısız (mekanik karar geçerli).
@@ -797,7 +809,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
         },
         "piyasa_rejimi": None if backtest else _btc_regime(),
         "kume": {"son_haber": 0, "ayni_yon": 0, "ters_yon": 0} if backtest else _cluster_context(item),
-        "beyin_kalibrasyon": trader.brain_scorecard(),
+        "beyin_kalibrasyon": _brain_calib_summary(),
         "portfoy": {"ayni_yonde_acik": trader._open_side_count(side), "yon": side},
     }
     client = _get_anthropic()

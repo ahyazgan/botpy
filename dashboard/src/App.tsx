@@ -513,6 +513,7 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [shadow, setShadow] = useState<{ overrides: Record<string, unknown>; n: number; diverged: number; live_trades: number; shadow_trades: number } | null>(null);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
   const [brainBtRunning, setBrainBtRunning] = useState(false);
@@ -546,7 +547,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -560,6 +561,7 @@ export default function App() {
         fetch(`${API_BASE}/tuning`),
         fetch(`${API_BASE}/brain-scorecard`),
         fetch(`${API_BASE}/readiness`),
+        fetch(`${API_BASE}/shadow`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -595,6 +597,7 @@ export default function App() {
       if (tuningRes.ok) setTuning(await tuningRes.json());
       if (bsRes.ok) setBrainSc(await bsRes.json());
       if (rdRes.ok) setReadiness(await rdRes.json());
+      if (shRes.ok) setShadow(await shRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -1789,6 +1792,12 @@ export default function App() {
                 <span className="rounded-lg border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200"
                   title={`Kelly f*=${risk.kelly.f_star} (win ${risk.kelly.win_rate}, payoff ${risk.kelly.payoff}, n=${risk.kelly.n})`}>
                   🎯 Kelly {risk.kelly.multiplier}x
+                </span>
+              )}
+              {shadow && Object.keys(shadow.overrides).length > 0 && (
+                <span className="rounded-lg border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200"
+                  title={`Gölge A/B aktif (SANAL — gerçek emir yok): aday ayar ${JSON.stringify(shadow.overrides)}. ${shadow.n} karar, ${shadow.diverged} farklı. Aday giriş ${shadow.shadow_trades} vs canlı ${shadow.live_trades}.`}>
+                  🅰️🅱️ Gölge: {shadow.diverged}/{shadow.n} farklı · aday {shadow.shadow_trades} vs canlı {shadow.live_trades}
                 </span>
               )}
             </div>

@@ -1537,6 +1537,7 @@ def process_items(
             _archive_signal(it)
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
+            _log_shadow_decision(it)    # A/B: aday ayar bu sinyalde ne karar verirdi (sanal)
             pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
             if pos:
                 _metrics["trades_opened_total"] += 1
@@ -1567,6 +1568,30 @@ def _archive_signal(item: NewsItem) -> None:
                 store.prune_signals(MAX_ARCHIVE_SIGNALS)
     except Exception as e:
         log.warning("Sinyal arşivleme hatası: %s", e)
+
+
+def _log_shadow_decision(item: NewsItem) -> None:
+    """A/B: aday ayar (gölge) bu canlı sinyalde ne karar verirdi — SANAL, kalıcı kaydet.
+
+    Gölge override yoksa no-op. Gerçek emir YOK; yalnız canlı vs aday karar farkını
+    günlükler (sonradan /shadow ile kıyaslanır). Hata akışı bozmaz.
+    """
+    if not trader.get_shadow_overrides():
+        return
+    try:
+        res = trader.shadow_decision(item, **_trade_context(item))
+        if res is None:
+            return
+        get_store().add_shadow_decision({
+            "news_id": item.id, "symbol": item.symbol, "side": res["live"].get("side"),
+            "impact": item.impact, "published": item.published or item.fetched_at,
+            "live_trade": res["live"]["would_trade"], "shadow_trade": res["shadow"]["would_trade"],
+            "live_usdt": res["live"].get("usdt"), "shadow_usdt": res["shadow"].get("usdt"),
+            "diverged": res["diverged"],
+            "overrides": json.dumps(trader.get_shadow_overrides(), ensure_ascii=False),
+        })
+    except Exception as e:
+        log.warning("Gölge karar günlüğü hatası: %s", e)
 
 
 # ── Arka plan döngüsü (RSS + Binance polling) ────────────────────────────
@@ -2347,6 +2372,28 @@ def _persist_backtest(mode: str, *, sl: float | None, tp: float | None, fee: flo
 def backtest_runs(limit: int = 50) -> dict[str, Any]:
     """Geçmiş backtest çalıştırmaları (en yeniden eskiye, karşılaştırma için)."""
     return {"runs": get_store().list_backtest_runs(limit)}
+
+
+@app.get("/shadow")
+def shadow() -> dict[str, Any]:
+    """Shadow-mode (A/B) durumu: aktif aday override'lar + canlı vs aday karar özeti.
+
+    Gölge canlı sinyallerde SANAL çalışır (gerçek emir yok). diverged = aday ayarın canlıdan
+    farklı karar verdiği sinyal sayısı; live_trades/shadow_trades = her ayarın giriş sayısı.
+    """
+    return {"overrides": trader.get_shadow_overrides(), **get_store().shadow_summary()}
+
+
+class ShadowPatch(BaseModel):
+    overrides: dict[str, Any] = {}   # {ayar: aday_değer}; boş → gölge kapat
+
+
+@app.patch("/shadow", dependencies=[Depends(require_token)])
+def shadow_patch(body: ShadowPatch) -> dict[str, Any]:
+    """Gölge (aday) ayar senaryosunu ayarla. Boş overrides → gölge kapalı. Yalnız güvenli
+    karar-eşiği alanları kabul edilir (para-büyüklüğü/risk tavanları gölgede override edilemez)."""
+    applied = trader.set_shadow_overrides(body.overrides)
+    return {"overrides": applied, "enabled": bool(applied)}
 
 
 # ── İşlem endpoint'leri ──────────────────────────────────────────────────

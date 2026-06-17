@@ -1632,6 +1632,62 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     return out
 
 
+# ── Shadow-mode / A-B: aday ayarı canlı sinyallerle SANAL test (gerçek emir yok) ──
+_shadow_overrides: dict[str, Any] = {}   # {ayar_adı: aday_değer} — gölge senaryosu
+_SHADOW_KEYS = ("auto_min_impact", "tier1_skip_confirm_impact", "auto_require_confirm",
+                "min_rel_volume", "rvol_scale_by_impact", "skip_already_priced_pct",
+                "size_by_impact", "size_by_kelly", "kelly_fraction",
+                "risk_parity", "max_same_direction", "max_funding_rate_pct",
+                "suppress_losing_sources", "use_learned_vetoes")
+
+
+def set_shadow_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Gölge (aday) ayar override'larını ayarla. Yalnız güvenli karar-eşiği alanları;
+    para-büyüklüğü tabanı (trade_usdt) / risk tavanları override edilemez (gölge sadece
+    KARAR farkını test eder, sanal). Boş dict → gölge kapalı. Döner: etkin override'lar."""
+    global _shadow_overrides
+    clean = {k: v for k, v in (overrides or {}).items() if k in _SHADOW_KEYS and v is not None}
+    _shadow_overrides = clean
+    return dict(_shadow_overrides)
+
+
+def get_shadow_overrides() -> dict[str, Any]:
+    return dict(_shadow_overrides)
+
+
+def shadow_decision(item: Any, *, feed_stale: bool = False,
+                    news_age_sec: float | None = None,
+                    price_series: dict[str, list[float]] | None = None
+                    ) -> dict[str, Any] | None:
+    """Aday ayarla (gölge) auto_decision'ı SANAL çalıştır — gerçek emir YOK, S kalıcı değil.
+
+    Canlı karar (mevcut S) ile aday karar yan yana üretilir; FARK varsa kaydedilebilir.
+    S'in gölge alanları geçici set edilir, auto_decision çağrılır, AYNEN geri yüklenir
+    (lock altında — eşzamanlı gerçek karar bozulmasın). Gölge yoksa None.
+
+    Döner: {live, shadow, diverged} — live/shadow auto_decision çıktıları, diverged: ikisi
+    farklı would_trade veya farklı boyut mu (aday ayar başka karar verirdi mi).
+    """
+    if not _shadow_overrides:
+        return None
+    live = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
+                         price_series=price_series)
+    # S'i geçici override et — auto_decision iç kilitleri (_open_side_count vb.) aldığından
+    # BURADA _lock TUTMA (yeniden-giriş = deadlock). Gölge, process_items'ten sıralı çağrılır.
+    saved = {k: getattr(S, k) for k in _shadow_overrides}
+    try:
+        for k, v in _shadow_overrides.items():
+            setattr(S, k, v)
+        shadow = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
+                               price_series=price_series)
+    finally:
+        for k, v in saved.items():
+            setattr(S, k, v)
+    diverged = (live["would_trade"] != shadow["would_trade"]
+                or (live["would_trade"] and live["usdt"] != shadow["usdt"]))
+    return {"live": live, "shadow": shadow, "diverged": diverged}
+
+
 def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str, Any] | None:
     """Giriş beynini güvenli çağır. Hata olursa None (mekanik karar geçerli kalır)."""
     try:

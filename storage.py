@@ -217,6 +217,24 @@ CREATE TABLE IF NOT EXISTS brain_decisions (
 
 CREATE INDEX IF NOT EXISTS idx_brain_ts ON brain_decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_brain_verdict ON brain_decisions(verdict);
+
+CREATE TABLE IF NOT EXISTS shadow_decisions (
+    row_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,          -- karar zamanı (utcnow)
+    news_id       TEXT,
+    symbol        TEXT,
+    side          TEXT,
+    impact        INTEGER,
+    published     TEXT,                   -- sinyal zamanı (sonuç değerlendirmesi için)
+    live_trade    INTEGER,                -- canlı ayar girer miydi (0/1)
+    shadow_trade  INTEGER,                -- aday ayar girer miydi (0/1)
+    live_usdt     REAL,
+    shadow_usdt   REAL,
+    diverged      INTEGER,                -- 0/1 (kararlar farklı mı)
+    overrides     TEXT                    -- aday ayar JSON (hangi senaryo)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_decisions(ts);
 """
 
 _NCT_COLUMNS = (
@@ -621,6 +639,44 @@ class Store:
                 "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Shadow-mode (A/B): canlı vs aday ayar karar günlüğü ──────────────────
+    def add_shadow_decision(self, row: dict[str, Any]) -> int:
+        """Bir gölge karar kaydını ekle (canlı vs aday ayar). Eklenen satır id'si döner."""
+        rec = {
+            "ts": row.get("ts") or _utcnow(),
+            "news_id": row.get("news_id"), "symbol": row.get("symbol"),
+            "side": row.get("side"), "impact": row.get("impact"),
+            "published": row.get("published"),
+            "live_trade": 1 if row.get("live_trade") else 0,
+            "shadow_trade": 1 if row.get("shadow_trade") else 0,
+            "live_usdt": row.get("live_usdt"), "shadow_usdt": row.get("shadow_usdt"),
+            "diverged": 1 if row.get("diverged") else 0,
+            "overrides": row.get("overrides"),
+        }
+        cols = ", ".join(rec)
+        ph = ", ".join(f":{c}" for c in rec)
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO shadow_decisions ({cols}) VALUES ({ph})", rec)
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def shadow_summary(self, limit: int = 1000) -> dict[str, Any]:
+        """Gölge karar özeti: kaç karar, kaç divergence, canlı vs aday giriş sayısı."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM shadow_decisions ORDER BY row_id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        rows = [dict(r) for r in rows]
+        n = len(rows)
+        return {
+            "n": n,
+            "diverged": sum(r["diverged"] for r in rows),
+            "live_trades": sum(r["live_trade"] for r in rows),
+            "shadow_trades": sum(r["shadow_trade"] for r in rows),
+            "recent": rows[:50],
+        }
 
     # ── Kapanan haber-işlem defteri (kalıcı; trade_state.json 500 sınırı dışı) ──
     def add_closed_news_trade(self, trade: dict[str, Any]) -> bool:

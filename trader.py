@@ -33,7 +33,8 @@ log = logging.getLogger(__name__)
 
 BINANCE_API = "https://api.binance.com/api/v3"
 BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"   # futures (funding rate)
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_state.json")
+STATE_FILE = os.environ.get("BOTPY_STATE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "trade_state.json")
 
 
 # ── Ayarlar (çalışırken /settings ile değişir, dosyaya kaydedilir) ───────
@@ -83,6 +84,10 @@ class Settings:
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
+    # Hacim Beyni — profesyonel haber-trade hacim mantığı
+    size_by_volume: bool = False     # likidite-katmanlı boyut: ince coinde küçül (exit-trap önleme)
+    min_rel_volume: float = 0.0      # >0: RVOL (göreceli hacim) bu katın altındaysa girme (hacimsiz=fake)
+    max_book_frac: float = 0.0       # >0: pozisyon orderbook derinliğinin en fazla bu oranı olsun (örn 0.10)
     # Sinyal kalitesi / öğrenme
     suppress_losing_sources: bool = False  # negatif beklentili kaynağı oto-işlemde sustur
     min_source_samples: int = 8      # bir kaynağı yargılamak için gereken min kapanmış işlem
@@ -116,6 +121,7 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
+    "size_by_volume", "min_rel_volume", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
@@ -610,6 +616,14 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
             raise RuntimeError("Orderbook bu büyüklüğü karşılayamıyor (çok düşük likidite)")
         if S.slippage_guard_pct > 0 and est["slippage"] is not None and est["slippage"] > S.slippage_guard_pct:
             raise RuntimeError(f"Slippage çok yüksek (%{est['slippage']:.2f} > %{S.slippage_guard_pct}) — giriş iptal")
+        # Orderbook payı tavanı: kitabın görünür derinliğinin en fazla %X'i ol
+        # (büyük emir piyasayı kaydırır + çıkışta tuzağa düşürür → boyutu kıs).
+        if S.max_book_frac > 0 and est.get("avail"):
+            cap = est["avail"] * S.max_book_frac
+            if usdt > cap:
+                log.info("Boyut orderbook payına kısıldı: $%.0f → $%.0f (kitap $%.0f, pay %%%.0f)",
+                         usdt, cap, est["avail"], S.max_book_frac * 100)
+                usdt = round(cap, 2)
 
     price = (est["avg"] if est and est.get("avg") else None) or get_price(symbol)
     if not price:
@@ -1043,6 +1057,26 @@ def _size_multiplier(impact: int) -> float:
     return max(0.5, min(1.5, 1.0 + (impact - 8) * 0.25))
 
 
+def _liquidity_factor(volume_usd: float | None) -> float:
+    """Likidite-katmanlı boyut çarpanı: ince coinde küçül (giremediğin yerden çıkamazsın).
+
+    Profesyonel kural — pozisyonu coinin 24s hacmine göre ölçekle. Derin coinde
+    tam boyut, inceldikçe kısıl. Hacim bilinmiyorsa ihtiyatlı (0.5x).
+      ≥$50M → 1.0x | $10–50M → 0.8x | $5–10M → 0.6x | $1–5M → 0.4x | <$1M → 0.25x
+    """
+    if volume_usd is None or volume_usd <= 0:
+        return 0.5
+    if volume_usd >= 50_000_000:
+        return 1.0
+    if volume_usd >= 10_000_000:
+        return 0.8
+    if volume_usd >= 5_000_000:
+        return 0.6
+    if volume_usd >= 1_000_000:
+        return 0.4
+    return 0.25
+
+
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
@@ -1091,6 +1125,12 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
                               or (side == "short" and m <= -S.skip_already_priced_pct)):
             return no(f"zaten fiyatlanmış (24s %{m:+.1f})")
+    # RVOL kapısı: hacim hareketi onaylamıyorsa haber muhtemelen fake → girme.
+    # (Veri yoksa engelleme — eksik veri ≠ düşük hacim.)
+    if S.min_rel_volume > 0:
+        rv = getattr(item, "rel_volume", None)
+        if rv is not None and rv < S.min_rel_volume:
+            return no(f"hacim zayıf (RVOL {rv:.1f}x < {S.min_rel_volume:.1f}x)")
     news_source = getattr(item, "source", "") or ""
     if S.suppress_losing_sources and news_source:
         st = source_stats(news_source)
@@ -1102,10 +1142,12 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         cost = _funding_cost_pct(symbol, side)
         if cost is not None and cost > S.max_funding_rate_pct:
             return no(f"funding maliyeti yüksek (%{cost:+.3f} > %{S.max_funding_rate_pct})")
-    # Boyut: conviction (güce göre) + kayıp serisi freni
+    # Boyut: conviction (güce göre) × likidite katmanı (hacme göre) × kayıp serisi freni
     usdt = S.trade_usdt
     if S.size_by_impact:
         usdt *= _size_multiplier(int(item.impact))
+    if S.size_by_volume:
+        usdt *= _liquidity_factor(getattr(item, "volume_usd", None))
     if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
         usdt *= 0.5
     return {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
@@ -1527,7 +1569,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         "partial_tp_pct": 2.5, "partial_tp_frac": 0.5,  # ilk sıçramada yarısını kasaya al
         "trailing_stop_pct": 1.5,                   # kalanı trend devam ederse sür
         "time_stop_min": 60,                        # edge söndüyse 60dk'da kes
-        "size_by_impact": True,                     # conviction sizing
+        "size_by_impact": True,                     # conviction sizing (güce göre)
+        "size_by_volume": True,                     # likidite katmanı (ince coinde küçül)
+        "min_rel_volume": 1.5,                      # RVOL<1.5x = hacimsiz/fake → girme
+        "max_book_frac": 0.10,                      # pozisyon orderbook'un en fazla %10'u
         "tier1_skip_confirm_impact": 9,             # güç≥9 net haberde refleks giriş
     },
     "safe": {
@@ -1537,6 +1582,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "trailing_stop_pct": 0.0,
         "time_stop_min": 0,
         "size_by_impact": False,
+        "size_by_volume": False,
+        "min_rel_volume": 0.0,
+        "max_book_frac": 0.0,
         "tier1_skip_confirm_impact": 0,
     },
 }

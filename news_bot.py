@@ -109,6 +109,10 @@ ALREADY_PRICED_PCT = 25.0      # 24s'te bu % üzeri hareket = büyük kısmı fi
 # daha gürültülü ama haberin önünde olur. Backtest'le kalibre et.
 CONFIRM_INTERVAL = os.environ.get("CONFIRM_INTERVAL", "15m")
 CONFIRM_LIMIT = int(os.environ.get("CONFIRM_LIMIT", "4"))
+# RVOL (göreceli hacim): son mumun hacmi, önceki mumların ortalamasının kaç katı.
+# Haber + fiyat + HACİM birlikte patlıyorsa haber gerçek; hacimsiz hareket = fake.
+# Teyit penceresiyle aynı mum aralığı; baseline için bu kadar mum çekilir.
+RVOL_LOOKBACK = int(os.environ.get("RVOL_LOOKBACK", "48"))  # 48×15dk ≈ 12s baz çizgi
 # Binance USDT paritesi olmayan/olağan dışı coinler için stop listesi
 _NOT_TRADEABLE = {"USDT", "USDC", "USD", "FDUSD", "TRY", "AED", "OPENAI", "ANTHROPIC"}
 
@@ -119,6 +123,13 @@ RSS_FEEDS: dict[str, str] = {
     "Decrypt":       "https://decrypt.co/feed",
     "TheBlock":      "https://www.theblock.co/rss.xml",
     "BMag":          "https://bitcoinmagazine.com/feed",
+    # Altcoin / geniş kapsam — küçük & yeni coin haberlerini de yakalar
+    "CryptoSlate":   "https://cryptoslate.com/feed/",
+    "BeInCrypto":    "https://beincrypto.com/feed/",
+    "CryptoBriefing":"https://cryptobriefing.com/feed/",
+    "CoinJournal":   "https://coinjournal.net/feed/",
+    "AMBCrypto":     "https://ambcrypto.com/feed/",
+    "U.Today":       "https://u.today/rss",
 }
 
 # Binance yeni listeleme duyuruları (catalogId=48) — en yüksek etkili sinyal
@@ -170,6 +181,7 @@ class NewsItem:
     price_15m_pct: float | None = None
     price_60m_pct: float | None = None   # ~1 saatlik hareket (çoklu zaman dilimi teyidi)
     volume_usd: float | None = None
+    rel_volume: float | None = None  # RVOL: son mum hacmi / ortalama (kaç kat = haber gerçek mi)
     atr_pct: float | None = None    # son mumların ortalama gerçek aralığı (%) — ATR çıkış için
     confirmed: bool = False         # haber + fiyat hareketi uyumlu mu
     price_note: str = ""            # teyit açıklaması
@@ -192,6 +204,7 @@ class NewsItem:
             "price_15m_pct": self.price_15m_pct,
             "price_60m_pct": self.price_60m_pct,
             "volume_usd": self.volume_usd,
+            "rel_volume": self.rel_volume,
             "atr_pct": self.atr_pct,
             "confirmed": self.confirmed,
             "price_note": self.price_note,
@@ -913,38 +926,65 @@ def _recheck_deferred_entries() -> None:
 
 
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
+def _compute_rvol(candles: list[Any]) -> float:
+    """RVOL: son hareketin quote-hacmi, önceki mumların ortalamasının kaç katı.
+
+    Kısmi (oluşmakta olan) son muma dayanıklı: son iki mumun maks'ını alır
+    (sürüş ister oluşan ister yeni kapanan mumda olsun yakalanır), baz çizgi
+    bu iki mumu dışlar. >1 = normalin üstü ilgi; haberin GERÇEKliğinin sinyali.
+    """
+    if not isinstance(candles, list) or len(candles) < 4:
+        return 0.0
+    def qv(c: Any) -> float:
+        try:
+            return float(c[7])  # klines[7] = quote asset volume (USD cinsi)
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+    recent = max(qv(candles[-1]), qv(candles[-2]))
+    prior = [v for c in candles[:-2] if (v := qv(c)) > 0]
+    if not prior or recent <= 0:
+        return 0.0
+    baseline = sum(prior) / len(prior)
+    return round(recent / baseline, 2) if baseline > 0 else 0.0
+
+
 def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, float] | None:
-    """Bir parite için 24s değişim, hacim, son ~15dk ve ~1s hareketini döndür."""
+    """Bir parite için 24s değişim, hacim, son ~15dk/~1s hareketi, ATR% ve RVOL döndür."""
     t = get_json(f"{BINANCE_API}/ticker/24hr", params={"symbol": symbol},
                  timeout=REQUEST_TIMEOUT, session=session)
     if not t:
         return None
-    # Yapılandırılabilir pencere → hem son mum (kısa pencere) hem tüm pencere hareketi
+    # Tek istek: teyit penceresi (son CONFIRM_LIMIT mum) + RVOL baz çizgisi (RVOL_LOOKBACK).
+    limit = max(CONFIRM_LIMIT, RVOL_LOOKBACK)
     candles = get_json(
         f"{BINANCE_API}/klines",
-        params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(CONFIRM_LIMIT)},
+        params={"symbol": symbol, "interval": CONFIRM_INTERVAL, "limit": str(limit)},
         timeout=REQUEST_TIMEOUT, session=session,
     )
-    move15 = move60 = atr_pct = 0.0
+    move15 = move60 = atr_pct = rvol = 0.0
     if isinstance(candles, list) and candles:
         last = candles[-1]
         o15, c15 = float(last[1]), float(last[4])
         if o15:
             move15 = (c15 - o15) / o15 * 100
-        o60, c60 = float(candles[0][1]), float(candles[-1][4])
+        # Kısa pencere (move60 + ATR) = son CONFIRM_LIMIT mum (RVOL baz çizgisi değil)
+        window = candles[-CONFIRM_LIMIT:] if len(candles) >= CONFIRM_LIMIT else candles
+        o60, c60 = float(window[0][1]), float(window[-1][4])
         if o60:
             move60 = (c60 - o60) / o60 * 100
         # ATR% ≈ mumların ortalama (yüksek-düşük)/kapanış — oynaklık ölçüsü
         ranges = [(float(k[2]) - float(k[3])) / float(k[4]) * 100
-                  for k in candles if float(k[4]) > 0]
+                  for k in window if float(k[4]) > 0]
         if ranges:
             atr_pct = sum(ranges) / len(ranges)
+        rvol = _compute_rvol(candles)
     return {
         "pct24": float(t.get("priceChangePercent", 0) or 0),
         "vol": float(t.get("quoteVolume", 0) or 0),
         "move15": move15,
         "move60": move60,
         "atr_pct": atr_pct,
+        "rvol": rvol,
     }
 
 
@@ -976,6 +1016,7 @@ def confirm_with_price(session: requests.Session, item: NewsItem) -> None:
     item.price_15m_pct = round(stats["move15"], 2)
     item.price_60m_pct = round(stats.get("move60", 0.0), 2)
     item.volume_usd = stats["vol"]
+    item.rel_volume = stats.get("rvol") or None
     item.atr_pct = round(stats.get("atr_pct", 0.0), 3) or None
 
     liq_ok = stats["vol"] >= MIN_VOLUME_USD
@@ -2127,6 +2168,9 @@ class SettingsPatch(BaseModel):
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None
+    size_by_volume: bool | None = None
+    min_rel_volume: float | None = None
+    max_book_frac: float | None = None
     time_stop_min: int | None = None
     breakeven_pct: float | None = None
     partial_tp_pct: float | None = None

@@ -42,6 +42,7 @@ type NewsItem = {
   price_15m_pct: number | null;
   price_60m_pct: number | null;
   volume_usd: number | null;
+  rel_volume: number | null;
   confirmed: boolean;
   price_note: string;
 };
@@ -82,6 +83,9 @@ type Settings = {
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
+  size_by_volume: boolean;
+  min_rel_volume: number;
+  max_book_frac: number;
   time_stop_min: number;
   breakeven_pct: number;
   partial_tp_pct: number;
@@ -455,6 +459,10 @@ export default function App() {
   const [minImpact, setMinImpact] = useState(0);
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   const [onlyConfirmed, setOnlyConfirmed] = useState(false);
+  // Zaman filtresi: hızlı "son N dakika" (0 = kapalı) + opsiyonel başlangıç/bitiş (HH:MM, yerel saat)
+  const [sinceMin, setSinceMin] = useState(0);
+  const [timeFrom, setTimeFrom] = useState("");
+  const [timeTo, setTimeTo] = useState("");
   const [notifyBrowser, setNotifyBrowser] = useState(() =>
     typeof localStorage !== "undefined" && localStorage.getItem("notifyBrowser") === "1");
   const notifiedRef = useRef<Set<string>>(new Set());
@@ -836,9 +844,28 @@ export default function App() {
   const displayed = useMemo(() => {
     const q = search.trim().toLowerCase();
     const floor = onlyAlerts ? Math.max(minImpact, meta.alert_threshold) : minImpact;
+    const sinceCutoff = sinceMin > 0 ? Date.now() - sinceMin * 60_000 : null;
+    // HH:MM (yerel) → o günün o anına ait epoch ms; geçersizse null
+    const hhmmToday = (hhmm: string): number | null => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+      if (!m) return null;
+      const d = new Date();
+      d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+      return d.getTime();
+    };
+    const fromMs = hhmmToday(timeFrom);
+    const toMs = hhmmToday(timeTo);
     return news.filter((n) => {
       if (n.impact < floor) return false;
       if (onlyConfirmed && !n.confirmed) return false;
+      if (sinceCutoff !== null || fromMs !== null || toMs !== null) {
+        const t = Date.parse(n.published || n.fetched_at || "");
+        if (!Number.isNaN(t)) {
+          if (sinceCutoff !== null && t < sinceCutoff) return false;
+          if (fromMs !== null && t < fromMs) return false;
+          if (toMs !== null && t > toMs) return false;
+        }
+      }
       if (q === "") return true;
       return (
         n.title.toLowerCase().includes(q) ||
@@ -846,7 +873,7 @@ export default function App() {
         n.source.toLowerCase().includes(q)
       );
     });
-  }, [news, search, minImpact, onlyAlerts, onlyConfirmed, meta.alert_threshold]);
+  }, [news, search, minImpact, onlyAlerts, onlyConfirmed, sinceMin, timeFrom, timeTo, meta.alert_threshold]);
 
   const alertCount = useMemo(
     () => news.filter((n) => n.impact >= meta.alert_threshold).length,
@@ -943,6 +970,18 @@ export default function App() {
               }`}
             >
               📊 Güce göre boyut: {settings.size_by_impact ? "AÇIK" : "kapalı"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void patchSettings({ size_by_volume: !settings.size_by_volume })}
+              title="Likidite-katmanlı boyut: ince coinde küçül (≥$50M tam, $1-5M 0.4x, <$1M 0.25x). Çıkış-tuzağı önler."
+              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                settings.size_by_volume
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+              }`}
+            >
+              🔊 Hacme göre boyut: {settings.size_by_volume ? "AÇIK" : "kapalı"}
             </button>
             <button
               type="button"
@@ -1119,8 +1158,10 @@ export default function App() {
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
-              <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Sinyal kalitesi</p>
+              <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Sinyal kalitesi · Hacim</p>
               <NumField label="Zaten-fiyatlanmış atla % (0=kapalı)" value={settings.skip_already_priced_pct} onSave={(v) => patchSettings({ skip_already_priced_pct: v })} />
+              <NumField label="Min. RVOL — hacim normalin kaçı (0=kapalı)" value={settings.min_rel_volume} onSave={(v) => patchSettings({ min_rel_volume: v })} />
+              <NumField label="Maks. orderbook payı 0-1 (örn 0.10, 0=kapalı)" value={settings.max_book_frac} onSave={(v) => patchSettings({ max_book_frac: v })} />
               <button
                 type="button"
                 onClick={() => void patchSettings({ suppress_losing_sources: !settings.suppress_losing_sources })}
@@ -1309,6 +1350,58 @@ export default function App() {
             {notifyBrowser ? "🔔 Bildirim açık" : "🔕 Bildirim"}
           </button>
         </div>
+
+        {/* Zaman filtresi: hızlı "son N dk" + saat-dakika aralığı (yerel saat) */}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm text-zinc-500 whitespace-nowrap">⏱ Zaman:</span>
+          {[
+            { label: "Hepsi", v: 0 },
+            { label: "5 dk", v: 5 },
+            { label: "15 dk", v: 15 },
+            { label: "1 sa", v: 60 },
+            { label: "4 sa", v: 240 },
+            { label: "24 sa", v: 1440 },
+          ].map((o) => (
+            <button
+              key={o.v}
+              type="button"
+              onClick={() => { setSinceMin(o.v); if (o.v) { setTimeFrom(""); setTimeTo(""); } }}
+              className={`h-9 rounded-lg border px-3 text-xs font-semibold transition ${
+                sinceMin === o.v && !timeFrom && !timeTo
+                  ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {o.label}
+            </button>
+          ))}
+          <span className="ml-1 text-xs text-zinc-600">|</span>
+          <label className="flex items-center gap-1 text-xs text-zinc-500">
+            Saat aralığı
+            <input
+              type="time"
+              value={timeFrom}
+              onChange={(e) => { setTimeFrom(e.target.value); setSinceMin(0); }}
+              className="h-9 rounded-lg border border-zinc-700 bg-zinc-800/80 px-2 text-xs text-zinc-200 outline-none focus:border-emerald-500/50"
+            />
+            <span className="text-zinc-600">→</span>
+            <input
+              type="time"
+              value={timeTo}
+              onChange={(e) => { setTimeTo(e.target.value); setSinceMin(0); }}
+              className="h-9 rounded-lg border border-zinc-700 bg-zinc-800/80 px-2 text-xs text-zinc-200 outline-none focus:border-emerald-500/50"
+            />
+          </label>
+          {(sinceMin > 0 || timeFrom || timeTo) && (
+            <button
+              type="button"
+              onClick={() => { setSinceMin(0); setTimeFrom(""); setTimeTo(""); }}
+              className="h-9 rounded-lg border border-zinc-700 bg-zinc-800/80 px-3 text-xs text-zinc-400 hover:text-zinc-200"
+            >
+              Temizle
+            </button>
+          )}
+        </div>
       </header>
 
       <main className="mx-auto mt-6 max-w-5xl space-y-3">
@@ -1361,7 +1454,13 @@ export default function App() {
                         <div><span className="text-zinc-500">24s:</span> <span className="text-zinc-300">{n.price_24h_pct !== null ? `${n.price_24h_pct > 0 ? "+" : ""}${n.price_24h_pct}%` : "—"}</span></div>
                         <div><span className="text-zinc-500">15dk:</span> <span className="text-zinc-300">{n.price_15m_pct !== null ? `${n.price_15m_pct > 0 ? "+" : ""}${n.price_15m_pct}%` : "—"}</span></div>
                         <div><span className="text-zinc-500">1s:</span> <span className="text-zinc-300">{n.price_60m_pct !== null ? `${n.price_60m_pct > 0 ? "+" : ""}${n.price_60m_pct}%` : "—"}</span></div>
-                        <div className="col-span-2 sm:col-span-3"><span className="text-zinc-500">Hacim:</span> <span className="text-zinc-300">{fmtUsd(n.volume_usd)}</span></div>
+                        <div><span className="text-zinc-500">Hacim:</span> <span className="text-zinc-300">{fmtUsd(n.volume_usd)}</span></div>
+                        <div title="RVOL: son hareketin hacmi normalin kaç katı. >1.5x = haber gerçek, hacimsiz = fake">
+                          <span className="text-zinc-500">RVOL:</span>{" "}
+                          <span className={n.rel_volume == null ? "text-zinc-500" : n.rel_volume >= 1.5 ? "text-emerald-400" : "text-zinc-400"}>
+                            {n.rel_volume != null ? `${n.rel_volume}x` : "—"}
+                          </span>
+                        </div>
                         {n.price_note && <div className="col-span-2 italic text-zinc-400 sm:col-span-3">{n.price_note}</div>}
                         {n.reason && <div className="col-span-2 text-zinc-400 sm:col-span-3"><span className="text-zinc-500">Gerekçe:</span> {n.reason}</div>}
                       </div>
@@ -1400,6 +1499,20 @@ export default function App() {
                             </span>
                           );
                         })()}
+                        {n.rel_volume != null && (
+                          <span
+                            title="RVOL: hacim normalin kaç katı. Yüksekse haber gerçek; hacimsiz hareket fake olabilir."
+                            className={`rounded-md border px-2 py-0.5 text-xs font-bold ${
+                              n.rel_volume >= 3
+                                ? "border-emerald-500/50 bg-emerald-950/50 text-emerald-300"
+                                : n.rel_volume >= 1.5
+                                ? "border-emerald-600/30 bg-emerald-950/30 text-emerald-400"
+                                : "border-zinc-600/40 bg-zinc-800/60 text-zinc-400"
+                            }`}
+                          >
+                            🔊 {n.rel_volume}x{n.rel_volume >= 3 ? " patlama" : ""}
+                          </span>
+                        )}
                         {n.volume_usd !== null && <span className="text-xs text-zinc-600">hacim {fmtUsd(n.volume_usd)}</span>}
                         {n.price_note && <span className="text-xs italic text-zinc-500">· {n.price_note}</span>}
 

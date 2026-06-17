@@ -15,6 +15,7 @@ dashboard-arb/dist/
 
 # Islem durumu (pozisyon/gecmis)
 trade_state.json
+trade_state.json.lock
 
 # SQLite veritabanı
 *.db

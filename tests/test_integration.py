@@ -49,6 +49,24 @@ def test_settings_roundtrip(client):
     assert r.status_code == 200 and r.json()["alert_threshold"] == 9
 
 
+def test_volume_brain_settings_patch(client):
+    """Hacim Beyni ayarları API üzerinden gerçekten yazılmalı (SettingsPatch'te tanımlı).
+
+    Regresyon: alanlar Pydantic modelinde yoksa FastAPI sessizce düşürür → ayar tutmaz.
+    """
+    saved = {k: getattr(trader.S, k) for k in ("size_by_volume", "min_rel_volume", "max_book_frac")}
+    try:
+        r = client.patch("/settings", json={"size_by_volume": True, "min_rel_volume": 1.5, "max_book_frac": 0.10})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["size_by_volume"] is True
+        assert body["min_rel_volume"] == 1.5
+        assert body["max_book_frac"] == 0.10
+    finally:
+        for k, v in saved.items():   # global S'i kirletme (test izolasyonu)
+            setattr(trader.S, k, v)
+
+
 def test_trades_closed(client):
     assert "trades" in client.get("/trades/closed").json()
 

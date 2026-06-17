@@ -14,9 +14,11 @@ def test_singleton_lock_acquires(tmp_path, monkeypatch):
     assert nb._acquire_singleton_lock() is True
     assert nb._instance_lock is not None
     assert os.path.exists(lock)
-    # pid dosyaya yazıldı
-    with open(lock) as f:
-        assert str(os.getpid()) in f.read()
+    # pid dosyaya yazıldı. Windows'ta kilitli dosya başka handle ile AÇILAMAZ
+    # (msvcrt özel kilit) — orada kilit alımı + dosya varlığı yeterli kanıt.
+    if os.name != "nt":
+        with open(lock) as f:
+            assert str(os.getpid()) in f.read()
     nb._instance_lock.close()   # temizlik
 
 

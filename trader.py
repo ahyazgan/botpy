@@ -79,6 +79,7 @@ class Settings:
     order_type: str = "market"       # "market" | "limit"
     exchange_native_stops: bool = True   # canlıda borsaya DURAN SL/TP emri koy (bot çökse de korur)
     reconcile_autoclose: bool = False    # açılış mutabakatında borsada olmayan hayalet pozisyonu kapat
+    auto_halt_on_anomaly: bool = True    # anomalide (emir-hata serisi/protect-error) yeni oto-işlemi durdur
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
@@ -98,6 +99,13 @@ _last_trade: dict[str, float] = {}
 _daily: dict[str, Any] = {"date": "", "realized": 0.0}
 _exchange: Any = None
 
+# Operasyonel devre kesici: anomalide yeni oto-işlemi durdurur (manuel işlem etkilenmez)
+_halt: dict[str, Any] = {"active": False, "reason": "", "since": ""}
+_order_fail_streak = 0
+_HALT_FAIL_THRESHOLD = 3   # üst üste bu kadar oto-emir hatası → durdur
+_order_rejects = 0         # toplam oto-emir red/dolmama (gözlemlenebilirlik)
+_halts = 0                 # devre kesici toplam tetiklenme
+
 _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
@@ -108,7 +116,7 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
-    "exchange_native_stops", "reconcile_autoclose",
+    "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
@@ -122,6 +130,44 @@ def _now() -> str:
 
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ── Operasyonel devre kesici ──────────────────────────────────────────────
+def trip_halt(reason: str) -> bool:
+    """Anomalide yeni oto-işlemi durdur. Dönen: gerçekten tetiklendi mi (yeni)."""
+    global _halts
+    if not S.auto_halt_on_anomaly or _halt["active"]:
+        return False
+    _halts += 1
+    _halt.update(active=True, reason=reason, since=_now())
+    log.error("⛔ OPERASYONEL DURDURMA: %s — yeni oto-işlem durduruldu (manuel /halt/clear ile aç)", reason)
+    return True
+
+
+def clear_halt() -> dict[str, Any]:
+    """Devre kesiciyi elle sıfırla (anomali giderildikten sonra)."""
+    global _order_fail_streak
+    _order_fail_streak = 0
+    _halt.update(active=False, reason="", since="")
+    log.info("Operasyonel durdurma temizlendi — oto-işlem yeniden aktif")
+    return dict(_halt)
+
+
+def get_halt() -> dict[str, Any]:
+    return dict(_halt)
+
+
+def _note_order_result(ok: bool) -> bool:
+    """Oto-emir sonucunu kaydet; üst üste hata eşiği aşılırsa halt tetikler. Dönen: halt yeni mi."""
+    global _order_fail_streak, _order_rejects
+    if ok:
+        _order_fail_streak = 0
+        return False
+    _order_rejects += 1
+    _order_fail_streak += 1
+    if _order_fail_streak >= _HALT_FAIL_THRESHOLD:
+        return trip_halt(f"üst üste {_order_fail_streak} oto-emir hatası")
+    return False
 
 
 # ── Kalıcılık ────────────────────────────────────────────────────────────
@@ -442,6 +488,33 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
     raise last_exc if last_exc else RuntimeError("emir gönderilemedi")
 
 
+class OrderError(RuntimeError):
+    """Borsa emrinin gönderilememesi/dolmaması (operasyonel hata — devre kesici sayar).
+    Doğrulama reddinden (slippage/minNotional/risk → düz RuntimeError) ayrılır."""
+
+
+def _verify_fill(ex: Any, order: dict[str, Any], csym: str) -> dict[str, Any]:
+    """Gönderilen emrin gerçekten DOLDUĞUNU doğrula (ters-hayalet önleme).
+
+    Dolum bilgisi yoksa fetch_order ile teyit eder. Kesin dolmama/iptal/red → OrderError.
+    Belirsizse (sorgu da başarısız) dokunmaz — mutabakat yakalar.
+    """
+    filled = float(order.get("filled") or 0)
+    status = order.get("status")
+    if filled <= 0 and order.get("id"):
+        try:
+            o2 = ex.fetch_order(order["id"], csym)
+            filled = float(o2.get("filled") or 0)
+            status = o2.get("status") or status
+            order = o2
+        except Exception as e:
+            log.warning("Emir durumu doğrulanamadı (%s) — dolmuş varsayılıyor: %s", order.get("id"), e)
+            return order
+    if filled <= 0 or status in ("canceled", "rejected", "expired"):
+        raise OrderError(f"emir dolmadı/reddedildi (status={status}, filled={filled})")
+    return order
+
+
 def _round_amount(ex: Any, csym: str, amount: float, price: float) -> float:
     """Emir miktarını borsanın lot-size/precision'ına yuvarla + minNotional/min-miktar doğrula.
 
@@ -545,14 +618,20 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
                 ex.set_leverage(S.leverage, csym)
             except Exception as e:
                 log.warning("Kaldıraç ayarlanamadı (%s): %s", csym, e)
-        if S.order_type == "limit":
-            try:
-                price = float(ex.price_to_precision(csym, price))
-            except Exception:
-                pass
-            order = _create_order_idempotent(ex, csym, "limit", ex_side, amount, price=price)
-        else:
-            order = _create_order_idempotent(ex, csym, "market", ex_side, amount)
+        try:
+            if S.order_type == "limit":
+                try:
+                    price = float(ex.price_to_precision(csym, price))
+                except Exception:
+                    pass
+                order = _create_order_idempotent(ex, csym, "limit", ex_side, amount, price=price)
+            else:
+                order = _create_order_idempotent(ex, csym, "market", ex_side, amount)
+            order = _verify_fill(ex, order, csym)   # gerçekten doldu mu (ters-hayalet önleme)
+        except OrderError:
+            raise
+        except Exception as e:
+            raise OrderError(f"emir gönderilemedi: {e}") from e
         if order.get("average"):
             price = float(order["average"])
         if order.get("filled"):
@@ -966,6 +1045,9 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
     """
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
+    # Operasyonel devre kesici: anomali sonrası yeni oto-işlem durdurulmuş
+    if _halt["active"]:
+        return no(f"operasyonel durdurma: {_halt['reason']}")
     # Güvenlik kapısı: akış kopukken kör girme (gerçek-zamanlı teyit güvenilmez)
     if S.halt_trade_on_stale and feed_stale:
         return no("haber akışı kopuk — güvenlik durdurması")
@@ -1072,10 +1154,17 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                           reason=getattr(item, "reason", ""),
                           atr_pct=getattr(item, "atr_pct", None),
                           sl_mult=sl_mult, time_stop_min=hold_min)
+    except OrderError as e:
+        log.warning("Oto-işlem emri başarısız (%s): %s", item.symbol, e)
+        _note_order_result(False)   # üst üste hata → devre kesici
+        return None
     except Exception as e:
         log.warning("Otomatik işlem açılamadı (%s): %s", item.symbol, e)
-        return None
-    if verdict is not None:
+        return None   # doğrulama reddi (slippage/minNotional/risk) — anomali değil
+    _note_order_result(True)
+    if isinstance(pos, dict) and pos.get("protect_error"):   # canlı pozisyon KORUMASIZ → durdur
+        trip_halt(f"{item.symbol} koruyucu stop konulamadı (korumasız pozisyon)")
+    if verdict is not None and isinstance(pos, dict):
         pos["brain"] = verdict   # şeffaflık: konviksiyon + rubrik + gerekçe pozisyonda saklanır
     return pos
 

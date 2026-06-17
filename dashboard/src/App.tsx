@@ -78,6 +78,7 @@ type Settings = {
   order_type: "market" | "limit";
   exchange_native_stops: boolean;
   reconcile_autoclose: boolean;
+  auto_halt_on_anomaly: boolean;
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
@@ -257,6 +258,8 @@ type Health = {
   ws_last_msg_age_sec?: number | null;
   feed_stale?: boolean;
   rate_limited?: number;
+  trading_halted?: boolean;
+  halt_reason?: string;
 };
 
 type ClosedTrade = {
@@ -570,6 +573,15 @@ export default function App() {
       setLoading(false);
     }
   }, []);
+
+  const clearHalt = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/halt/clear`, { method: "POST" });
+      if (r.ok) void load();
+    } catch {
+      setErr("Devre kesici temizlenemedi");
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -1132,6 +1144,14 @@ export default function App() {
               <NumField label="Max haber yaşı sn (0=kapalı)" value={settings.max_news_age_sec} onSave={(v) => patchSettings({ max_news_age_sec: v })} />
               <NumField label="Aynı yönde max pozisyon (0=kapalı)" value={settings.max_same_direction} onSave={(v) => patchSettings({ max_same_direction: v })} />
               <NumField label="Max funding % futures (0=kapalı)" value={settings.max_funding_rate_pct} onSave={(v) => patchSettings({ max_funding_rate_pct: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ auto_halt_on_anomaly: !settings.auto_halt_on_anomaly })}
+                title="Anomalide (üst üste emir hatası / korumasız pozisyon) yeni oto-işlemi otomatik durdur"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.auto_halt_on_anomaly ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-red-500/40 bg-red-950/40 text-red-200"}`}
+              >
+                ⛔ Anomalide oto-durdur: {settings.auto_halt_on_anomaly ? "AÇIK" : "KAPALI (riskli)"}
+              </button>
             </div>
           </div>
         )}
@@ -1227,6 +1247,15 @@ export default function App() {
         {err && (
           <div className="mt-4 rounded-xl border border-red-500/30 bg-red-950/40 px-4 py-3 text-sm text-red-200" role="alert">
             {err}
+          </div>
+        )}
+        {health?.trading_halted && (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-500/50 bg-red-950/60 px-4 py-3 text-sm text-red-100" role="alert">
+            <span>⛔ <b>OPERASYONEL DURDURMA</b> — yeni oto-işlem durdu: {health.halt_reason}</span>
+            <button type="button" onClick={() => void clearHalt()}
+              className="rounded-md border border-red-400/50 bg-red-900/50 px-3 py-1 text-xs font-semibold hover:bg-red-800/60">
+              Temizle & devam et
+            </button>
           </div>
         )}
         {notice && (

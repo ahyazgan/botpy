@@ -233,6 +233,8 @@ _metrics: dict[str, int] = {
     "alerts_total": 0,          # eşik üstü güçlü haber sayısı
     "trades_opened_total": 0,   # otomatik açılan pozisyon sayısı
     "scan_errors_total": 0,     # arka plan tarama hatası sayısı
+    "reconcile_drift_total": 0, # mutabakatta bulunan hayalet pozisyon (news_bot gözlemler)
+    "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -1298,6 +1300,7 @@ def process_items(
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
                 if pos.get("protect_error"):   # borsa stop konulamadı → KORUMASIZ canlı pozisyon
+                    _metrics["protect_errors_total"] += 1
                     notify_remote(f"⚠️ DİKKAT: {pos['symbol']} borsa koruyucu stop KONULAMADI "
                                   f"— pozisyon yalnız bot çalışırken korumalı. Sebep: {pos['protect_error']}")
 
@@ -1359,6 +1362,26 @@ def _background_loop(stop: threading.Event) -> None:
 
 # Açık pozisyonları SL/TP/trailing için sık aralıkla izle
 MONITOR_INTERVAL_SEC = 8
+RECONCILE_INTERVAL_SEC = 300   # periyodik mutabakat (canlıda hayalet pozisyon taraması)
+_last_reconcile = 0.0
+
+
+def _periodic_reconcile() -> None:
+    """Canlıda periyodik mutabakat: bot çalışırken oluşan drift'i (hayalet pozisyon) yakala."""
+    global _last_reconcile
+    now = time.time()
+    if now - _last_reconcile < RECONCILE_INTERVAL_SEC:
+        return
+    _last_reconcile = now
+    rec = trader.reconcile_and_heal(autoclose=trader.S.reconcile_autoclose)
+    if rec.get("checked") and rec.get("phantoms"):
+        syms = [o["symbol"] for o in rec["phantoms"]]
+        _metrics["reconcile_drift_total"] += len(syms)
+        action = (f"{len(rec['healed'])}'i otomatik kapatıldı" if rec.get("healed")
+                  else "ELLE kontrol et (oto-kapatma kapalı)")
+        log.warning("Periyodik mutabakat: %d hayalet pozisyon: %s", len(syms), syms)
+        notify_remote(f"⚠️ MUTABAKAT (çalışırken): borsada görünmeyen {len(syms)} pozisyon "
+                      f"({', '.join(syms)}) — {action}.")
 
 
 def _persist_closed(pos: dict[str, Any]) -> None:
@@ -1381,6 +1404,10 @@ def _monitor_loop(stop: threading.Event) -> None:
             _recheck_deferred_entries()   # giriş beyni 'bekle' adaylarını yeniden değerlendir
         except Exception as e:
             log.warning("Ertelenen giriş kontrolü hatası: %s", e)
+        try:
+            _periodic_reconcile()         # canlıda hayalet pozisyon taraması (5dk)
+        except Exception as e:
+            log.warning("Periyodik mutabakat hatası: %s", e)
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -1525,6 +1552,7 @@ async def lifespan(app: FastAPI):
         rec = trader.reconcile_and_heal(autoclose=trader.S.reconcile_autoclose)
         if rec.get("checked") and rec.get("phantoms"):
             syms = [o["symbol"] for o in rec["phantoms"]]
+            _metrics["reconcile_drift_total"] += len(syms)
             log.warning("Mutabakat: borsada bulunmayan %d hayalet pozisyon: %s", len(syms), syms)
             action = (f"{len(rec['healed'])}'i otomatik kapatıldı"
                       if rec.get("healed") else "ELLE kontrol et (oto-kapatma kapalı)")
@@ -1662,6 +1690,11 @@ _METRIC_META = {
     "botpy_alerts_total": ("counter", "Eşik üstü güçlü haber"),
     "botpy_trades_opened_total": ("counter", "Otomatik açılan pozisyon"),
     "botpy_scan_errors_total": ("counter", "Arka plan tarama hatası"),
+    "botpy_order_rejects_total": ("counter", "Borsa emir red/dolmama (canlı)"),
+    "botpy_reconcile_drift_total": ("counter", "Mutabakatta bulunan hayalet pozisyon"),
+    "botpy_protect_errors_total": ("counter", "Borsa koruyucu stop konamadı"),
+    "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
+    "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
     "botpy_signals_archived": ("gauge", "Arşivlenmiş sinyal sayısı"),
     "botpy_ws_connected": ("gauge", "TreeNews WS bağlı mı (1/0)"),
@@ -1699,6 +1732,11 @@ def metrics() -> PlainTextResponse:
         "botpy_alerts_total": _metrics["alerts_total"],
         "botpy_trades_opened_total": _metrics["trades_opened_total"],
         "botpy_scan_errors_total": _metrics["scan_errors_total"],
+        "botpy_order_rejects_total": trader._order_rejects,
+        "botpy_reconcile_drift_total": _metrics["reconcile_drift_total"],
+        "botpy_protect_errors_total": _metrics["protect_errors_total"],
+        "botpy_halts_total": trader._halts,
+        "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
         "botpy_signals_archived": archived,
         "botpy_ws_connected": 1 if _ws_state["connected"] else 0,
@@ -1731,6 +1769,8 @@ def health() -> dict[str, Any]:
         "feed_stale": _ws_feed_stale(),
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
+        "trading_halted": trader.get_halt()["active"],
+        "halt_reason": trader.get_halt()["reason"],
     }
 
 
@@ -2046,6 +2086,7 @@ class SettingsPatch(BaseModel):
     order_type: str | None = None
     exchange_native_stops: bool | None = None
     reconcile_autoclose: bool | None = None
+    auto_halt_on_anomaly: bool | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None
@@ -2161,6 +2202,18 @@ def readiness() -> dict[str, Any]:
             "profit_factor": pf, "max_drawdown": perf.get("max_drawdown"), "checks": checks,
             "note": "Edge/veto doğrulaması ağ-yoğun, ayrı çalıştır: /brain-backtest (edge_pct>0) "
                     "+ /brain-veto-review (avg_net<0)."}
+
+
+@app.get("/halt")
+def get_halt() -> dict[str, Any]:
+    """Operasyonel devre kesici durumu (anomalide oto-işlem durdurulur)."""
+    return trader.get_halt()
+
+
+@app.post("/halt/clear", dependencies=[Depends(require_token)])
+def clear_halt() -> dict[str, Any]:
+    """Devre kesiciyi elle sıfırla (anomali giderildikten sonra oto-işlemi yeniden aç)."""
+    return trader.clear_halt()
 
 
 @app.get("/brain-scorecard")

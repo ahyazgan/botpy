@@ -102,6 +102,7 @@ type Settings = {
   skip_already_priced_pct: number;
   auto_tune: boolean;
   use_learned_vetoes: boolean;
+  regime_adapt: boolean;
   halt_trade_on_stale: boolean;
   max_news_age_sec: number;
   max_same_direction: number;
@@ -225,6 +226,8 @@ type Risk = {
   trading_halted: boolean;
   paper_trading: boolean;
   auto_trade: boolean;
+  kelly?: { ready: boolean; f_star: number; win_rate: number | null; payoff: number | null; n: number; multiplier: number; enabled: boolean };
+  regime?: { enabled: boolean; active: boolean; bump: number; restore: number | null; since: string };
 };
 
 type ScoreStat = { n: number; hit_rate: number; avg_move_pct: number };
@@ -1713,6 +1716,18 @@ export default function App() {
                   ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
                 </span>
               )}
+              {risk.regime?.active && (
+                <span className="rounded-lg border border-amber-500/50 bg-amber-950/50 px-3 py-1 text-xs font-bold text-amber-200"
+                  title="Rejim bozulması: eşik geçici sıkılaştırıldı. Piyasa toparlanınca otomatik geri alınır.">
+                  🌀 Rejim sıkılaştırması aktif (eşik +{risk.regime.bump})
+                </span>
+              )}
+              {risk.kelly?.enabled && risk.kelly.ready && (
+                <span className="rounded-lg border border-violet-500/40 bg-violet-950/40 px-3 py-1 text-xs font-semibold text-violet-200"
+                  title={`Kelly f*=${risk.kelly.f_star} (win ${risk.kelly.win_rate}, payoff ${risk.kelly.payoff}, n=${risk.kelly.n})`}>
+                  🎯 Kelly {risk.kelly.multiplier}x
+                </span>
+              )}
             </div>
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -1809,6 +1824,20 @@ export default function App() {
                 }`}
               >
                 🚫 Öğrenilen-veto: {settings.use_learned_vetoes ? "AÇIK" : "kapalı"}
+              </button>
+            )}
+            {settings && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ regime_adapt: !settings.regime_adapt })}
+                title="Rejim adaptasyonu: son dönem eski dönemden ANLAMLI kötüyse (piyasa bozuldu) oto min. gücü geçici +1 sıkılaştır (daha seçici); toparlanınca orijinale geri al. Sadece eşiğe dokunur, riske değil."
+                className={`rounded-md border px-3 py-1 text-xs font-semibold transition ${
+                  settings.regime_adapt
+                    ? "border-emerald-500/50 bg-emerald-950/50 text-emerald-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🌀 Rejim adaptasyonu: {settings.regime_adapt ? "AÇIK" : "kapalı"}
               </button>
             )}
             <button

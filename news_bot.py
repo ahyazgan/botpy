@@ -1464,6 +1464,13 @@ def _monitor_loop(stop: threading.Event) -> None:
                         notify_remote("🧠 Oto-öğrenme: " + ", ".join(
                             f"{c['field']} {c['from']}→{c['to']}" for c in res["changes"]))
                     trader.refresh_learned_vetoes()   # koşullu öğrenilen-veto listesini tazele
+                    # Rejim adaptasyonu: bozulmada eşiği geçici sıkılaştır / toparlanınca geri al
+                    reg = trader.regime_adapt_step()
+                    if reg.get("acted") and reg.get("change"):
+                        c = reg["change"]
+                        yon = "sıkılaştır" if reg["state"] == "tighten" else "geri al"
+                        notify_remote(f"🌀 Rejim adaptasyonu ({yon}): "
+                                      f"{c['field']} {c['from']}→{c['to']}")
                 except Exception as e:
                     log.warning("Oto-öğrenme hatası: %s", e)
         except Exception as e:

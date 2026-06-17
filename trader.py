@@ -101,6 +101,7 @@ class Settings:
     skip_already_priced_pct: float = 0.0   # >0: 24s'te bu % haber yönünde oynamışsa girme (chase önleme)
     auto_tune: bool = False          # kapalı döngü: öğrenen beyin önerilerini OTO-uygula (korkuluklu)
     use_learned_vetoes: bool = False # koşullu öğrenme: anlamlı-negatif segmentte (kaynak×rvol vb.) girme
+    regime_adapt: bool = False       # rejim BOZULMASINDA eşiği geçici sıkılaştır; toparlanınca geri al
     max_funding_rate_pct: float = 0.0  # >0 (futures): yön funding'e ters & maliyet bu %'yi geçerse girme
 
 
@@ -115,6 +116,10 @@ _exchange: Any = None
 
 # Operasyonel devre kesici: anomalide yeni oto-işlemi durdurur (manuel işlem etkilenmez)
 _halt: dict[str, Any] = {"active": False, "reason": "", "since": ""}
+
+# Rejim adaptasyonu: bozulmada eşik geçici sıkılaştırılır; toparlanınca geri alınır.
+# active=True iken `restore` orijinal auto_min_impact'i tutar (kalıcı değil — durum bilgisi).
+_regime_state: dict[str, Any] = {"active": False, "restore": None, "bump": 0, "since": ""}
 _order_fail_streak = 0
 _HALT_FAIL_THRESHOLD = 3   # üst üste bu kadar oto-emir hatası → durdur
 _order_rejects = 0         # toplam oto-emir red/dolmama (gözlemlenebilirlik)
@@ -137,7 +142,7 @@ _PERSIST_KEYS = (
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
-    "max_funding_rate_pct", "auto_tune", "use_learned_vetoes",
+    "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
 )
 
 
@@ -1609,6 +1614,8 @@ def get_risk() -> dict[str, Any]:
         # Kelly boyut bağlamı (şeffaflık): edge + uygulanan çarpan
         "kelly": {**kelly, "multiplier": _kelly_multiplier() if S.size_by_kelly else 1.0,
                   "enabled": S.size_by_kelly},
+        # Rejim adaptasyon durumu: eşik geçici sıkılaştırıldı mı
+        "regime": get_regime_state(),
     }
 
 
@@ -2067,6 +2074,69 @@ def auto_apply_tuning(tier_of: Any = None) -> dict[str, Any]:
     if not S.auto_tune:
         return {"applied": False, "reason": "auto_tune kapalı", "changes": []}
     return apply_tuning(suggest_tuning(tier_of=tier_of))
+
+
+# Rejim bozulmasında uygulanacak geçici eşik sıkılaştırması (korkuluk: tek seferde +1, tavan +2)
+_REGIME_BUMP_STEP = 1
+_REGIME_BUMP_MAX = 2
+
+
+def regime_adapt_step() -> dict[str, Any]:
+    """Rejim BOZULMASINDA eşiği geçici sıkılaştır; toparlanınca GERİ AL (opt-in).
+
+    Kapanan gerçek işlemlerden `_regime_check`: son yarı eski yarıdan ANLAMLI kötüyse
+    (shifted & improving=False) piyasa bozulmuş → `auto_min_impact`'i geçici +1 yükselt
+    (daha seçici ol, tavan +2). Rejim toparlanınca (shifted=False ya da improving) orijinal
+    eşiğe DÖN. Kalıcı değil — durum bilgisi `_regime_state`'te; yalnız EŞİĞE dokunur,
+    para-büyüklüğü/risk tavanına ASLA. Döner: {acted, state, change?}.
+    """
+    if not S.regime_adapt:
+        return {"acted": False, "reason": "regime_adapt kapalı"}
+    with _lock:
+        closed = [c for c in _closed if c.get("pnl") is not None]
+    regime = _regime_check(closed)
+    if not regime.get("ready"):
+        return {"acted": False, "reason": "yeterli örnek yok", "regime": regime}
+    deteriorating = bool(regime["shifted"] and not regime["improving"])
+    st = _regime_state
+    # BOZULMA: eşiği sıkılaştır (henüz tavanda değilse)
+    if deteriorating:
+        if not st["active"]:
+            st["restore"] = S.auto_min_impact   # ilk sıkılaştırmada orijinali sakla
+            st["bump"] = 0
+        if st["bump"] < _REGIME_BUMP_MAX:
+            old = S.auto_min_impact
+            new = min(10, old + _REGIME_BUMP_STEP)
+            if new != old:
+                S.auto_min_impact = new
+                st["active"] = True
+                st["bump"] += _REGIME_BUMP_STEP
+                st["since"] = _now()
+                with _lock:
+                    _save_state()
+                log.info("Rejim adaptasyonu: BOZULMA → eşik %s→%s (geçici)", old, new)
+                return {"acted": True, "state": "tighten", "regime": regime,
+                        "change": {"field": "auto_min_impact", "from": old, "to": new}}
+        return {"acted": False, "state": "tightened-max", "regime": regime}
+    # TOPARLANMA (artık bozulma yok): geçici sıkılaştırmayı geri al
+    if st["active"] and st["restore"] is not None:
+        old = S.auto_min_impact
+        S.auto_min_impact = int(st["restore"])
+        restored = S.auto_min_impact
+        st.update({"active": False, "restore": None, "bump": 0, "since": ""})
+        with _lock:
+            _save_state()
+        log.info("Rejim adaptasyonu: toparlanma → eşik %s→%s (geri alındı)", old, restored)
+        return {"acted": True, "state": "restore", "regime": regime,
+                "change": {"field": "auto_min_impact", "from": old, "to": restored}}
+    return {"acted": False, "state": "stable", "regime": regime}
+
+
+def get_regime_state() -> dict[str, Any]:
+    """Rejim adaptasyon durumu (panel/uç için): aktif mi, ne kadar sıkılaştırıldı."""
+    return {"enabled": S.regime_adapt, "active": _regime_state["active"],
+            "bump": _regime_state["bump"], "restore": _regime_state["restore"],
+            "since": _regime_state["since"]}
 
 
 def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> dict[str, Any]:

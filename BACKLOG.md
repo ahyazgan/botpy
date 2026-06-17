@@ -10,6 +10,9 @@
 - [x] Hazırlık kokpiti (/readiness) — paper-doğrulama verdikti
   Done when: yerel ölçütleri (örnek sayısı, profit_factor, beyin kalibrasyonu) eşiklere göre
   değerlendirip geç/kal/veri-yetersiz verdikti; panelde 🚦 banner; testler; yeşil; commit.
+- [x] Operasyonel polish: limit-emir ters-hayalet düzeltmesi + tek-instance kilidi
+  Done when: _verify_fill reddederken duran emri iptal eder; _acquire_singleton_lock (fcntl/msvcrt,
+  çökme-dayanıklı) çift bot'u engeller; testler; ruff+mypy+pytest+build yeşil; commit.
 - [x] Operasyonel sağlamlaştırma: dolum doğrulama + devre kesici + periyodik mutabakat + metrikler
   Done when: _verify_fill/OrderError (ters-hayalet önleme); trip_halt/clear + /halt + auto_decision kapısı +
   panel banner; _periodic_reconcile (5dk); /metrics order_rejects/drift/protect/halts sayaçları; testler; yeşil.

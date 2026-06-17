@@ -499,9 +499,11 @@ def _verify_fill(ex: Any, order: dict[str, Any], csym: str) -> dict[str, Any]:
     Dolum bilgisi yoksa fetch_order ile teyit eder. Kesin dolmama/iptal/red → OrderError.
     Belirsizse (sorgu da başarısız) dokunmaz — mutabakat yakalar.
     """
+    _TERMINAL = ("canceled", "rejected", "expired")
     filled = float(order.get("filled") or 0)
     status = order.get("status")
-    if filled <= 0 and order.get("id"):
+    # Dolum görünmüyor ama terminal de değil → fetch_order ile kesin durumu öğren
+    if filled <= 0 and status not in _TERMINAL and order.get("id"):
         try:
             o2 = ex.fetch_order(order["id"], csym)
             filled = float(o2.get("filled") or 0)
@@ -509,10 +511,17 @@ def _verify_fill(ex: Any, order: dict[str, Any], csym: str) -> dict[str, Any]:
             order = o2
         except Exception as e:
             log.warning("Emir durumu doğrulanamadı (%s) — dolmuş varsayılıyor: %s", order.get("id"), e)
-            return order
-    if filled <= 0 or status in ("canceled", "rejected", "expired"):
-        raise OrderError(f"emir dolmadı/reddedildi (status={status}, filled={filled})")
-    return order
+            return order   # belirsiz → dolmuş varsay (mutabakat yakalar)
+    if filled > 0:
+        return order
+    # Dolmadı: borsada hâlâ DURUYORSA iptal et (limit emir dinlenip sonra dolup ters-hayalet
+    # yaratmasın). Zaten terminal ise iptal gereksiz.
+    if order.get("id") and status not in _TERMINAL:
+        try:
+            ex.cancel_order(order["id"], csym)
+        except Exception as e:
+            log.warning("Dolmayan emir iptal edilemedi (%s): %s", order.get("id"), e)
+    raise OrderError(f"emir dolmadı/reddedildi (status={status}, filled={filled})")
 
 
 def _round_amount(ex: Any, csym: str, amount: float, price: float) -> float:

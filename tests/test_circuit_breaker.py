@@ -95,3 +95,33 @@ def test_verify_fill_uncertain_does_not_raise():
     order = {"id": "o1", "filled": 0, "status": None}
     out = trader._verify_fill(Boom(), order, "FOO/USDT")   # raise YOK
     assert out is order
+
+
+def test_verify_fill_cancels_resting_order_on_reject():
+    """Limit emir dinleniyor (open, dolmamış) → reddederken DURAN emri iptal et (ters-hayalet önle)."""
+    cancelled = []
+
+    class Ex2:
+        def fetch_order(self, oid, sym):
+            return {"id": oid, "filled": 0, "status": "open"}   # hâlâ duruyor
+        def cancel_order(self, oid, sym):
+            cancelled.append(oid)
+
+    order = {"id": "o1", "filled": 0, "status": "open"}
+    with pytest.raises(trader.OrderError):
+        trader._verify_fill(Ex2(), order, "FOO/USDT")
+    assert cancelled == ["o1"]   # duran emir iptal edildi
+
+
+def test_verify_fill_no_cancel_when_already_terminal():
+    """Zaten iptal/red ise tekrar iptal etmeye çalışma."""
+    cancelled = []
+
+    class Ex3:
+        def cancel_order(self, oid, sym):
+            cancelled.append(oid)
+
+    order = {"id": "o1", "filled": 0, "status": "canceled"}
+    with pytest.raises(trader.OrderError):
+        trader._verify_fill(Ex3(), order, "FOO/USDT")
+    assert cancelled == []   # terminal → iptal yok

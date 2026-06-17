@@ -1538,10 +1538,47 @@ _ws_thread: threading.Thread | None = None
 _mon_thread: threading.Thread | None = None
 
 
+_instance_lock: Any = None   # tek-instance kilidi (handle'ı canlı tut → OS kilidi açık kalır)
+
+
+def _acquire_singleton_lock() -> bool:
+    """Aynı hesaba karşı ÇİFT bot çalışmasını önle (çift işlem felaketi).
+
+    Taşınabilir OS kilidi (fcntl/msvcrt); süreç ölünce OS serbest bırakır (çökme-dayanıklı,
+    bayat kilit sorunu yok). Alınamazsa False (başka örnek çalışıyor). Kilit yoksa True (sakınca yok).
+    """
+    global _instance_lock
+    path = os.environ.get("BOTPY_LOCK", trader.STATE_FILE + ".lock")
+    try:
+        f = open(path, "w")
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False   # kilit başkası tarafından tutuluyor
+    except Exception as e:
+        log.warning("Tek-instance kilidi kurulamadı (atlanıyor): %s", e)
+        return True    # kilit altyapısı yoksa engelleme
+    try:
+        f.write(f"{os.getpid()}\n{_now_iso()}\n")
+        f.flush()
+    except Exception:
+        pass
+    _instance_lock = f   # GC'lenirse kilit açılır → referansı tut
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _bg_thread, _ws_thread, _mon_thread
     setup_logging()
+    if not _acquire_singleton_lock():
+        raise RuntimeError(
+            "Başka bir bot örneği zaten çalışıyor (tek-instance kilidi) — çift işlem riskini "
+            "önlemek için başlatma iptal edildi. Diğer örneği kapat veya BOTPY_LOCK'u değiştir.")
     _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
     try:
         store = get_store()

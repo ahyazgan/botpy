@@ -78,6 +78,7 @@ class Settings:
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
     exchange_native_stops: bool = True   # canlıda borsaya DURAN SL/TP emri koy (bot çökse de korur)
+    reconcile_autoclose: bool = False    # açılış mutabakatında borsada olmayan hayalet pozisyonu kapat
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
@@ -107,7 +108,7 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
-    "exchange_native_stops",
+    "exchange_native_stops", "reconcile_autoclose",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
@@ -441,6 +442,33 @@ def _create_order_idempotent(ex: Any, symbol: str, otype: str, side: str, amount
     raise last_exc if last_exc else RuntimeError("emir gönderilemedi")
 
 
+def _round_amount(ex: Any, csym: str, amount: float, price: float) -> float:
+    """Emir miktarını borsanın lot-size/precision'ına yuvarla + minNotional/min-miktar doğrula.
+
+    Binance her parite için stepSize/minNotional filtreler — bunlara uymayan emir REDDEDİLİR.
+    Filtreyi geçemeyecek emir için net RuntimeError (boyutu artır). Market bilgisi yoksa ham döner.
+    """
+    try:
+        if not getattr(ex, "markets", None):
+            ex.load_markets()
+        m = ex.market(csym)
+    except Exception as e:
+        log.warning("Market bilgisi alınamadı (%s) — ham miktar: %s", csym, e)
+        return amount
+    limits = m.get("limits") or {}
+    min_cost = ((limits.get("cost") or {}).get("min"))
+    if min_cost and amount * price < float(min_cost):
+        raise RuntimeError(f"Emir minNotional altında (${amount * price:.2f} < ${float(min_cost):.2f}) — boyutu artır")
+    try:
+        adj = float(ex.amount_to_precision(csym, amount))
+    except Exception:
+        adj = amount
+    min_amt = ((limits.get("amount") or {}).get("min"))
+    if min_amt and adj < float(min_amt):
+        raise RuntimeError(f"Emir min miktar altında ({adj} < {min_amt}) — boyutu artır")
+    return adj or amount
+
+
 def _place_protective_orders(ex: Any, csym: str, pos: dict[str, Any]) -> None:
     """Canlıda girişten sonra borsaya DURAN koruyucu SL (ve TP) emri koy.
 
@@ -511,12 +539,17 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         ex = _get_exchange()
         csym = _ccxt_symbol(symbol)
         ex_side = "buy" if is_long else "sell"
+        amount = _round_amount(ex, csym, amount, price)   # lot-size/precision/minNotional
         if S.market == "futures" and S.leverage > 1:
             try:
                 ex.set_leverage(S.leverage, csym)
             except Exception as e:
                 log.warning("Kaldıraç ayarlanamadı (%s): %s", csym, e)
         if S.order_type == "limit":
+            try:
+                price = float(ex.price_to_precision(csym, price))
+            except Exception:
+                pass
             order = _create_order_idempotent(ex, csym, "limit", ex_side, amount, price=price)
         else:
             order = _create_order_idempotent(ex, csym, "market", ex_side, amount)
@@ -533,6 +566,14 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
     # Giriş beyni çıkış önerisi: SL sıkılığı (tight/normal/wide → sl_mult)
     if sl_mult != 1.0 and sl_pct > 0:
         sl_pct = max(0.5, min(15.0, sl_pct * sl_mult))
+    # Tasfiye-farkında SL (futures): SL tasfiye fiyatının ötesindeyse önce tasfiye olunur,
+    # SL hiç çalışmaz. Kaldıraç-ima tasfiye mesafesinin (~100/kaldıraç%) güvenli içine kıstır.
+    if S.market == "futures" and S.leverage > 1 and sl_pct > 0:
+        safe = 0.8 * (100.0 / S.leverage)
+        if sl_pct > safe:
+            log.warning("SL %%%.1f tasfiyeye (~%%%.1f, %dx) çok yakın — %%%.1f'e kıstırıldı (güvenlik)",
+                        sl_pct, 100.0 / S.leverage, S.leverage, safe)
+            sl_pct = round(safe, 2)
 
     # SL/TP fiyatları
     sl_price = tp_price = None
@@ -620,7 +661,9 @@ def update_position(pid: str, *, sl_price: float | None = None,
     return dict(pos)
 
 
-def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
+def close_position(pid: str, reason: str = "manuel", exchange_close: bool = True) -> dict[str, Any]:
+    """Pozisyonu kapat. `exchange_close=False` → borsaya kapanış emri GÖNDERME (yalnız yerel
+    defter; borsa zaten düz olduğunda mutabakat-iyileştirmesi için — duran emirler yine iptal)."""
     with _lock:
         idx = next((i for i, p in enumerate(_positions) if p["id"] == pid), None)
         if idx is None:
@@ -633,9 +676,10 @@ def close_position(pid: str, reason: str = "manuel") -> dict[str, Any]:
             ex = _get_exchange()
             csym = _ccxt_symbol(pos["symbol"])
             _cancel_protective_orders(ex, csym, pos)   # duran SL/TP'yi iptal et (çift kapanış önle)
-            ex_side = "sell" if pos["side"] == "long" else "buy"
-            params = {"reduceOnly": True} if pos["market"] == "futures" else {}
-            _create_order_idempotent(ex, csym, "market", ex_side, pos["amount"], params=params)
+            if exchange_close:
+                ex_side = "sell" if pos["side"] == "long" else "buy"
+                params = {"reduceOnly": True} if pos["market"] == "futures" else {}
+                _create_order_idempotent(ex, csym, "market", ex_side, pos["amount"], params=params)
         except Exception as e:
             log.warning("Canlı kapatma hatası (%s): %s", pos["symbol"], e)
 
@@ -695,6 +739,29 @@ def reconcile_positions(exchange_symbols: set[str] | None = None) -> dict[str, A
     orphans = [{"id": pid, "symbol": s} for pid, s in local if s not in exchange_symbols]
     matched = [{"id": pid, "symbol": s} for pid, s in local if s in exchange_symbols]
     return {"checked": True, "orphans": orphans, "matched": matched}
+
+
+def reconcile_and_heal(autoclose: bool = False) -> dict[str, Any]:
+    """Açılış/periyodik mutabakat: borsada GÖRÜNMEYEN yerel pozisyonları (hayalet) tespit eder.
+
+    Hayalet = bot 'açık' sanıyor ama borsa düz (genelde bot kapalıyken borsa stop'u tetiklenmiş
+    veya elle kapanmış). `autoclose=True` ise hayaleti yerel defterde kapatır (borsaya emir
+    GÖNDERMEZ — zaten düz). Drift'i her zaman raporlar; çağıran yüksek sesle uyarmalı.
+    """
+    rep = reconcile_positions()
+    if not rep.get("checked"):
+        return {"checked": False, "reason": rep.get("reason"), "phantoms": [], "healed": []}
+    phantoms = rep["orphans"]
+    healed: list[dict[str, Any]] = []
+    if autoclose:
+        for ph in phantoms:
+            try:
+                healed.append(close_position(ph["id"], reason="mutabakat: borsada yok",
+                                             exchange_close=False))
+            except Exception as e:
+                log.warning("Hayalet pozisyon kapatılamadı (%s): %s", ph["symbol"], e)
+    return {"checked": True, "phantoms": phantoms, "healed": healed,
+            "matched": rep.get("matched", [])}
 
 
 def close_all(reason: str = "toplu-kapat") -> dict[str, Any]:

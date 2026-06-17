@@ -77,6 +77,7 @@ type Settings = {
   max_per_coin_usdt: number;
   order_type: "market" | "limit";
   exchange_native_stops: boolean;
+  reconcile_autoclose: boolean;
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
@@ -1094,6 +1095,14 @@ export default function App() {
                 className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.exchange_native_stops ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-red-500/40 bg-red-950/40 text-red-200"}`}
               >
                 🛡️ Borsa-native stop: {settings.exchange_native_stops ? "AÇIK" : "KAPALI (riskli)"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ reconcile_autoclose: !settings.reconcile_autoclose })}
+                title="Açılış mutabakatı: borsada görünmeyen hayalet pozisyonu otomatik kapat (kapalıysa yalnız uyarır)"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.reconcile_autoclose ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                🔄 Hayalet pozisyon oto-kapat: {settings.reconcile_autoclose ? "AÇIK" : "kapalı (uyar)"}
               </button>
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />

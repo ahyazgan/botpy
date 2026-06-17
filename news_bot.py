@@ -1521,10 +1521,15 @@ async def lifespan(app: FastAPI):
         store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
         for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
             store.add_closed_news_trade(t)
-        rec = trader.reconcile_positions()         # canlı modda borsayla mutabakat (read-only)
-        if rec.get("checked") and rec.get("orphans"):
-            log.warning("Mutabakat: borsada bulunmayan %d yerel pozisyon (orphan): %s",
-                        len(rec["orphans"]), [o["symbol"] for o in rec["orphans"]])
+        # Açılış mutabakatı: bot kapalıyken borsa stop'u tetiklenmiş olabilir → hayalet pozisyon.
+        rec = trader.reconcile_and_heal(autoclose=trader.S.reconcile_autoclose)
+        if rec.get("checked") and rec.get("phantoms"):
+            syms = [o["symbol"] for o in rec["phantoms"]]
+            log.warning("Mutabakat: borsada bulunmayan %d hayalet pozisyon: %s", len(syms), syms)
+            action = (f"{len(rec['healed'])}'i otomatik kapatıldı"
+                      if rec.get("healed") else "ELLE kontrol et (oto-kapatma kapalı)")
+            notify_remote(f"⚠️ MUTABAKAT: borsada görünmeyen {len(syms)} yerel pozisyon "
+                          f"({', '.join(syms)}) — {action}. Bot kapalıyken stop tetiklenmiş olabilir.")
     except Exception as e:
         log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
@@ -2040,6 +2045,7 @@ class SettingsPatch(BaseModel):
     max_per_coin_usdt: float | None = None
     order_type: str | None = None
     exchange_native_stops: bool | None = None
+    reconcile_autoclose: bool | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None

@@ -10,6 +10,10 @@
 - [x] Hazırlık kokpiti (/readiness) — paper-doğrulama verdikti
   Done when: yerel ölçütleri (örnek sayısı, profit_factor, beyin kalibrasyonu) eşiklere göre
   değerlendirip geç/kal/veri-yetersiz verdikti; panelde 🚦 banner; testler; yeşil; commit.
+- [x] Canlı doğruluk: emir hassasiyeti/minNotional + tasfiye-farkında SL + açılış mutabakat-iyileştirme
+  Done when: _round_amount (precision+minNotional, reddederse net hata); futures SL tasfiye içine kıstırılır;
+  reconcile_and_heal (hayalet pozisyon tespit + opsiyonel oto-kapat, LOUD uyarı); panel toggle; testler;
+  ruff+mypy+pytest+build yeşil; commit.
 - [x] Borsa-native koruyucu stop (canlı güvenlik açığı)
   Done when: place_trade canlıda borsaya DURAN SL/TP koyar (_place_protective_orders, ccxt
   stopLossPrice/takeProfitPrice); close/update iptal+yeniler; protect_error → uzak uyarı; paper

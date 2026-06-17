@@ -876,6 +876,11 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
     src = getattr(item, "source", "") or ""
     side = decision.get("side") or ""
     st = trader.source_stats(src)
+    # Mikroyapı: orderbook skew (canlı yolda); aynı book likidasyon-baskısına da verilir
+    book = None if (backtest or not item.symbol) else trader.orderbook_imbalance(item.symbol)
+    # Likidasyon-baskısı: funding+premium → squeeze setup (futures, canlı yolda, auth'suz)
+    squeeze = (None if (backtest or not item.symbol or trader.S.market != "futures")
+               else trader.liquidation_pressure(item.symbol, side, book))
     ctx = {
         "haber": {
             "kaynak": src, "kaynak_tier": _source_tier(src),
@@ -891,8 +896,8 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
             "rvol": item.rel_volume,   # göreceli hacim: >1.5x haber gerçek, hacimsiz=fake
             "atr_pct": item.atr_pct, "teyitli": item.confirmed, "not": item.price_note[:160],
         },
-        "mikroyapi": (None if backtest or not item.symbol
-                      else trader.orderbook_imbalance(item.symbol)),
+        "mikroyapi": book,
+        "likidasyon_baskisi": squeeze,   # funding/premium aşırılığı → squeeze setup (futures)
         "kaynak_gecmisi": {"kapanmis_islem": st["count"], "ort_pnl_usdt": st["avg_pnl"]},
         "emsal": {
             "kaynak_geneli": trader.precedent_stats(news_source=src),
@@ -2396,6 +2401,55 @@ def shadow_patch(body: ShadowPatch) -> dict[str, Any]:
     return {"overrides": applied, "enabled": bool(applied)}
 
 
+def _shadow_eval_impl(limit: int, hours: float, sl: float, tp: float, fee: float) -> dict[str, Any]:
+    """Gölge kararların SANAL sonucunu (sinyal-sonrası fiyat) hesapla → terfi önerisi.
+
+    Her DIVERGENCE kaydı için sinyalin gerçek net %%'sini backtest'le (Binance klines,
+    ağ-yoğun → threadpool) çıkarır, trader.shadow_promotion_advice ile aday-ayar terfi
+    ÖNERİSİ üretir. OTO-UYGULAMAZ — yalnız öneri (kontrol kullanıcıda).
+    """
+    import news_backtest as nbt
+
+    rows = get_store().shadow_summary(limit=limit)["recent"]
+    diverged = [r for r in rows if r.get("diverged")]
+    if not diverged:
+        return {"ok": False, "reason": "değerlendirilecek divergence yok", "n": 0}
+    # Gölge kaydını backtest sinyal-satırına çevir (side→direction)
+    sig_rows = [{
+        "symbol": r["symbol"], "impact": r.get("impact") or 7, "title": "",
+        "published": r.get("published"),
+        "direction": "bullish" if r.get("side") == "long" else "bearish",
+    } for r in diverged if r.get("symbol") and r.get("side")]
+    candidates = nbt._signals_from_rows(sig_rows)
+    signals = nbt.prefetch(candidates, int(hours * 60)) if candidates else []
+    # sinyal-sonucunu (symbol,time) ile eşle → gölge kayıtlarına outcome_pct yaz
+    outcome: dict[tuple[str, int], float] = {}
+    for s in signals:
+        res = nbt.simulate(s, sl, tp, fee)
+        if res is not None:
+            outcome[(s["symbol"], s["time"])] = res["net_pct"]
+    enriched = []
+    for r, sr in zip(diverged, sig_rows):
+        t = nbt._to_ms(r.get("published"))
+        oc = outcome.get((r["symbol"], t)) if t else None
+        enriched.append({**r, "outcome_pct": oc})
+    advice = trader.shadow_promotion_advice(enriched)
+    return {"ok": True, "overrides": trader.get_shadow_overrides(), **advice}
+
+
+@app.get("/shadow/evaluate")
+def shadow_evaluate(limit: int = 500, hours: float = 6, sl: float = 3, tp: float = 6,
+                    fee: float = 0.1) -> dict[str, Any]:
+    """Gölge kararların sanal sonucundan aday-ayar TERFİ ÖNERİSİ (ağ-yoğun; sync route =
+    FastAPI threadpool'da koşar, olay döngüsünü bloklamaz; aynı anda tek koşar).
+
+    recommend=true ise aday ayar canlıdan tutarlı daha iyi → ELLE terfi düşünülebilir
+    (PATCH /settings ile). Oto-terfi YOK — kontrol kaybı riskine karşı kullanıcı onayı şart.
+    """
+    with _heavy_guard():
+        return _shadow_eval_impl(limit, hours, sl, tp, fee)
+
+
 # ── İşlem endpoint'leri ──────────────────────────────────────────────────
 class TradeRequest(BaseModel):
     symbol: str | None = None       # örn. BTCUSDT
@@ -2421,6 +2475,9 @@ class SettingsPatch(BaseModel):
     halt_trade_on_stale: bool | None = None
     max_news_age_sec: int | None = None
     max_same_direction: int | None = None
+    brain_recalibrate: bool | None = None
+    brain_recalibrate_min: int | None = None
+    brain_vote_count: int | None = None
     use_sl_tp: bool | None = None
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
@@ -2428,6 +2485,8 @@ class SettingsPatch(BaseModel):
     use_atr_exits: bool | None = None
     atr_sl_mult: float | None = None
     atr_tp_mult: float | None = None
+    use_atr_trailing: bool | None = None
+    atr_trailing_mult: float | None = None
     daily_loss_limit_usdt: float | None = None
     max_total_exposure_usdt: float | None = None
     max_per_coin_usdt: float | None = None
@@ -2437,7 +2496,6 @@ class SettingsPatch(BaseModel):
     auto_halt_on_anomaly: bool | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
-    size_by_impact: bool | None = None
     size_by_volume: bool | None = None
     min_rel_volume: float | None = None
     max_book_frac: float | None = None
@@ -2445,14 +2503,26 @@ class SettingsPatch(BaseModel):
     breakeven_pct: float | None = None
     partial_tp_pct: float | None = None
     partial_tp_frac: float | None = None
+    partial_tp_levels: str | None = None
     max_open_risk_usdt: float | None = None
     reduce_after_losses: int | None = None
+    size_by_impact: bool | None = None  # (zaten yukarıda var ama açık tutuluyor)
+    size_by_kelly: bool | None = None
+    kelly_fraction: float | None = None
+    kelly_min_trades: int | None = None
+    risk_parity: bool | None = None
+    target_risk_usdt: float | None = None
+    portfolio_risk: bool | None = None
+    corr_threshold: float | None = None
+    max_portfolio_heat: float | None = None
+    rvol_scale_by_impact: bool | None = None
     suppress_losing_sources: bool | None = None
     min_source_samples: int | None = None
     skip_already_priced_pct: float | None = None
     max_funding_rate_pct: float | None = None
     auto_tune: bool | None = None
     use_learned_vetoes: bool | None = None
+    regime_adapt: bool | None = None
 
 
 @app.get("/settings")

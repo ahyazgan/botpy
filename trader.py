@@ -69,11 +69,16 @@ class Settings:
     use_atr_exits: bool = False      # açıksa SL/TP = çarpan × ATR% (haber teyidinden)
     atr_sl_mult: float = 1.5         # SL = atr_sl_mult × ATR% ([0.5, 15] kıstırılır)
     atr_tp_mult: float = 3.0         # TP = atr_tp_mult × ATR% ([1, 30] kıstırılır)
+    use_atr_trailing: bool = False   # açıksa trailing % = atr_trailing_mult × ATR% (oynak coinde geniş)
+    atr_trailing_mult: float = 1.0   # trailing = atr_trailing_mult × ATR% ([0.3, 10] kıstırılır)
     # Akıllı çıkış yönetimi
     time_stop_min: int = 0           # >0: bu kadar dk sonra hâlâ açıksa kapat (haber edge'i söndü)
     breakeven_pct: float = 0.0       # >0: +%X kâra ulaşınca SL'i girişe çek (kârı koru)
     partial_tp_pct: float = 0.0      # >0: +%X'te pozisyonun bir kısmını al (scale-out)
     partial_tp_frac: float = 0.5     # kısmi TP'de kapatılacak oran (0-1)
+    # Çok-kademeli scale-out: "pct:frac,pct:frac" (örn "3:0.33,6:0.33,10:0.34").
+    # Doluysa partial_tp_pct/frac'ı GEÇERSİZ kılar (her kademe ayrı tetiklenir).
+    partial_tp_levels: str = ""
     # Risk limitleri
     daily_loss_limit_usdt: float = 200.0   # günlük gerçekleşen zarar bu USDT'yi geçerse dur (0=kapalı)
     max_total_exposure_usdt: float = 2000.0  # toplam açık pozisyon USDT tavanı (0=kapalı)
@@ -142,6 +147,7 @@ _PERSIST_KEYS = (
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
+    "use_atr_trailing", "atr_trailing_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "size_by_kelly", "kelly_fraction", "kelly_min_trades",
@@ -150,6 +156,7 @@ _PERSIST_KEYS = (
     "size_by_volume", "min_rel_volume", "rvol_scale_by_impact", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
+    "partial_tp_levels",
     "max_open_risk_usdt", "reduce_after_losses",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
     "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
@@ -314,6 +321,72 @@ def get_funding_rate(symbol: str) -> float | None:
         return float(data["lastFundingRate"]) * 100 if data else None
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _premium_index(symbol: str) -> dict[str, float] | None:
+    """Binance futures premiumIndex: funding% + perpetual premium% (mark vs index). Auth'suz.
+
+    premium = (markPrice − indexPrice)/indexPrice × 100. Pozitif → futures spot'un üstünde
+    (long baskısı/iyimserlik). Tek çağrıda hem funding hem premium. Hata/yoksa None.
+    """
+    data = get_json(f"{BINANCE_FAPI}/premiumIndex", params={"symbol": symbol}, timeout=10)
+    if not data:
+        return None
+    try:
+        mark = float(data["markPrice"])
+        index = float(data["indexPrice"])
+        funding = float(data["lastFundingRate"]) * 100
+    except (KeyError, TypeError, ValueError):
+        return None
+    premium = (mark - index) / index * 100 if index > 0 else 0.0
+    return {"funding_pct": round(funding, 4), "premium_pct": round(premium, 4)}
+
+
+# Funding/premium "aşırılık" eşikleri (squeeze sinyali için) — futures public veriden
+_FUNDING_EXTREME = 0.03   # |funding%| bu üstüyse pozisyonlar kalabalık/aşırı (8s oranı)
+_PREMIUM_EXTREME = 0.10   # |premium%| bu üstüyse perpetual spot'tan belirgin sapmış
+
+
+def liquidation_pressure(symbol: str, side: str,
+                         book: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Squeeze/likidasyon-baskısı sinyali (futures public veriden, auth'suz). Saf değerlendirme.
+
+    Aşırı-kalabalık bir yön zorla kapanmaya (squeeze) yatkındır → ters yönde patlama riski.
+      - funding NEGATİF & aşırı → shortlar kalabalık → SHORT-SQUEEZE (yukarı patlama, long lehine)
+      - funding POZİTİF & aşırı → longlar kalabalık → LONG-SQUEEZE (aşağı, short lehine)
+      - premium aynı yönde teyit eder; orderbook skew ters baskıyı gösterirse güç artar.
+    `book`: orderbook_imbalance çıktısı (çağıran verir, ekstra ağ olmasın); None → atla.
+    Döner: {funding_pct, premium_pct, squeeze, supports_side, score 0-1} ya da None (veri yok).
+    `score`: girilen `side` için bu kurulumun ne kadar destekleyici olduğu (squeeze işimize yarıyor mu).
+    """
+    pi = _premium_index(symbol)
+    if pi is None:
+        return None
+    funding, premium = pi["funding_pct"], pi["premium_pct"]
+    squeeze: str | None = None
+    if funding <= -_FUNDING_EXTREME:
+        squeeze = "short"      # shortlar kalabalık → short-squeeze → YUKARI (long lehine)
+    elif funding >= _FUNDING_EXTREME:
+        squeeze = "long"       # longlar kalabalık → long-squeeze → AŞAĞI (short lehine)
+    # squeeze yönü "kim sıkışacak"; patlama TERS yönde → long-squeeze short'u, short-squeeze long'u destekler
+    supports_side: str | None = None
+    if squeeze == "short":
+        supports_side = "long"
+    elif squeeze == "long":
+        supports_side = "short"
+    # Skor: aşırılık derecesi + premium teyidi + orderbook ters-baskı teyidi
+    score = 0.0
+    if supports_side:
+        score = min(1.0, abs(funding) / (_FUNDING_EXTREME * 3))   # aşırılık derecesi (cap 3×)
+        if abs(premium) >= _PREMIUM_EXTREME and (premium < 0) == (supports_side == "long"):
+            score = min(1.0, score + 0.2)   # premium squeeze yönünü teyit
+        if book and book.get("skew") is not None:
+            skew = book["skew"]
+            if (supports_side == "long" and skew > 0.2) or (supports_side == "short" and skew < -0.2):
+                score = min(1.0, score + 0.2)   # orderbook patlama yönünü teyit
+    return {"funding_pct": funding, "premium_pct": premium, "squeeze": squeeze,
+            "supports_side": supports_side, "score": round(score, 2),
+            "aligned": supports_side == side}
 
 
 def orderbook_imbalance(symbol: str, depth: int = 20) -> dict[str, Any] | None:
@@ -979,7 +1052,8 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "impact": impact,
         "rel_volume": rel_volume,   # öğrenme: hacim (RVOL) dilimine göre beklenti
         "reason": reason,
-        "atr_pct": round(atr_pct, 3) if (S.use_atr_exits and atr_pct) else None,
+        # ATR%: SL/TP veya trailing ATR-uyarlamalıysa sakla (çıkış motoru okur)
+        "atr_pct": round(atr_pct, 3) if ((S.use_atr_exits or S.use_atr_trailing) and atr_pct) else None,
         "time_stop_min": int(time_stop_min) if time_stop_min else None,
     }
     with _lock:
@@ -1206,6 +1280,51 @@ def _parse_dt(s: str | None) -> datetime | None:
         return None
 
 
+def _parse_tp_levels(spec: str) -> list[tuple[float, float]]:
+    """Çok-kademeli scale-out spec'ini ayrıştır: "3:0.33,6:0.33,10:0.34" → [(3,0.33),...].
+
+    Saf fonksiyon. Geçersiz parçaları atlar; pct'ye göre artan sıralar (en düşük eşik
+    önce tetiklenir). Boş/bozuk → boş liste (tek-kademe partial_tp_pct'e düşülür).
+    """
+    out: list[tuple[float, float]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        a, _, b = part.partition(":")
+        try:
+            pct, frac = float(a), float(b)
+        except ValueError:
+            continue
+        if pct > 0 and 0 < frac <= 1:
+            out.append((pct, frac))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _tp_levels() -> list[tuple[float, float]]:
+    """Etkin scale-out kademeleri: çok-kademe spec doluysa o, değilse tek-kademe (geriye uyum)."""
+    levels = _parse_tp_levels(S.partial_tp_levels)
+    if levels:
+        return levels
+    if S.partial_tp_pct > 0 and S.partial_tp_frac > 0:
+        return [(S.partial_tp_pct, S.partial_tp_frac)]
+    return []
+
+
+def _effective_trailing_pct(p: dict[str, Any]) -> float:
+    """Bu pozisyonun etkin trailing yüzdesi: ATR-uyarlamalı açıksa atr_trailing_mult×ATR%
+    (clamp [0.3,10]), yoksa pozisyonun sabit trailing_pct'i.
+
+    Oynak coinde (ATR yüksek) trailing geniş → trend tutulur; sakin coinde dar → erken
+    kilitlenir. ATR yoksa sabit yüzdeye düşülür (eksik veri ceza değil).
+    """
+    if S.use_atr_trailing:
+        atr = p.get("atr_pct")
+        if atr and atr > 0:
+            return max(0.3, min(10.0, S.atr_trailing_mult * atr))
+    return p.get("trailing_pct", 0) or 0
+
+
 def _partial_close(p: dict[str, Any], frac: float, reason: str, cur: float) -> dict[str, Any] | None:
     """Pozisyonun `frac` oranını kapat (scale-out). Kapanan kısmı kayıt eder,
     canlı pozisyonu küçültür. Kapanan satırı döndürür (canlı emir hatasında None)."""
@@ -1271,8 +1390,9 @@ def monitor_positions() -> list[dict[str, Any]]:
         elif cur < trough:
             p["trough"] = cur
 
-        # 1) Trailing stop: kâr yönünde ilerledikçe stop'u çek
-        tr = p.get("trailing_pct", 0) or 0
+        # 1) Trailing stop: kâr yönünde ilerledikçe stop'u çek. Yüzde sabit veya
+        #    ATR-uyarlamalı (oynak coinde geniş, sakinde dar) — _effective_trailing_pct.
+        tr = _effective_trailing_pct(p)
         if tr > 0:
             if is_long and cur > p.get("high_water", cur):
                 p["high_water"] = cur
@@ -1300,12 +1420,20 @@ def monitor_positions() -> list[dict[str, Any]]:
             with _lock:
                 _save_state()
 
-        # 3) Kısmi TP (scale-out, bir kez)
-        if (S.partial_tp_pct > 0 and S.partial_tp_frac > 0
-                and not p.get("partial_done") and gain >= S.partial_tp_pct):
-            rec = _partial_close(p, S.partial_tp_frac, "partial-tp", cur)
-            if rec:
-                closed.append(rec)
+        # 3) Kısmi TP (scale-out): çok-kademeli — her eşik ayrı tetiklenir (bir kez).
+        #    partial_levels_done = tetiklenmiş eşiklerin listesi (restart'a dayanıklı).
+        levels = _tp_levels()
+        if levels:
+            done = p.get("partial_levels_done") or []
+            for pct, frac in levels:
+                if gain >= pct and pct not in done:
+                    rec = _partial_close(p, frac, f"partial-tp-{pct:g}%", cur)
+                    done = [*done, pct]
+                    p["partial_levels_done"] = done
+                    if rec:
+                        closed.append(rec)
+                    if p["amount"] <= 0:   # tüm pozisyon scale-out ile kapandı
+                        break
 
         # 4) Tam çıkış: SL / TP / time-stop
         hit = None
@@ -1686,6 +1814,38 @@ def shadow_decision(item: Any, *, feed_stale: bool = False,
     diverged = (live["would_trade"] != shadow["would_trade"]
                 or (live["would_trade"] and live["usdt"] != shadow["usdt"]))
     return {"live": live, "shadow": shadow, "diverged": diverged}
+
+
+# Terfi önerisi için minimum kanıt: en az bu kadar SONUÇLU divergence + net edge eşiği
+_SHADOW_PROMOTE_MIN = 10
+_SHADOW_PROMOTE_EDGE_PCT = 0.5   # aday, canlıdan ort. bu kadar % net daha iyi olmalı
+
+
+def shadow_promotion_advice(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Gölge kararların SANAL sonuçlarından aday-ayar terfi ÖNERİSİ (saf, OTO-UYGULAMAZ).
+
+    `rows`: her biri en az {diverged, live_trade, shadow_trade, outcome_pct} taşıyan gölge
+    kayıtları. `outcome_pct`: o sinyalin sinyal-sonrası gerçek net %% (çağıran backtest'le
+    doldurur). Yalnız DIVERGENCE'larda (aday≠canlı karar) sonucu sayarız — fark orada.
+      - aday GİRER & canlı girmez: aday o sinyalin sonucunu KAZANIR/KAYBEDER (live 0 alır)
+      - canlı GİRER & aday girmez: tersi
+    Aday ort. net edge ≥ eşik VE yeterli örnek → 'terfi öner' (insan onayı şart, KONTROL kullanıcıda).
+    Döner: {ready, n, shadow_avg, live_avg, edge_pct, recommend}.
+    """
+    scored = [r for r in rows if r.get("diverged") and r.get("outcome_pct") is not None]
+    n = len(scored)
+    if n < _SHADOW_PROMOTE_MIN:
+        return {"ready": False, "n": n, "min": _SHADOW_PROMOTE_MIN,
+                "shadow_avg": None, "live_avg": None, "edge_pct": None, "recommend": False}
+    # Her divergence'ta her ayarın o sinyalden KAZANDIĞI net %: girdiyse outcome, girmediyse 0
+    shadow_pnls = [float(r["outcome_pct"]) if r.get("shadow_trade") else 0.0 for r in scored]
+    live_pnls = [float(r["outcome_pct"]) if r.get("live_trade") else 0.0 for r in scored]
+    shadow_avg = sum(shadow_pnls) / n
+    live_avg = sum(live_pnls) / n
+    edge = shadow_avg - live_avg
+    return {"ready": True, "n": n, "shadow_avg": round(shadow_avg, 3),
+            "live_avg": round(live_avg, 3), "edge_pct": round(edge, 3),
+            "recommend": edge >= _SHADOW_PROMOTE_EDGE_PCT}
 
 
 def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str, Any] | None:

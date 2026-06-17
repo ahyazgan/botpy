@@ -17,7 +17,8 @@ def clean(monkeypatch):
     # tüm yeni özellikler varsayılan kapalı başlasın
     for k, v in {
         "time_stop_min": 0, "breakeven_pct": 0.0, "partial_tp_pct": 0.0,
-        "partial_tp_frac": 0.5, "max_open_risk_usdt": 0.0, "reduce_after_losses": 0,
+        "partial_tp_frac": 0.5, "partial_tp_levels": "", "max_open_risk_usdt": 0.0,
+        "reduce_after_losses": 0,
         "suppress_losing_sources": False, "min_source_samples": 8,
         "skip_already_priced_pct": 0.0, "auto_trade": True, "paper_trading": True,
         "auto_min_impact": 7, "auto_require_confirm": False, "market": "spot",
@@ -86,10 +87,11 @@ def test_partial_tp_scales_out(clean, monkeypatch):
     monkeypatch.setattr(trader, "_positions", [p])
     monkeypatch.setattr(trader, "get_prices", lambda syms: {s: 106.0 for s in syms})   # +%6 > partial %5
     closed = trader.monitor_positions()
-    assert len(closed) == 1 and closed[0]["close_reason"] == "partial-tp"
+    # çok-kademe altyapısı: tek-kademe geriye-uyumda close_reason kademe etiketi taşır
+    assert len(closed) == 1 and closed[0]["close_reason"].startswith("partial-tp")
     assert closed[0]["usdt"] == 50.0           # yarısı kapandı
-    assert p["usdt"] == 50.0 and p["partial_done"] is True
-    # ikinci turda tekrar kısmi alınmaz
+    assert p["usdt"] == 50.0 and 5.0 in p["partial_levels_done"]
+    # ikinci turda tekrar kısmi alınmaz (kademe işaretli)
     assert trader.monitor_positions() == []
 
 

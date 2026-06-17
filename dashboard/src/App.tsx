@@ -118,6 +118,9 @@ type Settings = {
   max_same_direction: number;
   max_funding_rate_pct: number;
   use_atr_exits: boolean;
+  use_atr_trailing: boolean;
+  atr_trailing_mult: number;
+  partial_tp_levels: string;
   atr_sl_mult: number;
   atr_tp_mult: number;
   has_live_keys: boolean;
@@ -457,6 +460,22 @@ function NumField({ label, value, onSave }: { label: string; value: number; onSa
   );
 }
 
+function TextField({ label, value, onSave, hint }: { label: string; value: string; onSave: (v: string) => void; hint?: string }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-zinc-400" title={hint}>
+      <span>{label}</span>
+      <input
+        type="text"
+        defaultValue={value}
+        key={value}
+        onBlur={(e) => { if (e.target.value !== value) onSave(e.target.value); }}
+        placeholder="boş = tek-kademe"
+        className="h-7 w-full rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-xs tabular-nums text-zinc-200 outline-none focus:border-emerald-500/50"
+      />
+    </label>
+  );
+}
+
 export default function App() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [meta, setMeta] = useState({ total_seen: 0, alert_threshold: 7, updated_at: null as string | null });
@@ -514,6 +533,8 @@ export default function App() {
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
   const [shadow, setShadow] = useState<{ overrides: Record<string, unknown>; n: number; diverged: number; live_trades: number; shadow_trades: number } | null>(null);
+  const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
+  const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
   const [brainBtRunning, setBrainBtRunning] = useState(false);
@@ -621,6 +642,18 @@ export default function App() {
       if (r.ok) void load();
     } catch {
       setErr("Devre kesici temizlenemedi");
+    }
+  };
+
+  const evaluateShadow = async () => {
+    setShadowEvalRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/shadow/evaluate`);
+      if (r.ok) setShadowEval(await r.json());
+    } catch {
+      setErr("Gölge değerlendirme başarısız");
+    } finally {
+      setShadowEvalRunning(false);
     }
   };
 
@@ -1192,6 +1225,20 @@ export default function App() {
                   <NumField label="ATR TP çarpanı" value={settings.atr_tp_mult} onSave={(v) => patchSettings({ atr_tp_mult: v })} />
                 </>
               )}
+              <button
+                type="button"
+                onClick={() => void patchSettings({ use_atr_trailing: !settings.use_atr_trailing })}
+                title="Trailing stop %'sini sabit yerine ATR'ye göre ölçekle: oynak coinde geniş (trend tut), sakinde dar (erken kilitle). Çarpan × ATR%, [0.3,10] kıstırılır."
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.use_atr_trailing ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                ATR-uyarlamalı trailing: {settings.use_atr_trailing ? "AÇIK" : "kapalı"}
+              </button>
+              {settings.use_atr_trailing && (
+                <NumField label="ATR trailing çarpanı" value={settings.atr_trailing_mult} onSave={(v) => patchSettings({ atr_trailing_mult: v })} />
+              )}
+              <TextField label="Çok-kademe scale-out (örn 3:0.33,6:0.33,10:0.34)" value={settings.partial_tp_levels}
+                onSave={(v) => patchSettings({ partial_tp_levels: v })}
+                hint="Doluysa tek-kademe Kısmi TP'yi geçersiz kılar; her eşikte oran kadar kapat" />
               <div className="flex gap-2 pt-1">
                 <button type="button" onClick={() => void applyPreset("news")}
                   className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-950/40 px-2 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/50">
@@ -1798,6 +1845,23 @@ export default function App() {
                 <span className="rounded-lg border border-sky-500/40 bg-sky-950/40 px-3 py-1 text-xs font-semibold text-sky-200"
                   title={`Gölge A/B aktif (SANAL — gerçek emir yok): aday ayar ${JSON.stringify(shadow.overrides)}. ${shadow.n} karar, ${shadow.diverged} farklı. Aday giriş ${shadow.shadow_trades} vs canlı ${shadow.live_trades}.`}>
                   🅰️🅱️ Gölge: {shadow.diverged}/{shadow.n} farklı · aday {shadow.shadow_trades} vs canlı {shadow.live_trades}
+                </span>
+              )}
+              {shadow && Object.keys(shadow.overrides).length > 0 && (
+                <button type="button" onClick={() => void evaluateShadow()} disabled={shadowEvalRunning}
+                  className="rounded-lg border border-sky-500/40 bg-sky-950/30 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/40 disabled:opacity-50">
+                  {shadowEvalRunning ? "değerlendiriliyor…" : "📊 Gölge sonucu değerlendir"}
+                </button>
+              )}
+              {shadowEval && (
+                <span className={`rounded-lg border px-3 py-1 text-xs font-semibold ${
+                  !shadowEval.ready ? "border-zinc-700 bg-zinc-800 text-zinc-400"
+                    : shadowEval.recommend ? "border-emerald-500/50 bg-emerald-950/50 text-emerald-200"
+                      : "border-amber-500/40 bg-amber-950/40 text-amber-200"}`}
+                  title={shadowEval.ready ? `Aday ort. ${shadowEval.shadow_avg}% vs canlı ${shadowEval.live_avg}% (${shadowEval.n} sonuçlu divergence). ${shadowEval.recommend ? "Aday tutarlı daha iyi — ELLE terfi düşün (oto-terfi yok)." : "Aday yeterli edge göstermedi."}` : `Yeterli sonuçlu divergence yok (${shadowEval.n})`}>
+                  {!shadowEval.ready ? `⏳ gölge: ${shadowEval.n} örnek`
+                    : shadowEval.recommend ? `✅ TERFİ ÖNERİSİ: aday +${shadowEval.edge_pct}% edge`
+                      : `↔️ aday edge ${shadowEval.edge_pct}% (eşik altı)`}
                 </span>
               )}
             </div>

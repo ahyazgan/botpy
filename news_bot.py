@@ -233,6 +233,8 @@ _metrics: dict[str, int] = {
     "alerts_total": 0,          # eşik üstü güçlü haber sayısı
     "trades_opened_total": 0,   # otomatik açılan pozisyon sayısı
     "scan_errors_total": 0,     # arka plan tarama hatası sayısı
+    "reconcile_drift_total": 0, # mutabakatta bulunan hayalet pozisyon (news_bot gözlemler)
+    "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -1297,6 +1299,10 @@ def process_items(
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
+                if pos.get("protect_error"):   # borsa stop konulamadı → KORUMASIZ canlı pozisyon
+                    _metrics["protect_errors_total"] += 1
+                    notify_remote(f"⚠️ DİKKAT: {pos['symbol']} borsa koruyucu stop KONULAMADI "
+                                  f"— pozisyon yalnız bot çalışırken korumalı. Sebep: {pos['protect_error']}")
 
     return len(new_items), len(alerts)
 
@@ -1356,6 +1362,26 @@ def _background_loop(stop: threading.Event) -> None:
 
 # Açık pozisyonları SL/TP/trailing için sık aralıkla izle
 MONITOR_INTERVAL_SEC = 8
+RECONCILE_INTERVAL_SEC = 300   # periyodik mutabakat (canlıda hayalet pozisyon taraması)
+_last_reconcile = 0.0
+
+
+def _periodic_reconcile() -> None:
+    """Canlıda periyodik mutabakat: bot çalışırken oluşan drift'i (hayalet pozisyon) yakala."""
+    global _last_reconcile
+    now = time.time()
+    if now - _last_reconcile < RECONCILE_INTERVAL_SEC:
+        return
+    _last_reconcile = now
+    rec = trader.reconcile_and_heal(autoclose=trader.S.reconcile_autoclose)
+    if rec.get("checked") and rec.get("phantoms"):
+        syms = [o["symbol"] for o in rec["phantoms"]]
+        _metrics["reconcile_drift_total"] += len(syms)
+        action = (f"{len(rec['healed'])}'i otomatik kapatıldı" if rec.get("healed")
+                  else "ELLE kontrol et (oto-kapatma kapalı)")
+        log.warning("Periyodik mutabakat: %d hayalet pozisyon: %s", len(syms), syms)
+        notify_remote(f"⚠️ MUTABAKAT (çalışırken): borsada görünmeyen {len(syms)} pozisyon "
+                      f"({', '.join(syms)}) — {action}.")
 
 
 def _persist_closed(pos: dict[str, Any]) -> None:
@@ -1378,6 +1404,10 @@ def _monitor_loop(stop: threading.Event) -> None:
             _recheck_deferred_entries()   # giriş beyni 'bekle' adaylarını yeniden değerlendir
         except Exception as e:
             log.warning("Ertelenen giriş kontrolü hatası: %s", e)
+        try:
+            _periodic_reconcile()         # canlıda hayalet pozisyon taraması (5dk)
+        except Exception as e:
+            log.warning("Periyodik mutabakat hatası: %s", e)
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -1508,20 +1538,63 @@ _ws_thread: threading.Thread | None = None
 _mon_thread: threading.Thread | None = None
 
 
+_instance_lock: Any = None   # tek-instance kilidi (handle'ı canlı tut → OS kilidi açık kalır)
+
+
+def _acquire_singleton_lock() -> bool:
+    """Aynı hesaba karşı ÇİFT bot çalışmasını önle (çift işlem felaketi).
+
+    Taşınabilir OS kilidi (fcntl/msvcrt); süreç ölünce OS serbest bırakır (çökme-dayanıklı,
+    bayat kilit sorunu yok). Alınamazsa False (başka örnek çalışıyor). Kilit yoksa True (sakınca yok).
+    """
+    global _instance_lock
+    path = os.environ.get("BOTPY_LOCK", trader.STATE_FILE + ".lock")
+    try:
+        f = open(path, "w")
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False   # kilit başkası tarafından tutuluyor
+    except Exception as e:
+        log.warning("Tek-instance kilidi kurulamadı (atlanıyor): %s", e)
+        return True    # kilit altyapısı yoksa engelleme
+    try:
+        f.write(f"{os.getpid()}\n{_now_iso()}\n")
+        f.flush()
+    except Exception:
+        pass
+    _instance_lock = f   # GC'lenirse kilit açılır → referansı tut
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _bg_thread, _ws_thread, _mon_thread
     setup_logging()
+    if not _acquire_singleton_lock():
+        raise RuntimeError(
+            "Başka bir bot örneği zaten çalışıyor (tek-instance kilidi) — çift işlem riskini "
+            "önlemek için başlatma iptal edildi. Diğer örneği kapat veya BOTPY_LOCK'u değiştir.")
     _load_news_settings()   # kalıcı eşik/bildirim ayarlarını yükle (restart'a dayanıklı)
     try:
         store = get_store()
         store.prune_signals(MAX_ARCHIVE_SIGNALS)   # arşivi sınırla (başlangıç budama)
         for t in trader.closed_trades(1000):       # trade_state.json geçmişini kalıcı deftere taşı
             store.add_closed_news_trade(t)
-        rec = trader.reconcile_positions()         # canlı modda borsayla mutabakat (read-only)
-        if rec.get("checked") and rec.get("orphans"):
-            log.warning("Mutabakat: borsada bulunmayan %d yerel pozisyon (orphan): %s",
-                        len(rec["orphans"]), [o["symbol"] for o in rec["orphans"]])
+        # Açılış mutabakatı: bot kapalıyken borsa stop'u tetiklenmiş olabilir → hayalet pozisyon.
+        rec = trader.reconcile_and_heal(autoclose=trader.S.reconcile_autoclose)
+        if rec.get("checked") and rec.get("phantoms"):
+            syms = [o["symbol"] for o in rec["phantoms"]]
+            _metrics["reconcile_drift_total"] += len(syms)
+            log.warning("Mutabakat: borsada bulunmayan %d hayalet pozisyon: %s", len(syms), syms)
+            action = (f"{len(rec['healed'])}'i otomatik kapatıldı"
+                      if rec.get("healed") else "ELLE kontrol et (oto-kapatma kapalı)")
+            notify_remote(f"⚠️ MUTABAKAT: borsada görünmeyen {len(syms)} yerel pozisyon "
+                          f"({', '.join(syms)}) — {action}. Bot kapalıyken stop tetiklenmiş olabilir.")
     except Exception as e:
         log.warning("Başlangıç arşiv işlemi hatası: %s", e)
     _stop_event.clear()
@@ -1654,6 +1727,11 @@ _METRIC_META = {
     "botpy_alerts_total": ("counter", "Eşik üstü güçlü haber"),
     "botpy_trades_opened_total": ("counter", "Otomatik açılan pozisyon"),
     "botpy_scan_errors_total": ("counter", "Arka plan tarama hatası"),
+    "botpy_order_rejects_total": ("counter", "Borsa emir red/dolmama (canlı)"),
+    "botpy_reconcile_drift_total": ("counter", "Mutabakatta bulunan hayalet pozisyon"),
+    "botpy_protect_errors_total": ("counter", "Borsa koruyucu stop konamadı"),
+    "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
+    "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
     "botpy_signals_archived": ("gauge", "Arşivlenmiş sinyal sayısı"),
     "botpy_ws_connected": ("gauge", "TreeNews WS bağlı mı (1/0)"),
@@ -1691,6 +1769,11 @@ def metrics() -> PlainTextResponse:
         "botpy_alerts_total": _metrics["alerts_total"],
         "botpy_trades_opened_total": _metrics["trades_opened_total"],
         "botpy_scan_errors_total": _metrics["scan_errors_total"],
+        "botpy_order_rejects_total": trader._order_rejects,
+        "botpy_reconcile_drift_total": _metrics["reconcile_drift_total"],
+        "botpy_protect_errors_total": _metrics["protect_errors_total"],
+        "botpy_halts_total": trader._halts,
+        "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
         "botpy_signals_archived": archived,
         "botpy_ws_connected": 1 if _ws_state["connected"] else 0,
@@ -1723,6 +1806,8 @@ def health() -> dict[str, Any]:
         "feed_stale": _ws_feed_stale(),
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
+        "trading_halted": trader.get_halt()["active"],
+        "halt_reason": trader.get_halt()["reason"],
     }
 
 
@@ -2036,6 +2121,9 @@ class SettingsPatch(BaseModel):
     max_total_exposure_usdt: float | None = None
     max_per_coin_usdt: float | None = None
     order_type: str | None = None
+    exchange_native_stops: bool | None = None
+    reconcile_autoclose: bool | None = None
+    auto_halt_on_anomaly: bool | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_impact: bool | None = None
@@ -2101,6 +2189,68 @@ def get_tuning() -> dict[str, Any]:
     """Öğrenen beyin (öneri modu): kapanan GERÇEK işlemlerden eşik ayarı önerileri.
     Otomatik UYGULAMAZ — kaynak-tier eşlemesi için `_source_tier` geçirilir."""
     return trader.suggest_tuning(tier_of=_source_tier)
+
+
+READINESS_MIN_SAMPLES = 50   # canlıya geçiş için min kapanan işlem (heuristik)
+READINESS_PF_MIN = 1.3       # min profit factor
+
+
+@app.get("/readiness")
+def readiness() -> dict[str, Any]:
+    """Canlıya hazırlık kokpiti: ucuz (ağsız) yerel ölçütleri eşiklere göre değerlendirir.
+    Tek bakışta geç/kal/veri-yetersiz verdikti. Edge/veto için /brain-backtest + /veto-review ayrı."""
+    perf = trader.get_performance()
+    sc = trader.brain_scorecard()
+    n = int(perf.get("total_trades", 0))
+    pf = perf.get("profit_factor")
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})  # pass|fail|pending
+
+    enough = n >= READINESS_MIN_SAMPLES
+    add("Yeterli örnek", "pass" if enough else "pending",
+        f"{n}/{READINESS_MIN_SAMPLES} kapanan işlem" + ("" if enough else " — biriktirmeye devam"))
+    if not enough:
+        add(f"Profit factor ≥ {READINESS_PF_MIN}", "pending", "yeterli veri yok")
+        add("Beyin kalibrasyonu", "pending", "yeterli veri yok")
+        verdict = "VERİ YETERSİZ — paper'da çalışmaya devam et"
+    else:
+        if pf is None:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "pending", "henüz zarar yok (tanımsız)")
+        elif pf >= READINESS_PF_MIN:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "pass", str(pf))
+        else:
+            add(f"Profit factor ≥ {READINESS_PF_MIN}", "fail", f"{pf} — beklenti zayıf")
+        if sc["samples"] < 5:
+            add("Beyin kalibrasyonu", "pending", f"{sc['samples']} beyinli işlem — az")
+        elif sc["calibrated"]:
+            add("Beyin kalibrasyonu", "pass", "konviksiyon↑ → P&L↑")
+        else:
+            add("Beyin kalibrasyonu", "fail", "yüksek konviksiyon daha iyi P&L üretmiyor")
+        statuses = {c["status"] for c in checks}
+        if "fail" in statuses:
+            verdict = "HENÜZ DEĞİL — ayarla (/tuning/apply, kaybeden kaynağı sustur) ve yeniden ölç"
+        elif "pending" in statuses:
+            verdict = "GELİŞİYOR — birkaç ölçüt daha veri bekliyor"
+        else:
+            verdict = "UMUT VERİCİ — /brain-backtest + /brain-veto-review ile edge'i doğrula, sonra MİNİK canlı"
+    return {"verdict": verdict, "samples": n, "win_rate": perf.get("win_rate"),
+            "profit_factor": pf, "max_drawdown": perf.get("max_drawdown"), "checks": checks,
+            "note": "Edge/veto doğrulaması ağ-yoğun, ayrı çalıştır: /brain-backtest (edge_pct>0) "
+                    "+ /brain-veto-review (avg_net<0)."}
+
+
+@app.get("/halt")
+def get_halt() -> dict[str, Any]:
+    """Operasyonel devre kesici durumu (anomalide oto-işlem durdurulur)."""
+    return trader.get_halt()
+
+
+@app.post("/halt/clear", dependencies=[Depends(require_token)])
+def clear_halt() -> dict[str, Any]:
+    """Devre kesiciyi elle sıfırla (anomali giderildikten sonra oto-işlemi yeniden aç)."""
+    return trader.clear_halt()
 
 
 @app.get("/brain-scorecard")

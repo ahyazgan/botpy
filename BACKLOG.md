@@ -7,6 +7,25 @@
 
 ## Now (üstten alta, ara vermeden)
 
+- [x] Hazırlık kokpiti (/readiness) — paper-doğrulama verdikti
+  Done when: yerel ölçütleri (örnek sayısı, profit_factor, beyin kalibrasyonu) eşiklere göre
+  değerlendirip geç/kal/veri-yetersiz verdikti; panelde 🚦 banner; testler; yeşil; commit.
+- [x] Operasyonel polish: limit-emir ters-hayalet düzeltmesi + tek-instance kilidi
+  Done when: _verify_fill reddederken duran emri iptal eder; _acquire_singleton_lock (fcntl/msvcrt,
+  çökme-dayanıklı) çift bot'u engeller; testler; ruff+mypy+pytest+build yeşil; commit.
+- [x] Operasyonel sağlamlaştırma: dolum doğrulama + devre kesici + periyodik mutabakat + metrikler
+  Done when: _verify_fill/OrderError (ters-hayalet önleme); trip_halt/clear + /halt + auto_decision kapısı +
+  panel banner; _periodic_reconcile (5dk); /metrics order_rejects/drift/protect/halts sayaçları; testler; yeşil.
+- [x] Canlı doğruluk: emir hassasiyeti/minNotional + tasfiye-farkında SL + açılış mutabakat-iyileştirme
+  Done when: _round_amount (precision+minNotional, reddederse net hata); futures SL tasfiye içine kıstırılır;
+  reconcile_and_heal (hayalet pozisyon tespit + opsiyonel oto-kapat, LOUD uyarı); panel toggle; testler;
+  ruff+mypy+pytest+build yeşil; commit.
+- [x] Borsa-native koruyucu stop (canlı güvenlik açığı)
+  Done when: place_trade canlıda borsaya DURAN SL/TP koyar (_place_protective_orders, ccxt
+  stopLossPrice/takeProfitPrice); close/update iptal+yeniler; protect_error → uzak uyarı; paper
+  dokunulmaz; panel toggle; testler; ruff+mypy+pytest+build yeşil; commit.
+
+
 ### Epic: Akıllı oto-trade güçlendirme (haber→otomatik işlem)
 
 - [x] Faz 1 — Güvenlik kapıları (auto_decision)  (cc5be8c)

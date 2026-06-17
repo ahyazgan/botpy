@@ -76,6 +76,9 @@ type Settings = {
   max_total_exposure_usdt: number;
   max_per_coin_usdt: number;
   order_type: "market" | "limit";
+  exchange_native_stops: boolean;
+  reconcile_autoclose: boolean;
+  auto_halt_on_anomaly: boolean;
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
@@ -110,6 +113,11 @@ type BrainBacktest = {
 type BrainVetoReview = {
   ready: boolean; reason?: string; n: number;
   avg_net_pct?: number | null; win_rate?: number | null; verdict?: string;
+};
+type ReadinessCheck = { check: string; status: "pass" | "fail" | "pending"; detail: string };
+type Readiness = {
+  verdict: string; samples: number; win_rate: number | null; profit_factor: number | null;
+  max_drawdown: number | null; checks: ReadinessCheck[]; note: string;
 };
 
 type Performance = {
@@ -250,6 +258,8 @@ type Health = {
   ws_last_msg_age_sec?: number | null;
   feed_stale?: boolean;
   rate_limited?: number;
+  trading_halted?: boolean;
+  halt_reason?: string;
 };
 
 type ClosedTrade = {
@@ -465,6 +475,7 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
   const [brainBtRunning, setBrainBtRunning] = useState(false);
   const runBrainBacktest = async () => {
@@ -497,7 +508,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -510,6 +521,7 @@ export default function App() {
         fetch(`${API_BASE}/summary`),
         fetch(`${API_BASE}/tuning`),
         fetch(`${API_BASE}/brain-scorecard`),
+        fetch(`${API_BASE}/readiness`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -544,6 +556,7 @@ export default function App() {
       if (perfRes.ok) setPerf(await perfRes.json());
       if (tuningRes.ok) setTuning(await tuningRes.json());
       if (bsRes.ok) setBrainSc(await bsRes.json());
+      if (rdRes.ok) setReadiness(await rdRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -560,6 +573,15 @@ export default function App() {
       setLoading(false);
     }
   }, []);
+
+  const clearHalt = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/halt/clear`, { method: "POST" });
+      if (r.ok) void load();
+    } catch {
+      setErr("Devre kesici temizlenemedi");
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -1078,6 +1100,22 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ exchange_native_stops: !settings.exchange_native_stops })}
+                title="Canlıda borsaya DURAN SL/TP emri koy — bot çökse/internet gitse bile pozisyon korunur (yalnız canlı mod)"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.exchange_native_stops ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-red-500/40 bg-red-950/40 text-red-200"}`}
+              >
+                🛡️ Borsa-native stop: {settings.exchange_native_stops ? "AÇIK" : "KAPALI (riskli)"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void patchSettings({ reconcile_autoclose: !settings.reconcile_autoclose })}
+                title="Açılış mutabakatı: borsada görünmeyen hayalet pozisyonu otomatik kapat (kapalıysa yalnız uyarır)"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.reconcile_autoclose ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 text-zinc-400"}`}
+              >
+                🔄 Hayalet pozisyon oto-kapat: {settings.reconcile_autoclose ? "AÇIK" : "kapalı (uyar)"}
+              </button>
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
@@ -1106,6 +1144,14 @@ export default function App() {
               <NumField label="Max haber yaşı sn (0=kapalı)" value={settings.max_news_age_sec} onSave={(v) => patchSettings({ max_news_age_sec: v })} />
               <NumField label="Aynı yönde max pozisyon (0=kapalı)" value={settings.max_same_direction} onSave={(v) => patchSettings({ max_same_direction: v })} />
               <NumField label="Max funding % futures (0=kapalı)" value={settings.max_funding_rate_pct} onSave={(v) => patchSettings({ max_funding_rate_pct: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ auto_halt_on_anomaly: !settings.auto_halt_on_anomaly })}
+                title="Anomalide (üst üste emir hatası / korumasız pozisyon) yeni oto-işlemi otomatik durdur"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.auto_halt_on_anomaly ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-red-500/40 bg-red-950/40 text-red-200"}`}
+              >
+                ⛔ Anomalide oto-durdur: {settings.auto_halt_on_anomaly ? "AÇIK" : "KAPALI (riskli)"}
+              </button>
             </div>
           </div>
         )}
@@ -1201,6 +1247,15 @@ export default function App() {
         {err && (
           <div className="mt-4 rounded-xl border border-red-500/30 bg-red-950/40 px-4 py-3 text-sm text-red-200" role="alert">
             {err}
+          </div>
+        )}
+        {health?.trading_halted && (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-500/50 bg-red-950/60 px-4 py-3 text-sm text-red-100" role="alert">
+            <span>⛔ <b>OPERASYONEL DURDURMA</b> — yeni oto-işlem durdu: {health.halt_reason}</span>
+            <button type="button" onClick={() => void clearHalt()}
+              className="rounded-md border border-red-400/50 bg-red-900/50 px-3 py-1 text-xs font-semibold hover:bg-red-800/60">
+              Temizle & devam et
+            </button>
           </div>
         )}
         {notice && (
@@ -1532,6 +1587,33 @@ export default function App() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {/* Hazırlık kokpiti — canlıya geçiş verdikti */}
+      {readiness && (
+        <section className="mx-auto mt-10 max-w-5xl">
+          <div className={`rounded-2xl border px-4 py-3 ${
+            readiness.verdict.startsWith("UMUT") ? "border-emerald-500/40 bg-emerald-950/20"
+              : readiness.verdict.startsWith("HENÜZ") ? "border-red-500/40 bg-red-950/20"
+              : "border-zinc-600/40 bg-zinc-900/40"}`}>
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-sm font-bold text-white">🚦 Canlıya hazırlık</span>
+              <span className="text-sm font-semibold text-zinc-200">{readiness.verdict}</span>
+            </div>
+            <div className="flex flex-wrap gap-2 text-xs">
+              {readiness.checks.map((c) => (
+                <span key={c.check} className={`rounded-md px-2 py-1 ${
+                  c.status === "pass" ? "bg-emerald-900/50 text-emerald-200"
+                    : c.status === "fail" ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-400"}`}>
+                  {c.status === "pass" ? "✓" : c.status === "fail" ? "✗" : "…"} {c.check}: {c.detail}
+                </span>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] text-zinc-500">
+              pf {readiness.profit_factor ?? "—"} · kazanma %{readiness.win_rate ?? "—"} · max DD {readiness.max_drawdown ?? "—"} · {readiness.note}
+            </p>
+          </div>
         </section>
       )}
 

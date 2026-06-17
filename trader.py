@@ -52,6 +52,9 @@ class Settings:
     use_entry_brain: bool = False    # giriş anında Claude kararlı yargı (Tier-2 adaylarda; refleks atlanır)
     brain_escalate: bool = False     # kararsız konviksiyonda (0.4-0.6) daha güçlü modele ikinci bakış
     brain_self_improve: bool = False # kalibrasyondan öğren: negatif conviction dilimini oto-veto + boyut eğ
+    brain_recalibrate: bool = False  # ham conviction'ı geçmiş isabetle düzelt (reliability-bin remap)
+    brain_recalibrate_min: int = 20  # bu kadar beyinli-kapanmış işlem yoksa düzeltme yok (ham geçerli)
+    brain_vote_count: int = 1        # >1: N bağımsız beyin çağrısı → çoğunluk-oylama (medyan conviction)
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
@@ -130,7 +133,8 @@ _PERSIST_KEYS = (
     "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
     "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
-    "brain_self_improve", "cooldown_sec",
+    "brain_self_improve", "brain_recalibrate", "brain_recalibrate_min",
+    "brain_vote_count", "cooldown_sec",
     "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
@@ -597,6 +601,92 @@ def _pearson(xs: list[float], ys: list[float]) -> float | None:
         return None
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     return round(sxy / math.sqrt(sxx * syy), 3)
+
+
+def _isotonic(pairs: list[tuple[float, int]]) -> list[tuple[float, float]]:
+    """Monoton (azalmayan) conviction→win-rate eğrisi — Pool Adjacent Violators (PAV).
+
+    `pairs`: [(conviction, outcome 0/1), ...]. Conviction'a göre sıralar, ardından
+    komşu ihlalleri (sonraki nokta öncekinden düşük) ağırlıklı ortalamayla birleştirir
+    → azalmayan basamak fonksiyonu. Döner: [(conviction_eşiği, kalibre_olasılık), ...]
+    artan conviction sırasında. Aşırı-güveni düzeltir: conviction 0.9 ama gerçek 0.4
+    ise eğri 0.9'u ~0.4'e indirir. Saf fonksiyon.
+    """
+    if not pairs:
+        return []
+    # Önce AYNI conviction değerini tek noktaya topla (eşit-conviction kazanç+kayıp
+    # tek grup olmalı; aksi halde PAV ekleme sırasına bağlı yanlış böler).
+    agg: dict[float, list[float]] = {}
+    for c, o in pairs:
+        a = agg.setdefault(round(c, 4), [0.0, 0.0])  # [toplam_outcome, n]
+        a[0] += float(o)
+        a[1] += 1.0
+    # Soldan sağa yığınla; her blok [toplam_outcome, ağırlık(=n), toplam_conviction(×ağırlık)].
+    # Temsili conviction = blok ORTALAMA conviction. Yeni blok eklenince önceki blok
+    # ortalaması daha büyükse (monotonluk ihlali) birleştir, zinciri geriye çöz (PAV).
+    stack: list[list[float]] = []
+    for c in sorted(agg):
+        tot_o, w = agg[c]
+        stack.append([tot_o, w, c * w])
+        while len(stack) >= 2 and stack[-2][0] / stack[-2][1] > stack[-1][0] / stack[-1][1]:
+            last = stack.pop()
+            stack[-1][0] += last[0]
+            stack[-1][1] += last[1]
+            stack[-1][2] += last[2]
+    return [(round(b[2] / b[1], 4), round(b[0] / b[1], 4)) for b in stack]
+
+
+def _fit_calibration(pairs: list[tuple[float, int]], min_n: int) -> dict[str, Any]:
+    """Beyin conviction kalibrasyon haritası (geçmiş gir→sonuç'tan). Saf fonksiyon.
+
+    Yeterli örnek (≥min_n) varsa isotonic eğri fit eder; yoksa kimlik (ham geçerli).
+    Döner: {ready, curve, n}. curve: artan conviction → kalibre olasılık basamakları.
+    """
+    n = len(pairs)
+    if n < max(2, min_n):
+        return {"ready": False, "curve": [], "n": n}
+    curve = _isotonic(pairs)
+    # Tek blok bile geçerli kalibrasyon (tüm conviction'ları gerçek orana çeker —
+    # aşırı-güveni düzeltir). Yalnız boş eğri hazır değil.
+    return {"ready": len(curve) >= 1, "curve": curve, "n": n}
+
+
+def _apply_calibration(conv: float, curve: list[tuple[float, float]]) -> float:
+    """Ham conviction'ı kalibrasyon eğrisinden geçir (basamak ara değer). Saf.
+
+    Eğri [(eşik, olasılık), ...] artan. conv'a en yakın alt-eşiğin kalibre değerini
+    döndürür (basamak fonksiyonu). Eğri boşsa conv aynen döner.
+    """
+    if not curve:
+        return conv
+    out = curve[0][1]
+    for thr, prob in curve:
+        if conv >= thr:
+            out = prob
+        else:
+            break
+    return round(max(0.0, min(1.0, out)), 4)
+
+
+def recalibrate_conviction(conv: float) -> dict[str, Any]:
+    """Ham beyin conviction'ını geçmiş isabetle düzelt (opt-in). Döner: {value, adjusted, raw}.
+
+    brain_recalibrate kapalıysa ya da yeterli beyinli-kapanmış işlem yoksa ham geçerli.
+    Aşırı-güveni kalibrasyon eğrisiyle bastırır (conviction 0.9 ama o bantta gerçek
+    win-rate 0.4 ise → ~0.4). Boyut/veto bu düzeltilmiş değeri kullanır.
+    """
+    if not S.brain_recalibrate:
+        return {"value": conv, "adjusted": False, "raw": conv}
+    with _lock:
+        pairs = [(float(c["brain"]["conviction"]), 1 if c["pnl"] > 0 else 0)
+                 for c in _closed
+                 if c.get("pnl") is not None and isinstance(c.get("brain"), dict)
+                 and c["brain"].get("conviction") is not None]
+    fit = _fit_calibration(pairs, S.brain_recalibrate_min)
+    if not fit["ready"]:
+        return {"value": conv, "adjusted": False, "raw": conv}
+    cal = _apply_calibration(conv, fit["curve"])
+    return {"value": cal, "adjusted": True, "raw": conv}
 
 
 _BRAIN_SELF_IMPROVE_MIN = 5   # bir conviction dilimini yargılamak için min örnek
@@ -1499,6 +1589,13 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                 return None
             conv = verdict.get("conviction")
             if conv is not None:
+                # Recalibration: ham conviction'ı geçmiş isabetle düzelt (aşırı-güveni bastır).
+                # Self-improve dilimi ve boyut bu düzeltilmiş değeri kullanır.
+                rec = recalibrate_conviction(float(conv))
+                if rec["adjusted"]:
+                    conv = rec["value"]
+                    verdict["conviction_raw"] = rec["raw"]
+                    verdict["conviction"] = conv   # şeffaflık: pozisyonda düzeltilmiş saklanır
                 # Kendini-iyileştirme: bu conviction dilimi geçmişte negatifse oto-veto; zayıfsa boyutu kıs
                 if S.brain_self_improve:
                     band = _brain_band_stats(float(conv))

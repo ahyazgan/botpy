@@ -69,6 +69,9 @@ type Settings = {
   use_entry_brain: boolean;
   brain_escalate: boolean;
   brain_self_improve: boolean;
+  brain_recalibrate: boolean;
+  brain_recalibrate_min: number;
+  brain_vote_count: number;
   cooldown_sec: number;
   use_sl_tp: boolean;
   stop_loss_pct: number;
@@ -256,6 +259,8 @@ type AutoPreviewRow = {
     enter: boolean; wait_seconds: number; conviction: number; direction: string;
     sl_tightness: string; hold_minutes: number; reason: string; escalated: boolean;
     scores: Record<string, number>;
+    conviction_raw?: number;
+    vote?: { n: number; enter_ratio: number; agreement: number; convictions: number[] };
   } | null;
 };
 
@@ -1067,6 +1072,20 @@ export default function App() {
                 🔁 Kendini-iyileştir: {settings.brain_self_improve ? "AÇIK" : "kapalı"}
               </button>
             )}
+            {settings.use_entry_brain && (
+              <button
+                type="button"
+                onClick={() => void patchSettings({ brain_recalibrate: !settings.brain_recalibrate })}
+                title="Recalibration: ham conviction'ı geçmiş isabetle düzelt (isotonic/PAV eğrisi). Aşırı-güveni bastırır — conviction 0.9 ama o bantta gerçek win-rate 0.4 ise 0.4'e çeker. Boyut/veto düzeltilmiş değeri kullanır."
+                className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                  settings.brain_recalibrate
+                    ? "border-violet-500/50 bg-violet-950/50 text-violet-200"
+                    : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+                }`}
+              >
+                🎚️ Recalibrate: {settings.brain_recalibrate ? "AÇIK" : "kapalı"}
+              </button>
+            )}
             <div className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-800/80 px-1">
               {(["spot", "futures"] as const).map((m) => (
                 <button
@@ -1202,6 +1221,9 @@ export default function App() {
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
+              <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Beyin: recalibration · oylama</p>
+              <NumField label="Beyin oy sayısı (>1: N-bağımsız çoğunluk-oylama)" value={settings.brain_vote_count} onSave={(v) => patchSettings({ brain_vote_count: v })} />
+              <NumField label="Recalibration min. işlem (altında ham conviction)" value={settings.brain_recalibrate_min} onSave={(v) => patchSettings({ brain_recalibrate_min: v })} />
               <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Kelly · Risk-eşitleme</p>
               <NumField label="Kelly fraksiyonu (0.25=çeyrek-Kelly, agresif=1.0)" value={settings.kelly_fraction} onSave={(v) => patchSettings({ kelly_fraction: v })} />
               <NumField label="Kelly min. işlem (altında nötr)" value={settings.kelly_min_trades} onSave={(v) => patchSettings({ kelly_min_trades: v })} />
@@ -2453,8 +2475,8 @@ export default function App() {
                             <span className={`ml-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
                               verdict === "girer" ? "bg-violet-900/60 text-violet-200"
                                 : verdict === "bekle" ? "bg-amber-900/50 text-amber-200" : "bg-red-900/50 text-red-200"}`}
-                              title={p.brain.reason}>
-                              🧠 {verdict} {(p.brain.conviction).toFixed(2)}{p.brain.escalated ? " ⬆️" : ""}
+                              title={`${p.brain.reason}${p.brain.conviction_raw != null ? ` · ham konv ${p.brain.conviction_raw.toFixed(2)} → kalibre ${p.brain.conviction.toFixed(2)}` : ""}${p.brain.vote ? ` · ${p.brain.vote.n} oy, enter ${Math.round(p.brain.vote.enter_ratio * 100)}%, oybirliği ${Math.round(p.brain.vote.agreement * 100)}%` : ""}`}>
+                              🧠 {verdict} {(p.brain.conviction).toFixed(2)}{p.brain.conviction_raw != null ? "🎚️" : ""}{p.brain.escalated ? " ⬆️" : ""}{p.brain.vote ? ` 🗳️${p.brain.vote.n}` : ""}
                             </span>
                           )}
                         </td>

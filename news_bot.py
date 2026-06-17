@@ -840,7 +840,10 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
         "portfoy": {"ayni_yonde_acik": trader._open_side_count(side), "yon": side},
     }
     client = _get_anthropic()
-    r = _brain_call(client, ENTRY_BRAIN_MODEL, ctx)
+    # Çoklu-oylama: N bağımsız çağrı → çoğunluk enter + medyan conviction (gürültü azaltma).
+    # vote_count=1 ise tek çağrı (eski davranış). Bağımsızlık: aynı model, ayrı API çağrıları.
+    n_votes = max(1, trader.S.brain_vote_count)
+    r, vote = _brain_vote(client, ENTRY_BRAIN_MODEL, ctx, n_votes)
     model_used, escalated = ENTRY_BRAIN_MODEL, False
     # İki-kademeli: kararsız bantta daha güçlü modele ikinci bakış (nihai karar onun)
     conv0 = max(0.0, min(1.0, float(r.conviction)))
@@ -851,7 +854,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
             model_used, escalated = ENTRY_BRAIN_ESCALATE_MODEL, True
         except Exception as e:
             log.warning("Beyin eskalasyonu başarısız, haiku kararı geçerli: %s", e)
-    return {
+    out = {
         "enter": bool(r.enter), "wait_seconds": max(0, min(300, int(r.wait_seconds))),
         "conviction": max(0.0, min(1.0, float(r.conviction))),
         "direction": r.direction, "sl_tightness": r.sl_tightness,
@@ -864,6 +867,52 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
         },
         "model": model_used, "escalated": escalated,
     }
+    if vote is not None:
+        out["vote"] = vote   # şeffaflık: oy sayısı + enter-oranı + oybirliği
+    return out
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def _brain_vote(client: Any, model: str, ctx: dict[str, Any],
+                n: int) -> tuple[Any, dict[str, Any] | None]:
+    """N bağımsız beyin çağrısı → birleştirilmiş karar. n=1'de tek çağrı (oy yok).
+
+    Çoğunluk `enter` (≥yarısı evet), medyan conviction, oybirliği oranı. Temsili karar
+    olarak medyan-conviction'a EN YAKIN oyu seçer (sl_tightness/hold/scores tutarlı kalsın),
+    ama enter ve conviction'ı çoğunluk/medyanla EZER. Bir çağrı patlarsa atlanır; hepsi
+    patlarsa istisna yükselir (çağıran fail-safe yakalar). Döner: (temsili_r, vote|None).
+    """
+    if n <= 1:
+        return _brain_call(client, model, ctx), None
+    results = []
+    for _ in range(n):
+        try:
+            results.append(_brain_call(client, model, ctx))
+        except Exception as e:
+            log.warning("Oylama çağrısı başarısız (atlandı): %s", e)
+    if not results:
+        raise RuntimeError("tüm oylama çağrıları başarısız")
+    enters = [bool(x.enter) for x in results]
+    convs = [max(0.0, min(1.0, float(x.conviction))) for x in results]
+    enter_ratio = sum(enters) / len(results)
+    majority_enter = enter_ratio >= 0.5
+    med_conv = _median(convs)
+    agreement = max(enter_ratio, 1.0 - enter_ratio)   # oybirliği gücü (0.5=bölünmüş, 1.0=tam)
+    # Temsili: medyan conviction'a en yakın oy (rubrik/çıkış alanları tutarlı)
+    rep = min(results, key=lambda x: abs(max(0.0, min(1.0, float(x.conviction))) - med_conv))
+    rep.enter = majority_enter            # çoğunlukla ez
+    rep.conviction = med_conv             # medyanla ez (aykırı oy etkisini kır)
+    vote = {"n": len(results), "enter_ratio": round(enter_ratio, 2),
+            "agreement": round(agreement, 2), "convictions": [round(c, 2) for c in convs]}
+    return rep, vote
 
 
 # ── Bekle/izle: kararsız ama gelişen kurulumu kısa süre ertele, sonra yeniden bak ──

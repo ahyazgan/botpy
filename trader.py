@@ -85,6 +85,12 @@ class Settings:
     slippage_guard_pct: float = 0.8  # tahmini slippage bu %'yi geçerse girme (0=kapalı)
     min_orderbook_usd: float = 50_000.0  # girişte orderbook'ta en az bu likidite (0=kapalı)
     size_by_impact: bool = False     # conviction sizing: oto-işlemde güce göre boyutla
+    # Kelly + risk-eşitleme (boyut matematiği — kazanma istatistiğine bağlar)
+    size_by_kelly: bool = False      # fraksiyonel-Kelly: gerçek win-rate+payoff'tan optimal-f çarpanı
+    kelly_fraction: float = 0.25     # çeyrek-Kelly (aşırı-bahis önleme); tam-Kelly çok agresif
+    kelly_min_trades: int = 20       # bu kadar kapanmış işlem yoksa Kelly nötr (gürültüden öğrenme yok)
+    risk_parity: bool = False        # vol-hedef: SL mesafesi geniş işlemde boyutu kıs (sabit USDT-risk)
+    target_risk_usdt: float = 0.0    # >0 ise risk-eşitleme hedefi; 0 → trade_usdt'nin %stop_loss'u
     # Hacim Beyni — profesyonel haber-trade hacim mantığı
     size_by_volume: bool = False     # likidite-katmanlı boyut: ince coinde küçül (exit-trap önleme)
     min_rel_volume: float = 0.0      # >0: RVOL (göreceli hacim) bu katın altındaysa girme (hacimsiz=fake)
@@ -124,6 +130,8 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
+    "size_by_kelly", "kelly_fraction", "kelly_min_trades",
+    "risk_parity", "target_risk_usdt",
     "size_by_volume", "min_rel_volume", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
@@ -718,9 +726,9 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
             amount = float(order["filled"]) or amount
 
     # SL/TP yüzdeleri: sabit (varsayılan) veya volatilite-bazlı (ATR)
-    sl_pct, tp_pct = S.stop_loss_pct, S.take_profit_pct
+    sl_pct = _effective_stop_pct(atr_pct)
+    tp_pct = S.take_profit_pct
     if S.use_atr_exits and atr_pct and atr_pct > 0:
-        sl_pct = max(0.5, min(15.0, S.atr_sl_mult * atr_pct))
         tp_pct = max(1.0, min(30.0, S.atr_tp_mult * atr_pct))
     # Giriş beyni çıkış önerisi: SL sıkılığı (tight/normal/wide → sl_mult)
     if sl_mult != 1.0 and sl_pct > 0:
@@ -1160,6 +1168,92 @@ def _liquidity_factor(volume_usd: float | None) -> float:
     return 0.25
 
 
+# Kelly çarpanı [alt, üst] kıstırması — tam-Kelly bile asla 1.5x'i aşmaz (risk tavanı)
+_KELLY_MIN_MULT = 0.25
+_KELLY_MAX_MULT = 1.5
+
+
+def _kelly_fraction(closed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Kapanan GERÇEK işlemlerden Kelly fraksiyonu f* = W − (1−W)/R (saf fonksiyon).
+
+    W = kazanma oranı, R = payoff (ort.kazanç / |ort.kayıp|). f* pozitif edge'i,
+    sermayenin ne kadarının bahse değer olduğunu söyler. Burada f*'ı doğrudan
+    sermaye-oranı olarak DEĞİL, taban boyutun çarpanı olarak kullanırız (trade_usdt
+    zaten risk birimi). Döner: {ready, f_star, win_rate, payoff, n}.
+
+    `ready` yalnız yeterli örnek VE anlamlı edge varsa True — gürültüden Kelly
+    çıkarmak felakettir (tek şanslı seri → aşırı-bahis). Wilson alt sınırı 0.5'i
+    aşmıyorsa (kazanma oranı güvenilir değil) ready=False.
+    """
+    scored = [c for c in closed if c.get("pnl") is not None]
+    n = len(scored)
+    if n < S.kelly_min_trades:
+        return {"ready": False, "f_star": 0.0, "win_rate": None, "payoff": None, "n": n}
+    wins = [c["pnl"] for c in scored if c["pnl"] > 0]
+    losses = [c["pnl"] for c in scored if c["pnl"] < 0]
+    if not wins or not losses:
+        return {"ready": False, "f_star": 0.0, "win_rate": None, "payoff": None, "n": n}
+    w = len(wins) / n
+    avg_win = sum(wins) / len(wins)
+    avg_loss = abs(sum(losses) / len(losses))
+    if avg_loss <= 0:
+        return {"ready": False, "f_star": 0.0, "win_rate": None, "payoff": None, "n": n}
+    payoff = avg_win / avg_loss
+    f_star = w - (1 - w) / payoff
+    # Gürültü korkuluğu: kazanma oranının Wilson alt sınırı (%95) anlamlı değilse Kelly'e güvenme
+    ready = _wilson_lo(len(wins), n) > 0.0 and f_star > 0
+    return {"ready": ready, "f_star": round(f_star, 4),
+            "win_rate": round(w, 3), "payoff": round(payoff, 2), "n": n}
+
+
+def _kelly_multiplier() -> float:
+    """Fraksiyonel-Kelly boyut çarpanı (kapanan işlemlerden). Korkuluklu: [0.25, 1.5].
+
+    Edge belirsizse (yetersiz/gürültülü örnek) NÖTR (1.0x — boyutu bozmaz). Negatif
+    edge'de minimuma kıstırır (boyutu kıs — ama girişi engellemez, o veto işi değil).
+    """
+    with _lock:
+        closed = list(_closed)
+    k = _kelly_fraction(closed)
+    if not k["ready"]:
+        return 1.0
+    # f* (pozitif) × kullanıcının fraksiyonu (çeyrek-Kelly) → taban çarpanı.
+    # 1.0 nötr nokta etrafında: tam edge (f*≈1) tavanı, sıfır edge taban civarı.
+    mult = 1.0 + k["f_star"] * max(0.0, min(1.0, S.kelly_fraction))
+    return round(max(_KELLY_MIN_MULT, min(_KELLY_MAX_MULT, mult)), 3)
+
+
+def _effective_stop_pct(atr_pct: float | None) -> float:
+    """Bu işlemin gerçek SL yüzdesi: ATR çıkışı açıksa atr_sl_mult×ATR (clamp), yoksa sabit.
+
+    place_trade ile aynı SL mantığı (tek doğruluk kaynağı) — risk-eşitleme aynı
+    pencereden baksın. Beyin sl_tightness çarpanı burada YOK (o, beyin yargısından
+    sonra place_trade'de uygulanır; risk-eşitleme mekanik tabanı hedefler).
+    """
+    if S.use_atr_exits and atr_pct and atr_pct > 0:
+        return max(0.5, min(15.0, S.atr_sl_mult * atr_pct))
+    return S.stop_loss_pct
+
+
+def _risk_parity_factor(usdt: float, stop_pct: float | None) -> float:
+    """Vol-hedef: SL mesafesi geniş işlemde boyutu kıs ki SL'deki USDT-riski sabit kalsın.
+
+    Risk-at-SL = usdt × (stop_pct/100). Hedef risk sabitse (target_risk_usdt veya
+    trade_usdt'nin baz-stop riski), bu işlemin boyutunu hedef/gerçek-risk oranıyla
+    ölçekle. Geniş ATR-SL'li işlem küçülür, dar SL'li büyür → her işlem aynı USDT'yi
+    riske atar. Korkuluk: çarpan [0.25, 1.5] (tek işlemde aşırı şişme/sönme önlenir).
+    """
+    if not stop_pct or stop_pct <= 0 or usdt <= 0:
+        return 1.0
+    actual_risk = usdt * (stop_pct / 100.0)
+    if actual_risk <= 0:
+        return 1.0
+    target = S.target_risk_usdt if S.target_risk_usdt > 0 else S.trade_usdt * (S.stop_loss_pct / 100.0)
+    if target <= 0:
+        return 1.0
+    return round(max(_KELLY_MIN_MULT, min(_KELLY_MAX_MULT, target / actual_risk)), 3)
+
+
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
@@ -1231,14 +1325,21 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         cost = _funding_cost_pct(symbol, side)
         if cost is not None and cost > S.max_funding_rate_pct:
             return no(f"funding maliyeti yüksek (%{cost:+.3f} > %{S.max_funding_rate_pct})")
-    # Boyut: conviction (güce göre) × likidite katmanı (hacme göre) × kayıp serisi freni
+    # Boyut: conviction (güce göre) × Kelly (kazanma matematiği) × likidite katmanı
+    # (hacme göre) × kayıp serisi freni × risk-eşitleme (SL mesafesine göre).
     usdt = S.trade_usdt
     if S.size_by_impact:
         usdt *= _size_multiplier(int(item.impact))
+    if S.size_by_kelly:
+        usdt *= _kelly_multiplier()
     if S.size_by_volume:
         usdt *= _liquidity_factor(getattr(item, "volume_usd", None))
     if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
         usdt *= 0.5
+    # Risk-eşitleme (vol-hedef): bu işlemin SL mesafesine göre boyutu eşitle. SL%
+    # canlı yolda ATR çıkışı açıksa ATR'den, değilse sabit stop_loss_pct'ten gelir.
+    if S.risk_parity:
+        usdt *= _risk_parity_factor(usdt, _effective_stop_pct(getattr(item, "atr_pct", None)))
     return {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
             "side": side, "usdt": round(usdt, 2), "news_source": news_source}
 
@@ -1389,6 +1490,8 @@ def get_risk() -> dict[str, Any]:
         realized = _daily.get("realized", 0.0)
         n_open = len(_positions)
     daily_limit = S.daily_loss_limit_usdt
+    with _lock:
+        kelly = _kelly_fraction(list(_closed))
     return {
         "open_positions": n_open,
         "max_positions": S.max_positions,
@@ -1402,6 +1505,9 @@ def get_risk() -> dict[str, Any]:
         "trading_halted": bool(daily_limit > 0 and realized <= -abs(daily_limit)),
         "paper_trading": S.paper_trading,
         "auto_trade": S.auto_trade,
+        # Kelly boyut bağlamı (şeffaflık): edge + uygulanan çarpan
+        "kelly": {**kelly, "multiplier": _kelly_multiplier() if S.size_by_kelly else 1.0,
+                  "enabled": S.size_by_kelly},
     }
 
 

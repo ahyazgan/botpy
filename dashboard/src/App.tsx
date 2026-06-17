@@ -83,6 +83,11 @@ type Settings = {
   slippage_guard_pct: number;
   min_orderbook_usd: number;
   size_by_impact: boolean;
+  size_by_kelly: boolean;
+  kelly_fraction: number;
+  kelly_min_trades: number;
+  risk_parity: boolean;
+  target_risk_usdt: number;
   size_by_volume: boolean;
   min_rel_volume: number;
   max_book_frac: number;
@@ -975,6 +980,30 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={() => void patchSettings({ size_by_kelly: !settings.size_by_kelly })}
+              title="Fraksiyonel-Kelly: gerçek kazanma oranı + payoff'tan optimal-f çarpanı. Edge belirsizse (yetersiz/gürültülü örnek) nötr. Çarpan [0.25, 1.5] kıstırılır."
+              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                settings.size_by_kelly
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+              }`}
+            >
+              🎯 Kelly boyut: {settings.size_by_kelly ? "AÇIK" : "kapalı"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void patchSettings({ risk_parity: !settings.risk_parity })}
+              title="Risk-eşitleme (vol-hedef): SL mesafesi geniş işlemde boyutu kıs ki her işlem aynı USDT'yi riske atsın. Dar SL → büyük, geniş SL → küçük. Çarpan [0.25, 1.5]."
+              className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
+                settings.risk_parity
+                  ? "border-emerald-500/40 bg-emerald-950/50 text-emerald-200"
+                  : "border-zinc-700 bg-zinc-800/80 text-zinc-300"
+              }`}
+            >
+              ⚖️ Risk-eşitleme: {settings.risk_parity ? "AÇIK" : "kapalı"}
+            </button>
+            <button
+              type="button"
               onClick={() => void patchSettings({ size_by_volume: !settings.size_by_volume })}
               title="Likidite-katmanlı boyut: ince coinde küçül (≥$50M tam, $1-5M 0.4x, <$1M 0.25x). Çıkış-tuzağı önler."
               className={`h-9 rounded-lg border px-3 text-sm font-semibold transition ${
@@ -1160,6 +1189,10 @@ export default function App() {
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
+              <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Kelly · Risk-eşitleme</p>
+              <NumField label="Kelly fraksiyonu (0.25=çeyrek-Kelly, agresif=1.0)" value={settings.kelly_fraction} onSave={(v) => patchSettings({ kelly_fraction: v })} />
+              <NumField label="Kelly min. işlem (altında nötr)" value={settings.kelly_min_trades} onSave={(v) => patchSettings({ kelly_min_trades: v })} />
+              <NumField label="Hedef risk USDT (0=trade_usdt'nin stop%'si)" value={settings.target_risk_usdt} onSave={(v) => patchSettings({ target_risk_usdt: v })} />
               <p className="pt-2 text-xs font-semibold uppercase tracking-wider text-violet-400/80">Sinyal kalitesi · Hacim</p>
               <NumField label="Zaten-fiyatlanmış atla % (0=kapalı)" value={settings.skip_already_priced_pct} onSave={(v) => patchSettings({ skip_already_priced_pct: v })} />
               <NumField label="Min. RVOL — hacim normalin kaçı (0=kapalı)" value={settings.min_rel_volume} onSave={(v) => patchSettings({ min_rel_volume: v })} />

@@ -2268,12 +2268,16 @@ async def lifespan(app: FastAPI):
 
 # ── FastAPI ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Kripto Haber Trade", lifespan=lifespan)
+# Vite dev sunucusu hedef portu (5173) doluysa sıradaki boş porta kayar
+# (5174, 5175, ...) — panel başka bir projeyle çakışınca bağlanamamasın diye
+# Vite'ın olası dev port aralığına izin ver.
+_CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+for _port in range(5173, 5181):
+    _CORS_ORIGINS.append(f"http://localhost:{_port}")
+    _CORS_ORIGINS.append(f"http://127.0.0.1:{_port}")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:3000", "http://127.0.0.1:3000",
-    ],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

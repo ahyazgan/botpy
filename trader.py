@@ -2369,6 +2369,27 @@ def connectivity_probe() -> dict[str, Any]:
         add("Kimlik doğrulama", "critical", f"başarısız: {e}")
         ok = False
 
+    # 4) API anahtarı izinleri (GÜVENLİK): çekim KAPALI olmalı + IP kısıtı önerilir.
+    # Anahtar çalınsa bile çekim kapalıysa para çekilemez — kritik güvenlik kontrolü.
+    try:
+        fn = getattr(ex, "sapiGetAccountApiRestrictions", None)
+        r = fn() if callable(fn) else None
+        if isinstance(r, dict):
+            if r.get("enableWithdrawals"):
+                add("Çekim izni (API)", "critical",
+                    "API anahtarında ÇEKİM AÇIK — KAPAT (anahtar çalınırsa paran çekilir)")
+                ok = False
+            else:
+                add("Çekim izni (API)", "ok", "kapalı — güvenli (anahtar yalnız işlem/okuma)")
+            add("IP kısıtlaması (API)", "ok" if r.get("ipRestrict") else "warn",
+                "aktif" if r.get("ipRestrict") else "yok — anahtarı yalnız sunucu IP'sine kısıtla")
+        else:
+            add("API izinleri", "warn",
+                "okunamadı — MANUEL doğrula: çekim KAPALI + IP whitelist açık olmalı")
+    except Exception as e:
+        add("API izinleri", "warn",
+            f"okunamadı ({e}) — MANUEL doğrula: çekim KAPALI + IP whitelist")
+
     return {"ok": ok, "skipped": False, "checks": checks}
 
 

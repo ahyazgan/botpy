@@ -1,0 +1,20 @@
+# Build bağlamını küçült (imaj boyutu + güvenlik)
+.git
+.github
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+dashboard/node_modules
+dashboard/dist
+frontend
+*.db
+*.sqlite
+trade_state.json
+.env
+.venv
+venv
+*.md
+*.bat

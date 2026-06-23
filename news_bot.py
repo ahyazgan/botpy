@@ -41,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
+import costtracker
 import latency
 import sourcehealth
 import storage
@@ -111,6 +112,37 @@ APP_ID            = "Kripto Haber Trade"
 # CLAUDE_MODEL'i "claude-opus-4-8" yap; maliyet ~5x artar.)
 CLAUDE_MODEL = "claude-haiku-4-5"
 USE_CLAUDE = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+# Claude fiyatlandırma (USD / milyon token) — maliyet TAHMİNİ içindir; yayınlanan
+# oranlar değişebilir, env (CLAUDE_PRICE_<MODEL>_IN/OUT) ile geçersiz kılınabilir.
+def _price_env(model: str, default_in: float, default_out: float) -> tuple[float, float]:
+    key = model.upper().replace("-", "_").replace(".", "_")
+    try:
+        rin = float(os.environ.get(f"CLAUDE_PRICE_{key}_IN", default_in))
+        rout = float(os.environ.get(f"CLAUDE_PRICE_{key}_OUT", default_out))
+    except ValueError:
+        rin, rout = default_in, default_out
+    return rin, rout
+
+
+CLAUDE_PRICING: dict[str, tuple[float, float]] = {
+    "claude-haiku-4-5": _price_env("claude-haiku-4-5", 1.0, 5.0),
+    "claude-sonnet-4-6": _price_env("claude-sonnet-4-6", 3.0, 15.0),
+    "claude-opus-4-8": _price_env("claude-opus-4-8", 5.0, 25.0),
+}
+
+
+def _record_claude_usage(category: str, model: str, resp: Any) -> None:
+    """Claude yanıtının `usage`'ını maliyet takipçisine işle. Hata/eksikte sessiz."""
+    try:
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        costtracker.record(category, model,
+                           getattr(u, "input_tokens", 0) or 0,
+                           getattr(u, "output_tokens", 0) or 0)
+    except Exception:
+        pass
 
 # ── Fiyat teyidi (Binance public) ────────────────────────────────────────
 BINANCE_API = "https://api.binance.com/api/v3"
@@ -694,6 +726,7 @@ def _score_chunk(client: Any, chunk: list[NewsItem], recent: list[NewsItem] | No
         messages=[{"role": "user", "content": listing}],
         output_format=_ScoreBatch,
     )
+    _record_claude_usage("scoring", CLAUDE_MODEL, resp)
     by_index = {r.index: r for r in resp.parsed_output.results}
     for i, it in enumerate(chunk):
         r = by_index.get(i)
@@ -904,6 +937,7 @@ def _brain_call(client: Any, model: str, ctx: dict[str, Any]) -> _EntryDecision:
         messages=[{"role": "user", "content": json.dumps(ctx, ensure_ascii=False)}],
         output_format=_EntryDecision,
     )
+    _record_claude_usage("entry_brain", model, resp)
     return resp.parsed_output
 
 
@@ -2230,6 +2264,8 @@ _METRIC_META = {
     "botpy_ws_connected": ("gauge", "TreeNews WS bağlı mı (1/0)"),
     "botpy_ws_last_msg_age_seconds": ("gauge", "Son WS mesajından bu yana saniye"),
     "botpy_rate_limited_total": ("counter", "Binance 429/418 rate-limit yanıtı"),
+    "botpy_claude_calls_total": ("counter", "Toplam Claude API çağrısı"),
+    "botpy_claude_cost_usd_total": ("gauge", "Tahmini toplam Claude maliyeti (USD)"),
     "botpy_http_retries_total": ("counter", "Dış API yeniden deneme sayısı"),
 }
 
@@ -2290,6 +2326,9 @@ def metrics() -> PlainTextResponse:
     net = get_stats()
     values["botpy_rate_limited_total"] = net["rate_limited"]
     values["botpy_http_retries_total"] = net["retries"]
+    _cost = costtracker.summary(CLAUDE_PRICING)["totals"]
+    values["botpy_claude_calls_total"] = _cost["calls"]
+    values["botpy_claude_cost_usd_total"] = _cost["est_cost_usd"]
     values.update(latency.get_metrics())   # boru hattı gecikme gauge'leri (p50/p95/max/count)
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
 
@@ -2313,6 +2352,20 @@ def _latency_sla() -> dict[str, dict[str, Any]]:
 def _latency_breaches() -> list[str]:
     """SLA'yı aşan (yavaş) aşama adları."""
     return [s for s, v in _latency_sla().items() if not v["ok"]]
+
+
+@app.get("/cost")
+def cost_report() -> dict[str, Any]:
+    """Claude API maliyet/kullanım özeti — süreç başından beri çağrı + token + USD tahmini.
+
+    Kategori (scoring vs entry_brain) × model bazında kırılım. `est_cost_usd` TAHMİNDİR
+    (`CLAUDE_PRICING`, env ile geçersiz kılınabilir). `projected_daily_usd`: uptime'a göre
+    günlük izdüşüm. complexity_audit Claude çarpanını tahmin eder; bu GERÇEK kullanımı ölçer."""
+    s = costtracker.summary(CLAUDE_PRICING)
+    uptime = max(1.0, time.time() - _started_at)
+    daily = round(s["totals"]["est_cost_usd"] / uptime * 86400, 2)
+    return {**s, "uptime_sec": int(uptime), "projected_daily_usd": daily,
+            "pricing_note": "est_cost_usd tahmindir; oranlar CLAUDE_PRICING (env) ile ayarlanır."}
 
 
 @app.get("/latency")

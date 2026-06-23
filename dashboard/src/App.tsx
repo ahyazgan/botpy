@@ -161,6 +161,16 @@ type BrainVetoReview = {
   ready: boolean; reason?: string; n: number;
   avg_net_pct?: number | null; win_rate?: number | null; verdict?: string;
 };
+type Report = {
+  verdict: string; status: string; actions: string[]; n_trades: number;
+  components: {
+    edge: { verdict: string; samples: number | null; profit_factor: number | null };
+    safety: { verdict: string; critical: number; warn: number; blockers: string[] };
+    complexity: { verdict: string; premature: string[]; n_active: number | null };
+    risk: { ok: boolean; risk_of_ruin: number | null; max_dd_p95: number | null; reliable: boolean | null };
+    performance: { trades: number; win_rate: number | null; total_pnl: number | null; profit_factor: number | null };
+  };
+};
 type ReadinessCheck = { check: string; status: "pass" | "fail" | "pending"; detail: string };
 type Readiness = {
   verdict: string; samples: number; win_rate: number | null; profit_factor: number | null;
@@ -612,6 +622,7 @@ export default function App() {
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [report, setReport] = useState<Report | null>(null);
   const [complexity, setComplexity] = useState<Complexity | null>(null);
   const [cost, setCost] = useState<{ totals: { calls: number; est_cost_usd: number }; projected_daily_usd: number } | null>(null);
   const [golive, setGolive] = useState<GoLive | null>(null);
@@ -648,7 +659,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes, cxRes, costRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes, cxRes, costRes, repRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -671,6 +682,7 @@ export default function App() {
         fetch(`${API_BASE}/events?limit=30`),
         fetch(`${API_BASE}/complexity`),
         fetch(`${API_BASE}/cost`),
+        fetch(`${API_BASE}/report`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -715,6 +727,7 @@ export default function App() {
       if (evRes.ok) setOpsEvents(await evRes.json());
       if (cxRes.ok) setComplexity(await cxRes.json());
       if (costRes.ok) setCost(await costRes.json());
+      if (repRes.ok) setReport(await repRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2095,6 +2108,42 @@ export default function App() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {/* Konsolide durum değerlendirmesi — tek verdikt + sıradaki adımlar */}
+      {report && (
+        <section className="mx-auto mt-8 max-w-5xl">
+          <div className={`rounded-2xl border-2 px-5 py-4 ${
+            report.status === "ops_unsafe" || report.status === "risk_high" ? "border-red-500/50 bg-red-950/20"
+              : report.status === "ready" ? "border-emerald-500/50 bg-emerald-950/20"
+                : report.status === "gather_data" ? "border-sky-500/40 bg-sky-950/20"
+                  : "border-amber-500/40 bg-amber-950/20"}`}>
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-base font-bold text-white">📋 Durum</span>
+              <span className="text-base font-semibold text-zinc-100">{report.verdict}</span>
+            </div>
+            {report.actions.length > 0 && (
+              <ol className="mb-3 ml-1 space-y-0.5 text-sm text-zinc-300">
+                {report.actions.map((a, i) => (
+                  <li key={i}><span className="text-zinc-500">{i + 1}.</span> {a}</li>
+                ))}
+              </ol>
+            )}
+            <div className="flex flex-wrap gap-2 text-[11px]">
+              {([
+                ["edge", report.components.edge.verdict],
+                ["güvenlik", report.components.safety.verdict],
+                ["karmaşıklık", report.components.complexity.verdict],
+                ["risk", report.components.risk.ok ? `iflas %${report.components.risk.risk_of_ruin} · DD-p95 %${report.components.risk.max_dd_p95}` : "veri yok"],
+                ["performans", `${report.components.performance.trades} işlem · PF ${report.components.performance.profit_factor ?? "—"}`],
+              ] as const).map(([k, v]) => (
+                <span key={k} className="rounded-md bg-zinc-800/70 px-2 py-1 text-zinc-300">
+                  <span className="text-zinc-500">{k}:</span> {String(v).split("—")[0].trim()}
+                </span>
+              ))}
+            </div>
+          </div>
         </section>
       )}
 

@@ -3333,6 +3333,90 @@ def preflight(probe: bool = False) -> dict[str, Any]:
             "note": "Bu operasyonel/konfig güvenliği ölçer; strateji edge'i için /readiness."}
 
 
+def _assess(*, ops_critical: int, ops_warn: int, readiness_verdict: str,
+            complexity: dict[str, Any], risk_of_ruin: float | None, mc_reliable: bool,
+            n_trades: int) -> dict[str, Any]:
+    """Tüm değerlendirme boyutlarını TEK verdikt + öncelikli aksiyon listesine sentezle. Saf.
+
+    Öncelik (en yüksek blokaj önce): ops-güvenlik → veri-yeterliliği → karmaşıklık →
+    risk → edge. Her durum için `status` + tek-cümle verdikt + somut sıradaki adımlar.
+    """
+    actions: list[str] = []
+    premature = complexity.get("premature") or []
+    rv = readiness_verdict
+    risk_high = bool(mc_reliable and risk_of_ruin is not None and risk_of_ruin >= 10.0)
+
+    if ops_critical > 0:
+        status, verdict = "ops_unsafe", "ÖNCE GÜVENLİĞİ DÜZELT — operasyonel kritik eksik"
+        actions.append(f"{ops_critical} kritik ön-uçuş eksiğini gider (/preflight)")
+    elif rv.startswith("VERİ YETERSİZ"):
+        status, verdict = "gather_data", "VERİ TOPLA — paper'da çalıştırıp işlem biriktir"
+        actions.append("Docker ile paper modda motoru çalıştır (auto_trade kapalı, güvenli)")
+        actions.append("Geçmiş haber datasetini import_history ile yükle (hızlı kalibrasyon)")
+    elif premature:
+        status, verdict = "prune_complexity", "KARMAŞIKLIĞI BUDA — veri-aç katmanlar erken açık"
+        actions.append("Kapat: " + "; ".join(premature[:3]))
+        actions.append("preset/lean ile yalın mekanik tabana dön, edge kanıtlanınca geri ekle")
+    elif risk_high:
+        status, verdict = "risk_high", f"RİSKİ DÜŞÜR — iflas riski %{risk_of_ruin}"
+        actions.append("Pozisyon boyutunu/risk_per_trade_pct'yi düşür")
+        actions.append("max_drawdown_pct kill-switch + kademeli de-risk'i sıkılaştır")
+    elif rv.startswith("HENÜZ DEĞİL"):
+        status, verdict = "edge_weak", "EDGE YETERSİZ — ayarla ve yeniden ölç"
+        actions.append("/ablation ile zararlı gate'leri ele; /tuning/apply ile kalibre et")
+        actions.append("/alpha ile kazandıran haber kategorilerine odaklan")
+    elif rv.startswith("GELİŞİYOR"):
+        status, verdict = "developing", "GELİŞİYOR — birkaç ölçüt daha veri bekliyor"
+        actions.append("Paper'da çalışmaya devam et, /readiness'i izle")
+    elif rv.startswith("UMUT VERİCİ"):
+        status, verdict = "ready", "MİNİK CANLI'YA HAZIR — küçük başla (kontrol sende)"
+        actions.append("/golive?probe=true ile canlı bağlantıyı + API izinlerini doğrula")
+        actions.append("Çok küçük boyutla canlıya geç; /montecarlo riskini izle")
+    else:
+        status, verdict = "review", "GÖZDEN GEÇİR — durum belirsiz, bileşenlere bak"
+    if ops_warn > 0 and status != "ops_unsafe":
+        actions.append(f"{ops_warn} ops uyarısını gözden geçir (/preflight)")
+    return {"verdict": verdict, "status": status, "actions": actions, "n_trades": n_trades}
+
+
+@app.get("/report")
+def report() -> dict[str, Any]:
+    """Konsolide değerlendirme: edge + güvenlik + karmaşıklık + risk + performans → TEK
+    verdikt + öncelikli aksiyon listesi. "Nerede duruyorum, sıradaki adım ne?" — tüm
+    analiz uçlarını (readiness/preflight/complexity/montecarlo/performance) tek yerde
+    sentezler. Ağsız (montecarlo dahil saf compute). Derin doğrulama için /alpha·/ablation."""
+    import montecarlo as mc
+    pre_checks = _preflight_checks(probe=False)
+    pre = _preflight_verdict(pre_checks)
+    rd = readiness()
+    perf = trader.get_performance()
+    n = int(perf.get("total_trades", 0))
+    cx = trader.complexity_audit(n)
+    pnls = [c["pnl"] for c in _closed_trades(1000) if c.get("pnl") is not None]
+    risk = (mc.monte_carlo(pnls, runs=2000, account_equity=trader.S.account_equity_usdt, seed=1)
+            if pnls else {"ok": False})
+    a = _assess(ops_critical=pre["counts"]["critical"], ops_warn=pre["counts"]["warn"],
+                readiness_verdict=rd["verdict"], complexity=cx,
+                risk_of_ruin=risk.get("risk_of_ruin"), mc_reliable=bool(risk.get("reliable")),
+                n_trades=n)
+    mdd = risk.get("max_drawdown_pct")
+    mdd_p95 = mdd.get("p95") if isinstance(mdd, dict) else None
+    return {**a, "components": {
+        "edge": {"verdict": rd["verdict"], "samples": rd.get("samples"),
+                 "profit_factor": rd.get("profit_factor")},
+        "safety": {"verdict": pre["verdict"], "critical": pre["counts"]["critical"],
+                   "warn": pre["counts"]["warn"],
+                   "blockers": [c["check"] for c in pre_checks if c["status"] == "critical"]},
+        "complexity": {"verdict": cx["verdict"], "premature": cx.get("premature") or [],
+                       "n_active": cx.get("n_active_layers")},
+        "risk": {"ok": risk.get("ok", False), "risk_of_ruin": risk.get("risk_of_ruin"),
+                 "max_dd_p95": mdd_p95,
+                 "reliable": risk.get("reliable")},
+        "performance": {"trades": n, "win_rate": perf.get("win_rate"),
+                        "total_pnl": perf.get("total_pnl"), "profit_factor": perf.get("profit_factor")},
+    }}
+
+
 @app.get("/golive")
 def golive(probe: bool = False) -> dict[str, Any]:
     """Canlıya hazırlık kokpiti: iki ekseni TEK verdiktte birleştirir —

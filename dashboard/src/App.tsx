@@ -199,6 +199,13 @@ type AblationSearch = {
   selected?: { gate: string; desc: string; step_improve_pct: number; cut_n: number; cut_avg_net_pct: number }[];
   recommended_settings?: Record<string, number | boolean>;
 };
+type MonteCarlo = {
+  ok?: boolean; reason?: string; n_trades: number; runs?: number; reliable?: boolean;
+  account_equity?: number; ruin_pct?: number;
+  final_pnl?: { p5: number; p50: number; p95: number; mean: number };
+  max_drawdown_pct?: { p50: number; p95: number; worst: number };
+  prob_profit?: number; risk_of_ruin?: number;
+};
 type AlphaStat = { n: number; hit_rate: number | null; avg_move_pct: number | null; win_rate: number | null; avg_net_pct: number | null; total_pnl_usdt: number | null; thin: boolean };
 type AlphaAnalysis = {
   ok?: boolean; reason?: string; n?: number;
@@ -547,6 +554,8 @@ export default function App() {
   const [ablation, setAblation] = useState<AblationSearch | null>(null);
   const [alpha, setAlpha] = useState<AlphaAnalysis | null>(null);
   const [alphaRunning, setAlphaRunning] = useState(false);
+  const [mc, setMc] = useState<MonteCarlo | null>(null);
+  const [mcRunning, setMcRunning] = useState(false);
   const [ablationRunning, setAblationRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
@@ -822,6 +831,19 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Alpha analizi hatası");
     } finally {
       setAlphaRunning(false);
+    }
+  };
+
+  const runMonteCarlo = async () => {
+    setMcRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/montecarlo`);
+      if (!r.ok) throw new Error(`montecarlo ${r.status}`);
+      setMc(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Monte Carlo hatası");
+    } finally {
+      setMcRunning(false);
     }
   };
 
@@ -2323,8 +2345,56 @@ export default function App() {
             >
               {alphaRunning ? "Analiz…" : "💎 Alpha analizi"}
             </button>
+            <button
+              type="button"
+              onClick={() => void runMonteCarlo()}
+              disabled={mcRunning}
+              title="Kapanan işlemleri yeniden örnekleyip sonuç dağılımı + iflas riski çıkarır — 'en kötü makul drawdown ne olabilir?' (ağsız)"
+              className="rounded-md border border-fuchsia-500/40 bg-fuchsia-950/40 px-3 py-1 text-xs font-semibold text-fuchsia-200 hover:bg-fuchsia-900/50 disabled:opacity-50"
+            >
+              {mcRunning ? "Simüle…" : "🎲 Monte Carlo risk"}
+            </button>
           </div>
         </div>
+
+        {/* Monte Carlo: sonuç dağılımı + iflas riski */}
+        {mc && (
+          <div className="mb-3 rounded-2xl border border-fuchsia-500/30 bg-fuchsia-950/20 px-4 py-3 text-sm">
+            {mc.ok === false ? (
+              <p className="text-zinc-500">{mc.reason ?? "Yetersiz veri."}</p>
+            ) : (
+              <>
+                <div className="mb-2 flex flex-wrap items-center gap-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-fuchsia-300/80">🎲 Monte Carlo risk</span>
+                  <span className="text-zinc-500">{mc.n_trades} işlem × {mc.runs} yol</span>
+                  {mc.reliable === false && <span className="rounded bg-amber-900/50 px-2 py-0.5 text-xs text-amber-200">az örnek — gürültülü</span>}
+                  <span className={`rounded px-2 py-0.5 font-semibold ${(mc.risk_of_ruin ?? 0) >= 5 ? "bg-red-900/50 text-red-200" : "bg-emerald-900/50 text-emerald-200"}`}
+                    title={`Sermayenin %${mc.ruin_pct} altına düşen yol oranı`}>
+                    iflas riski %{mc.risk_of_ruin}
+                  </span>
+                  <span className="text-zinc-400">kâr olasılığı %{mc.prob_profit}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-3">
+                  <div className="rounded-lg border border-white/10 bg-zinc-900/50 px-2 py-1.5">
+                    <div className="text-[10px] uppercase text-zinc-500">final P&L (p5/p50/p95)</div>
+                    <div className="tabular-nums">
+                      <span className="text-red-300">{mc.final_pnl?.p5}</span> / <span className="text-zinc-200">{mc.final_pnl?.p50}</span> / <span className="text-emerald-300">{mc.final_pnl?.p95}</span>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-white/10 bg-zinc-900/50 px-2 py-1.5">
+                    <div className="text-[10px] uppercase text-zinc-500">max drawdown (medyan/p95)</div>
+                    <div className="tabular-nums text-amber-300">%{mc.max_drawdown_pct?.p50} / %{mc.max_drawdown_pct?.p95}</div>
+                  </div>
+                  <div className="rounded-lg border border-white/10 bg-zinc-900/50 px-2 py-1.5">
+                    <div className="text-[10px] uppercase text-zinc-500">en kötü drawdown</div>
+                    <div className="tabular-nums text-red-300">%{mc.max_drawdown_pct?.worst}</div>
+                  </div>
+                </div>
+                <p className="mt-2 text-[11px] text-zinc-500">Gerçekleşen eğri tek örnektir; bu, farklı işlem sırasıyla en kötü makul drawdown'ı (p95/en kötü) gösterir.</p>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Alpha: hangi haber kategorisi/kaynağı para oynatıyor */}
         {alpha && (

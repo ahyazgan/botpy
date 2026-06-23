@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import requests
 
@@ -68,6 +69,10 @@ def _signals_from_rows(rows: list[dict]) -> list[dict]:
             "symbol": n["symbol"], "direction": n["direction"], "time": t,
             "impact": n["impact"], "title": n["title"][:60],
             "source": n.get("source", "?"),
+            # Ablation/sinyal-kalitesi gateleri için taşınan opsiyonel meta (yoksa None)
+            "rel_volume": n.get("rel_volume"),
+            "price_24h_pct": n.get("price_24h_pct"),
+            "confirmed": n.get("confirmed"),
         })
     return out
 
@@ -367,6 +372,75 @@ def breakdown(results: list[dict], usdt: float = 100.0) -> dict:
         "by_direction": _group(lambda r: r.get("direction", "?")),
         "by_source": _group(lambda r: r.get("source", "?")),
     }
+
+
+def _directional_24h(r: dict) -> float | None:
+    """Arşivlenmiş 24s hareketi haber yönünde (chase-guard için). price_24h_pct yoksa None."""
+    p = r.get("price_24h_pct")
+    if p is None:
+        return None
+    return float(p) if r.get("direction") == "bullish" else -float(p)
+
+
+def ablation(results: list[dict], usdt: float = 100.0, *,
+             chase_pct: float = 5.0, rvol_min: float = 1.5,
+             high_impact: int = 9, min_subset: int = 5) -> dict:
+    """Mekanik sinyal-kalitesi gatelerinin net katkısını ölç (saf, ağsız).
+
+    Beyin katmanlarının çoğu canlı-anlık girdiye (orderbook/rejim/küme) dayandığı
+    için geçmişe kurulamaz (bkz. /brain-backtest). Ama **mekanik gateler** arşiv
+    metasının deterministik fonksiyonu → her sinyal BİR KEZ simüle edilir, sonra
+    gate = hangi alt-kümeyi kabul ettiği. Pahalı kısım tek prefetch'tir.
+
+    Her gate için: `kept` (gate AÇIK alt-kümesi) + `removed` (gate'in BLOKLADIĞI
+    işlemler) özetleri + `delta_avg_pct` (ort. edge iyileşmesi) + `verdict`. Gate
+    "işe yarar" ⇔ bloklananların ort. net'i NEGATİF (kaybedeni eliyor) ve kalan
+    edge pozitif kalıyor. Verisi yetersiz (alt-küme < `min_subset`) gate atlanır.
+    """
+    base = _summarize(results, usdt)
+    base_avg = base.get("avg_net_pct", 0.0)
+
+    # (ad, açıklama, predicate(keep), uygulanabilir-mi(has-field))
+    gates: list[tuple[str, str, Any, Any]] = [
+        (f"impact>={high_impact}", "yalnız yüksek-güç haber",
+         lambda r: r.get("impact", 0) >= high_impact, lambda r: True),
+        ("confirmed", "yalnız fiyat-teyitli sinyal",
+         lambda r: bool(r.get("confirmed")), lambda r: r.get("confirmed") is not None),
+        (f"rvol>={rvol_min:g}", "düşük göreceli hacmi ele (fake/likiditesiz)",
+         lambda r: (r.get("rel_volume") or 0) >= rvol_min, lambda r: r.get("rel_volume") is not None),
+        (f"chase-guard<{chase_pct:g}%", "24s'te haber yönünde çok oynamışı ele (geç giriş)",
+         lambda r: (_directional_24h(r) or 0.0) < chase_pct, lambda r: r.get("price_24h_pct") is not None),
+    ]
+
+    out: list[dict] = []
+    for name, desc, keep, has in gates:
+        usable = [r for r in results if has(r)]
+        if len(usable) < min_subset:
+            out.append({"gate": name, "desc": desc, "status": "yetersiz-veri",
+                        "applicable_n": len(usable)})
+            continue
+        kept = [r for r in usable if keep(r)]
+        removed = [r for r in usable if not keep(r)]
+        if len(kept) < min_subset or len(removed) < min_subset:
+            out.append({"gate": name, "desc": desc, "status": "yetersiz-bölünme",
+                        "kept_n": len(kept), "removed_n": len(removed)})
+            continue
+        k_sum = _summarize(kept, usdt)
+        r_sum = _summarize(removed, usdt)
+        # Gate kalan işlemlerin ort. edge'ini ne kadar artırdı (uygulanabilir tabana göre)
+        u_avg = _summarize(usable, usdt).get("avg_net_pct", 0.0)
+        delta = round(k_sum["avg_net_pct"] - u_avg, 3)
+        pays = r_sum["avg_net_pct"] < 0 and k_sum["avg_net_pct"] > 0
+        out.append({
+            "gate": name, "desc": desc,
+            "status": "işe-yarar" if pays else ("nötr/zararlı" if delta <= 0 else "kısmi"),
+            "delta_avg_pct": delta,            # +: gate edge'i artırıyor
+            "kept": k_sum, "removed": r_sum,   # removed.avg_net<0 ⇒ kaybedeni eliyor
+        })
+
+    return {"baseline": base, "base_avg_net_pct": base_avg, "gates": out,
+            "note": "Yalnız mekanik gateler ablate edilir; canlı-anlık beyin girdileri "
+                    "(orderbook/rejim/küme) geçmişe kurulamaz."}
 
 
 def run(signals: list[dict], sl: float, tp: float, fee: float, usdt: float, verbose: bool,

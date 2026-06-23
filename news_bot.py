@@ -2568,6 +2568,30 @@ def scorecard(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int 
         return {"ok": True, **nbt.signal_scorecard(signals)}
 
 
+@app.get("/alpha")
+def alpha(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 500,
+          sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0) -> dict[str, Any]:
+    """Alpha kırılımı: hangi haber KATEGORİSİ (hack/ETF/listeleme/ortaklık/makro...) ve
+    KAYNAK gerçekten para/hareket üretiyor — "hangi playbook işe yarıyor?".
+
+    Her arşiv sinyali simüle edilir (SL/TP), sonra `news_backtest.alpha_analysis` kategori
+    (başlık keyword'lerinden) + kaynak bazında HAM yön hareketi (hit/avg_move) + gerçekleşen
+    net (win/avg_net/total_pnl) verir. Strateji odağı/eşik kalibrasyonu için. Ağ-yoğun."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        results = nbt.simulate_all(signals, sl, tp, fee)
+        if not results:
+            return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
+        return {"ok": True, **nbt.alpha_analysis(results, usdt)}
+
+
 @app.get("/ablation")
 def ablation(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
              sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,

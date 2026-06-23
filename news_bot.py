@@ -84,6 +84,9 @@ SCAN_INTERVAL_FAST_SEC = int(os.environ.get("SCAN_INTERVAL_FAST_SEC", "5"))
 # Yedek kaynak sağlığı: üst üste bu kadar hata veren kaynağı geçici devre dışı bırak.
 SOURCE_FAIL_THRESHOLD = int(os.environ.get("SOURCE_FAIL_THRESHOLD", "3"))
 SOURCE_COOLDOWN_SEC = float(os.environ.get("SOURCE_COOLDOWN_SEC", "300"))
+# Gecikme kalıcılığı: periyodik olarak latency özetini arşivle (restart'a dayanıklı trend).
+LATENCY_SNAPSHOT_EVERY_SEC = float(os.environ.get("LATENCY_SNAPSHOT_EVERY_SEC", "300"))
+MAX_LATENCY_SNAPSHOTS = int(os.environ.get("MAX_LATENCY_SNAPSHOTS", "10000"))
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -1763,6 +1766,35 @@ def _periodic_reconcile() -> None:
                       f"({', '.join(syms)}) — {action}.")
 
 
+_last_latency_snapshot = 0.0
+_latency_snapshot_count = 0
+
+
+def _maybe_snapshot_latency() -> None:
+    """Periyodik olarak latency özetini kalıcı arşive yaz (restart'a dayanıklı trend).
+
+    `latency.summary()` bellekte kayan penceredir; restart'ta kaybolur. Bu, "gerçek
+    edge"in günler boyu trendini görmek için aşama p50/p95/max'ı `latency_snapshots`
+    tablosuna işler. Boş özet (örnek yok) atlanır. Sınırsız büyümeyi önlemek için budar.
+    """
+    global _last_latency_snapshot, _latency_snapshot_count
+    now = time.time()
+    if now - _last_latency_snapshot < LATENCY_SNAPSHOT_EVERY_SEC:
+        return
+    _last_latency_snapshot = now
+    try:
+        summary = latency.summary()
+        if not summary:
+            return
+        n = get_store().add_latency_snapshot(summary)
+        if n:
+            _latency_snapshot_count += 1
+            if _latency_snapshot_count % 20 == 0:   # ara sıra buda
+                get_store().prune_latency_snapshots(MAX_LATENCY_SNAPSHOTS)
+    except Exception as e:
+        log.warning("Gecikme anlık görüntüsü yazılamadı: %s", e)
+
+
 def _persist_closed(pos: dict[str, Any]) -> None:
     """Kapanan işlemi kalıcı deftere yaz (trade_state.json 500 sınırı dışı). Hata akışı bozmaz."""
     try:
@@ -1808,6 +1840,7 @@ def _monitor_loop(stop: threading.Event) -> None:
             _periodic_reconcile()         # canlıda hayalet pozisyon taraması (5dk)
         except Exception as e:
             log.warning("Periyodik mutabakat hatası: %s", e)
+        _maybe_snapshot_latency()         # gecikme trendini kalıcı arşivle (5dk)
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -2236,9 +2269,29 @@ def latency_report() -> dict[str, Any]:
     kaynak-bazlı ingest kırılımı (hangi besleme yavaş). `sla`: p95'in eşiği aşıp aşmadığı.
     """
     sla = _latency_sla()
+    try:
+        span = get_store().latency_span()
+    except Exception:
+        span = {"count": 0, "first_ts": None, "last_ts": None}
     return {"stages": latency.summary(), "by_source": latency.source_summary(),
             "sla": sla, "sla_ok": all(v["ok"] for v in sla.values()),
-            "breaches": [s for s, v in sla.items() if not v["ok"]]}
+            "breaches": [s for s, v in sla.items() if not v["ok"]],
+            "archive_span": span}
+
+
+@app.get("/latency/history")
+def latency_history(hours: float = 24.0, stage: str | None = None) -> dict[str, Any]:
+    """Kalıcı gecikme trendi (restart'a dayanıklı): aşama p50/p95/max zaman serisi.
+
+    Bellekteki `/latency` kayan penceredir; bu, periyodik arşivlenmiş anlık görüntülerden
+    (her `LATENCY_SNAPSHOT_EVERY_SEC`) günler boyu trendi döner. `stage` ile tek aşama;
+    `hours` ile pencere. "Gerçek edge" zamanla iyileşiyor/bozuluyor mu görmek için."""
+    try:
+        rows = get_store().latency_history(hours=hours, stage=stage)
+        span = get_store().latency_span()
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "points": []}
+    return {"ok": True, "hours": hours, "stage": stage, "span": span, "points": rows}
 
 
 @app.get("/health")

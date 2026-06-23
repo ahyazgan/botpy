@@ -169,6 +169,14 @@ type GoLive = {
   blockers: PreflightCheck[];
   note: string;
 };
+type LatStage = { p50_ms: number; p95_ms: number; max_ms: number; count: number };
+type LatencyReport = {
+  stages: Record<string, LatStage>;
+  sla: Record<string, { p95_ms: number; sla_ms: number; ok: boolean }>;
+  breaches: string[];
+  archive_span: { count: number; first_ts: string | null; last_ts: string | null };
+};
+type LatPoint = { ts: string; stage: string; p50: number | null; p95: number | null; max: number | null };
 type SourceStat = {
   healthy: boolean; disabled: boolean; consecutive_fails: number;
   total_ok: number; total_fail: number; retry_in_sec: number; last_error: string;
@@ -566,6 +574,8 @@ export default function App() {
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
   const [brainAttr, setBrainAttr] = useState<BrainAttribution | null>(null);
+  const [latency, setLatency] = useState<LatencyReport | null>(null);
+  const [latencyHist, setLatencyHist] = useState<LatPoint[]>([]);
   const [shadow, setShadow] = useState<{ overrides: Record<string, unknown>; n: number; diverged: number; live_trades: number; shadow_trades: number } | null>(null);
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
@@ -604,7 +614,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -622,6 +632,8 @@ export default function App() {
         fetch(`${API_BASE}/golive`),
         fetch(`${API_BASE}/sources-health`),
         fetch(`${API_BASE}/brain-attribution`),
+        fetch(`${API_BASE}/latency`),
+        fetch(`${API_BASE}/latency/history?stage=pipeline&hours=24`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -661,6 +673,8 @@ export default function App() {
       if (glRes.ok) setGolive(await glRes.json());
       if (srcRes.ok) setSrcHealth(await srcRes.json());
       if (baRes.ok) setBrainAttr(await baRes.json());
+      if (latRes.ok) setLatency(await latRes.json());
+      if (latHistRes.ok) setLatencyHist((await latHistRes.json()).points ?? []);
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2030,6 +2044,43 @@ export default function App() {
         </section>
       )}
 
+      {/* Boru hattı gecikmesi — haber→emir gerçek edge (p95 + kalıcı trend) */}
+      {latency && Object.keys(latency.stages).length > 0 && (
+        <section className="mx-auto mt-6 max-w-5xl">
+          <div className="rounded-2xl border border-sky-500/20 bg-sky-950/10 px-4 py-3">
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-sm font-bold text-white">🛰️ Boru hattı gecikmesi (p95)</span>
+              <span className="text-xs text-zinc-500">haber→emir gerçek edge · ms</span>
+              {latency.breaches.length > 0 && (
+                <span className="rounded bg-red-900/50 px-2 py-0.5 text-xs font-semibold text-red-200" title="SLA aşan (yavaş) aşamalar — oto-işlem durdurulabilir">
+                  🐢 SLA aşımı: {latency.breaches.join(", ")}
+                </span>
+              )}
+            </div>
+            <div className="mb-3 flex flex-wrap gap-2 text-xs">
+              {["ingest", "score", "brain", "confirm", "order", "pipeline"].filter((s) => latency.stages[s]).map((s) => {
+                const st = latency.stages[s];
+                const breach = latency.breaches.includes(s);
+                return (
+                  <span key={s} className={`rounded-md px-2 py-1 font-mono ${breach ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-300"}`}
+                    title={`${s}: p50 ${st.p50_ms}ms · p95 ${st.p95_ms}ms · max ${st.max_ms}ms · ${st.count} örnek${latency.sla[s] ? ` · SLA ${latency.sla[s].sla_ms}ms` : ""}`}>
+                    {s} <b className="tabular-nums">{st.p95_ms}</b>
+                  </span>
+                );
+              })}
+            </div>
+            {latencyHist.length >= 2 && (
+              <>
+                <LatencyTrend points={latencyHist} />
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  pipeline p95 trendi (24s) · {latency.archive_span.count} kalıcı snapshot
+                </p>
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
       {/* Öğrenen beyin — öneriler (otomatik uygulanmaz) */}
       <section className="mx-auto mt-10 max-w-5xl">
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -2953,6 +3004,21 @@ function EquityChart({ points }: { points: Array<{ cumulative: number }> }) {
       <line x1={pad} y1={zeroY} x2={W - pad} y2={zeroY} stroke="#3f3f46" strokeWidth={1} strokeDasharray="3 3" />
       <path d={area} fill={color} fillOpacity={0.12} />
       <path d={line} fill="none" stroke={color} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function LatencyTrend({ points }: { points: Array<{ p95: number | null }> }) {
+  const vals = points.map((p) => p.p95 ?? 0).filter((v) => v > 0);
+  if (vals.length < 2) return null;
+  const W = 600, H = 80, pad = 6;
+  const max = Math.max(...vals) || 1;
+  const x = (i: number) => pad + (i / (vals.length - 1)) * (W - 2 * pad);
+  const y = (v: number) => pad + (1 - v / max) * (H - 2 * pad);
+  const line = vals.map((v, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="h-16 w-full" preserveAspectRatio="none" role="img" aria-label="Pipeline p95 gecikme trendi">
+      <path d={line} fill="none" stroke="#38bdf8" strokeWidth={2} vectorEffect="non-scaling-stroke" />
     </svg>
   );
 }

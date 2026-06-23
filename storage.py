@@ -12,7 +12,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 DEFAULT_DB_PATH = os.environ.get("BOTPY_DB", "botpy.db")
@@ -235,6 +235,18 @@ CREATE TABLE IF NOT EXISTS shadow_decisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_decisions(ts);
+
+CREATE TABLE IF NOT EXISTS latency_snapshots (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     TEXT NOT NULL,
+    stage  TEXT NOT NULL,           -- ingest | score | brain | confirm | order | pipeline
+    p50    REAL,
+    p95    REAL,
+    max    REAL,
+    count  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_latency_ts ON latency_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_latency_stage_ts ON latency_snapshots(stage, ts);
 """
 
 _NCT_COLUMNS = (
@@ -639,6 +651,70 @@ class Store:
                 "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Gecikme anlık görüntüleri (kalıcı trend; restart'a dayanıklı) ─────────
+    def add_latency_snapshot(self, stages: dict[str, dict[str, Any]],
+                             ts: str | None = None) -> int:
+        """Bir gecikme özetini (aşama başına p50/p95/max/count) kalıcı yaz.
+
+        `stages`: `latency.summary()` çıktısı {stage: {p50_ms, p95_ms, max_ms, count}}.
+        Aşama başına bir satır ekler. Yazılan satır sayısını döner. Boş özet → 0.
+        """
+        t = ts or _utcnow()
+        rows = [
+            {"ts": t, "stage": stage, "p50": st.get("p50_ms"), "p95": st.get("p95_ms"),
+             "max": st.get("max_ms"), "count": st.get("count")}
+            for stage, st in stages.items() if st.get("count")
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO latency_snapshots (ts, stage, p50, p95, max, count) "
+                "VALUES (:ts, :stage, :p50, :p95, :max, :count)", rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def latency_history(self, hours: float = 24.0, stage: str | None = None,
+                        limit: int = 5000) -> list[dict[str, Any]]:
+        """Gecikme anlık görüntüleri, eskiden yeniye (trend). `stage` ile filtrele.
+
+        `hours`: bu kadar saat geriye. Zaman serisi grafiği için ts-artan döner.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        q = "SELECT ts, stage, p50, p95, max, count FROM latency_snapshots WHERE ts >= ?"
+        params: list[Any] = [cutoff]
+        if stage:
+            q += " AND stage = ?"
+            params.append(stage)
+        q += " ORDER BY ts ASC, id ASC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def latency_span(self) -> dict[str, Any]:
+        """Gecikme arşivi kapsamı: satır sayısı + ilk/son zaman (gözlemlenebilirlik)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+                "FROM latency_snapshots",
+            ).fetchone()
+        return {"count": row["n"], "first_ts": row["first_ts"], "last_ts": row["last_ts"]}
+
+    def prune_latency_snapshots(self, keep: int) -> int:
+        """En yeni `keep` satır dışındakileri sil (sınırsız büyümeyi önler). keep<=0 → no-op."""
+        if keep <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM latency_snapshots WHERE id NOT IN "
+                "(SELECT id FROM latency_snapshots ORDER BY id DESC LIMIT ?)",
+                (keep,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # ── Shadow-mode (A/B): canlı vs aday ayar karar günlüğü ──────────────────
     def add_shadow_decision(self, row: dict[str, Any]) -> int:

@@ -2105,6 +2105,55 @@ def preflight() -> list[dict[str, Any]]:
     return checks
 
 
+def connectivity_probe() -> dict[str, Any]:
+    """Canlı borsa bağlantı probu (AĞ — auth + saat kayması + bakiye).
+
+    Gerçek emir GÖNDERMEDEN borsanın erişilebilir ve anahtarların geçerli olduğunu
+    doğrular: (1) sunucu saat kayması (imza reddi riski), (2) kimlik doğrulama,
+    (3) serbest USDT bakiyesi. Paper modda/anahtar yoksa atlar. Kritik = canlıya geçme.
+    """
+    if not has_live_keys():
+        return {"ok": False, "skipped": True, "reason": "canlı anahtar yok (.env)", "checks": []}
+    checks: list[dict[str, Any]] = []
+    ok = True
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    try:
+        ex = _get_exchange()
+    except Exception as e:
+        return {"ok": False, "skipped": False,
+                "checks": [{"check": "Borsa bağlantısı", "status": "critical",
+                            "detail": f"kurulamadı: {e}"}]}
+
+    # 1) Saat kayması: imzalı isteklerde borsa zamanıyla fark çok büyükse emir reddedilir
+    try:
+        server_ms = int(ex.fetch_time())
+        skew = abs(server_ms - int(time.time() * 1000))
+        if skew <= 1000:
+            add("Saat kayması", "ok", f"{skew} ms")
+        elif skew <= 5000:
+            add("Saat kayması", "warn", f"{skew} ms — imza reddi riski (NTP senkronla)")
+        else:
+            add("Saat kayması", "critical", f"{skew} ms — emir imzaları reddedilir (NTP senkronla)")
+            ok = False
+    except Exception as e:
+        add("Saat kayması", "warn", f"okunamadı: {e}")
+
+    # 2) Kimlik doğrulama + 3) bakiye (tek özel-uç çağrısı)
+    try:
+        bal = ex.fetch_balance() or {}
+        free = float((bal.get("free") or {}).get("USDT", 0) or 0)
+        add("Kimlik doğrulama", "ok", "anahtarlar geçerli (özel uç erişildi)")
+        add("USDT bakiye", "ok" if free > 0 else "warn", f"{free:.2f} USDT serbest")
+    except Exception as e:
+        add("Kimlik doğrulama", "critical", f"başarısız: {e}")
+        ok = False
+
+    return {"ok": ok, "skipped": False, "checks": checks}
+
+
 def daily_summary(date: str | None = None) -> dict[str, Any]:
     """Bir günün (varsayılan bugün) işlem özeti: kapanan işlemler + anlık maruziyet.
 
@@ -2700,17 +2749,39 @@ def get_settings() -> dict[str, Any]:
 
 
 def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    """Ayarları uygula (transaksiyonel: reddedilirse kısmi commit YOK).
+
+    Canlı oto-işlemi ETKİNLEŞTİREN bir değişiklik + ön-uçuşta (`preflight`) kritik
+    eksik varsa GUARD-RAIL devreye girer ve değişiklik bloklanır (kör canlıya geçiş
+    önleme). Zaten canlı+oto iken diğer alanları düzenlemek bloklanmaz (kilitlenme yok).
+    """
     global _exchange
+    snapshot = {k: getattr(S, k) for k in _PERSIST_KEYS}
     market_changed = "market" in patch and patch["market"] != S.market
-    for k in _PERSIST_KEYS:
-        if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
-            setattr(S, k, patch[k])
-    if "paper_trading" in patch and patch["paper_trading"] is not None:
-        S.paper_trading = bool(patch["paper_trading"])
-    if "auto_trade" in patch and patch["auto_trade"] is not None:
-        if patch["auto_trade"] and not S.paper_trading and not has_live_keys():
-            raise RuntimeError("Canlı otomatik işlem için .env'de Binance anahtarları gerekli")
-        S.auto_trade = bool(patch["auto_trade"])
+    try:
+        for k in _PERSIST_KEYS:
+            if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
+                setattr(S, k, patch[k])
+        if "paper_trading" in patch and patch["paper_trading"] is not None:
+            S.paper_trading = bool(patch["paper_trading"])
+        if "auto_trade" in patch and patch["auto_trade"] is not None:
+            if patch["auto_trade"] and not S.paper_trading and not has_live_keys():
+                raise RuntimeError("Canlı otomatik işlem için .env'de Binance anahtarları gerekli")
+            S.auto_trade = bool(patch["auto_trade"])
+        # Guard-rail: canlı oto-işlemi ETKİNLEŞTİREN değişiklik + ön-uçuş kritik → blokla
+        enabling_live = S.auto_trade and not S.paper_trading and (
+            bool(patch.get("auto_trade")) or patch.get("paper_trading") is False)
+        if enabling_live:
+            crit = [c for c in preflight() if c["status"] == "critical"]
+            if crit:
+                raise RuntimeError(
+                    "Canlıya geçiş engellendi — ön-uçuş kritik eksik(ler): "
+                    + "; ".join(f"{c['check']} ({c['detail']})" for c in crit)
+                    + ". /preflight ile düzelt veya halt_trade_on_latency gibi kapıyı gözden geçir.")
+    except Exception:
+        for k, v in snapshot.items():   # kısmi commit'i geri al
+            setattr(S, k, v)
+        raise
     if market_changed:
         _exchange = None
     with _lock:

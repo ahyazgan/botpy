@@ -2772,13 +2772,9 @@ def readiness() -> dict[str, Any]:
 _PREFLIGHT_RANK = {"critical": 3, "warn": 2, "info": 1, "ok": 0}
 
 
-@app.get("/preflight")
-def preflight() -> dict[str, Any]:
-    """Canlıya geçiş operasyonel ön-uçuş: sistem gerçek parayı riske atacak şekilde
-    GÜVENLİ yapılandırılmış mı (anahtarlar/koruyucu-stop/risk-limitleri/besleme/bildirim).
-
-    `/readiness` track-record edge'ini (strateji yeterince iyi mi) sorgular; bu ayrı bir
-    eksen — ops/konfig güvenliği. Salt gözlem, ağsız. 'critical' eksik = canlıya geçme."""
+def _preflight_checks(probe: bool = False) -> list[dict[str, Any]]:
+    """Ön-uçuş kontrol listesini derle: trader ops + besleme/gecikme/bildirim/token
+    (+ probe=True ise canlı bağlantı probu, AĞ)."""
     checks = trader.preflight()
 
     def add(name: str, status: str, detail: str) -> None:
@@ -2815,6 +2811,19 @@ def preflight() -> dict[str, Any]:
         "ayarlı (mutasyon uçları korumalı)" if API_TOKEN
         else "yok — yerel kullanımda sorun değil; sunucu dışa açılırsa ayarla")
 
+    # Canlı bağlantı probu (AĞ — auth/saat/bakiye); yalnız istenirse
+    if probe:
+        pr = trader.connectivity_probe()
+        if pr.get("skipped"):
+            add("Canlı bağlantı probu", "info", pr.get("reason", "atlandı (paper/anahtar yok)"))
+        else:
+            for c in pr.get("checks", []):
+                add(f"Canlı: {c['check']}", c["status"], c["detail"])
+    return checks
+
+
+def _preflight_verdict(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Kontrol listesinden verdikt + sayım üret (saf)."""
     worst = max((_PREFLIGHT_RANK.get(c["status"], 0) for c in checks), default=0)
     if worst >= 3:
         verdict = "CANLIYA HAZIR DEĞİL — kritik güvenlik eksiği var (aşağıyı düzelt)"
@@ -2824,9 +2833,54 @@ def preflight() -> dict[str, Any]:
         verdict = "OPERASYONEL OLARAK HAZIR — edge için ayrıca /readiness + /brain-backtest"
     counts = {s: sum(1 for c in checks if c["status"] == s)
               for s in ("critical", "warn", "info", "ok")}
-    return {"verdict": verdict, "paper_trading": trader.S.paper_trading,
-            "counts": counts, "checks": checks,
+    return {"verdict": verdict, "counts": counts}
+
+
+@app.get("/preflight")
+def preflight(probe: bool = False) -> dict[str, Any]:
+    """Canlıya geçiş operasyonel ön-uçuş: sistem gerçek parayı riske atacak şekilde
+    GÜVENLİ yapılandırılmış mı (anahtarlar/koruyucu-stop/risk-limitleri/besleme/bildirim).
+
+    `/readiness` track-record edge'ini (strateji yeterince iyi mi) sorgular; bu ayrı bir
+    eksen — ops/konfig güvenliği. `probe=true`: canlı borsa bağlantı probu da koşar
+    (auth/saat-kayması/bakiye — AĞ). 'critical' eksik = canlıya geçme (PATCH /settings
+    canlı oto-işlemi de bu kritiklerde bloklar)."""
+    checks = _preflight_checks(probe=probe)
+    res = _preflight_verdict(checks)
+    return {**res, "paper_trading": trader.S.paper_trading, "checks": checks,
             "note": "Bu operasyonel/konfig güvenliği ölçer; strateji edge'i için /readiness."}
+
+
+@app.get("/golive")
+def golive(probe: bool = False) -> dict[str, Any]:
+    """Canlıya hazırlık kokpiti: iki ekseni TEK verdiktte birleştirir —
+    (a) **edge** (`/readiness`: track-record yeterince iyi mi) + (b) **operasyonel
+    güvenlik** (`/preflight`: sistem güvenli yapılandırılmış mı). `probe=true` canlı
+    bağlantı probunu da koşar (AĞ).
+
+    Nihai verdikt iki tarafın EN KÖTÜSÜdür: ops'ta kritik VEYA edge HENÜZ DEĞİL ise
+    canlıya geçme. İkisi de yeşilse → MİNİK canlı başlat (kontrol kullanıcıda)."""
+    pre_checks = _preflight_checks(probe=probe)
+    pre = _preflight_verdict(pre_checks)
+    rd = readiness()
+    ops_critical = pre["counts"]["critical"] > 0
+    edge_ok = rd["verdict"].startswith("UMUT VERİCİ")
+    edge_blocked = rd["verdict"].startswith(("HENÜZ DEĞİL", "VERİ YETERSİZ"))
+    if ops_critical:
+        verdict = "CANLIYA GEÇME — operasyonel kritik eksik (bkz preflight)"
+    elif edge_blocked:
+        verdict = f"CANLIYA GEÇME — edge hazır değil ({rd['verdict'].split('—')[0].strip()})"
+    elif edge_ok and pre["counts"]["warn"] == 0:
+        verdict = "HAZIR — MİNİK canlı başlatmayı düşün (kontrol sende)"
+    else:
+        verdict = "NEREDEYSE — uyarıları gözden geçir; edge'i /brain-backtest ile doğrula"
+    return {
+        "verdict": verdict,
+        "operational": {**pre, "checks": pre_checks},
+        "edge": rd,
+        "blockers": [c for c in pre_checks if c["status"] == "critical"],
+        "note": "PATCH /settings canlı oto-işlemi operasyonel kritiklerde otomatik bloklar.",
+    }
 
 
 @app.get("/halt")

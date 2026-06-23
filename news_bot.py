@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -149,6 +150,9 @@ BINANCE_API = "https://api.binance.com/api/v3"
 MIN_VOLUME_USD = 1_000_000     # bu hacmin altı = düşük likidite (slippage riski)
 CONFIRM_MOVE_PCT = 0.5         # son penceede haber yönünde en az bu % hareket = teyit
 ALREADY_PRICED_PCT = 25.0      # 24s'te bu % üzeri hareket = büyük kısmı fiyatlanmış
+# Fiyat verisi doğrulama: bu %'yi aşan hareket "imkânsız/bozuk tick" sayılır → teyit yok.
+# Gerçek hareketler bunun altında; amaç saçma/bozuk veriyle körlemesine işlem önleme.
+PRICE_SANITY_MAX_PCT = float(os.environ.get("PRICE_SANITY_MAX_PCT", "500"))
 # Teyit penceresi: kaç dakikalık mum × kaç adet. Varsayılan 15m×4 (son 15dk + ~1s).
 # Daha hızlı/erken teyit için CONFIRM_INTERVAL=1m CONFIRM_LIMIT=15 (son 1dk + 15dk);
 # daha gürültülü ama haberin önünde olur. Backtest'le kalibre et.
@@ -300,6 +304,7 @@ _metrics: dict[str, int] = {
     "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
     "failover_scans_total": 0,  # WS bayatken hızlı yedek tarama sayısı (kaynak redundansı)
     "source_disabled_total": 0, # üst üste hata sonrası devre dışı bırakılan yedek kaynak sayısı
+    "price_anomaly_total": 0,   # reddedilen anormal/bozuk fiyat verisi (teyit edilemeyen)
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -1200,6 +1205,25 @@ def _compute_rvol(candles: list[Any]) -> float:
     return round(recent / baseline, 2) if baseline > 0 else 0.0
 
 
+def _stats_sane(stats: dict[str, float]) -> str | None:
+    """Fiyat istatistiklerini doğrula. Bozuk/anormal veride sebep döndürür, temizse None. Saf.
+
+    Borsa public API genelde temiz ama transient bozuk tick / gap / NaN saçma işlem
+    açtırabilir. Reddet: NaN/inf, negatif hacim, |hareket| > `PRICE_SANITY_MAX_PCT`
+    (imkânsız = bozuk veri). Gerçek hareketler eşiğin altında → yanlış-pozitif yok.
+    """
+    for k in ("pct24", "move15", "move60", "atr_pct", "rvol", "vol"):
+        v = stats.get(k, 0.0)
+        if not math.isfinite(v):
+            return f"{k} sonlu değil ({v})"
+    if stats["vol"] < 0:
+        return f"negatif hacim ({stats['vol']})"
+    for k in ("pct24", "move15", "move60"):
+        if abs(stats[k]) > PRICE_SANITY_MAX_PCT:
+            return f"{k}=%{stats[k]:.0f} imkânsız (>%{PRICE_SANITY_MAX_PCT:.0f}) — bozuk tick"
+    return None
+
+
 def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, float] | None:
     """Bir parite için 24s değişim, hacim, son ~15dk/~1s hareketi, ATR% ve RVOL döndür."""
     t = get_json(f"{BINANCE_API}/ticker/24hr", params={"symbol": symbol},
@@ -1230,7 +1254,7 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
         if ranges:
             atr_pct = sum(ranges) / len(ranges)
         rvol = _compute_rvol(candles)
-    return {
+    stats = {
         "pct24": float(t.get("priceChangePercent", 0) or 0),
         "vol": float(t.get("quoteVolume", 0) or 0),
         "move15": move15,
@@ -1238,6 +1262,13 @@ def _fetch_symbol_stats(session: requests.Session, symbol: str) -> dict[str, flo
         "atr_pct": atr_pct,
         "rvol": rvol,
     }
+    # Fiyat verisi doğrulama: bozuk/anormal tick → teyit edilemez (körlemesine işlem önleme)
+    bad = _stats_sane(stats)
+    if bad is not None:
+        _metrics["price_anomaly_total"] += 1
+        log.warning("Anormal fiyat verisi reddedildi (%s): %s", symbol, bad)
+        return None
+    return stats
 
 
 def confirm_with_price(session: requests.Session, item: NewsItem) -> None:
@@ -2268,6 +2299,7 @@ _METRIC_META = {
     "botpy_backup_scan_interval_seconds": ("gauge", "Aktif yedek tarama aralığı (failover'da düşer)"),
     "botpy_source_disabled_total": ("counter", "Üst üste hatada devre dışı bırakılan yedek kaynak"),
     "botpy_sources_disabled": ("gauge", "Şu an devre dışı yedek kaynak sayısı"),
+    "botpy_price_anomaly_total": ("counter", "Reddedilen anormal/bozuk fiyat verisi"),
     "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
     "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
@@ -2325,6 +2357,7 @@ def metrics() -> PlainTextResponse:
         "botpy_backup_scan_interval_seconds": _scan_interval(),
         "botpy_source_disabled_total": _metrics["source_disabled_total"],
         "botpy_sources_disabled": sum(1 for v in _source_health.snapshot().values() if v["disabled"]),
+        "botpy_price_anomaly_total": _metrics["price_anomaly_total"],
         "botpy_halts_total": trader._halts,
         "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),

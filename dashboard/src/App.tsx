@@ -110,6 +110,7 @@ type Settings = {
   partial_tp_frac: number;
   max_open_risk_usdt: number;
   reduce_after_losses: number;
+  derisk_on_drawdown: boolean;
   suppress_losing_sources: boolean;
   min_source_samples: number;
   skip_already_priced_pct: number;
@@ -297,7 +298,7 @@ type Risk = {
   realized_today: number;
   daily_loss_limit_usdt: number;
   trading_halted: boolean;
-  drawdown?: { equity: number; peak: number; drawdown_usdt: number; drawdown_pct: number; max_drawdown_pct: number; account_equity_usdt: number; halted: boolean };
+  drawdown?: { equity: number; peak: number; drawdown_usdt: number; drawdown_pct: number; max_drawdown_pct: number; account_equity_usdt: number; halted: boolean; derisk_on?: boolean; size_factor?: number };
   sizing?: { risk_per_trade_pct: number; equity: number; mode: "risk_pct" | "fixed_usdt" };
   paper_trading: boolean;
   auto_trade: boolean;
@@ -1414,6 +1415,14 @@ export default function App() {
               <NumField label="Max açık pozisyon" value={settings.max_positions} onSave={(v) => patchSettings({ max_positions: v })} />
               <NumField label="Max açık risk USDT (0=kapalı)" value={settings.max_open_risk_usdt} onSave={(v) => patchSettings({ max_open_risk_usdt: v })} />
               <NumField label="Kayıp serisi freni (0=kapalı)" value={settings.reduce_after_losses} onSave={(v) => patchSettings({ reduce_after_losses: v })} />
+              <button
+                type="button"
+                onClick={() => void patchSettings({ derisk_on_drawdown: !settings.derisk_on_drawdown })}
+                title="Drawdown büyüdükçe pozisyon boyutunu kademeli kıs (sert kill-switch'ten önce defensif yumuşama)"
+                className={`w-full rounded-md border px-2 py-1 text-xs font-semibold ${settings.derisk_on_drawdown ? "border-emerald-500/40 bg-emerald-950/40 text-emerald-200" : "border-zinc-700 bg-zinc-800/60 text-zinc-400"}`}
+              >
+                📉 Kademeli drawdown de-risk: {settings.derisk_on_drawdown ? "AÇIK" : "kapalı"}
+              </button>
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-sky-400/80">Emir kalitesi</p>
@@ -2013,6 +2022,12 @@ export default function App() {
                 <span className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-1 text-xs font-semibold text-amber-200"
                   title={`Tepe ${risk.drawdown.peak} · equity ${risk.drawdown.equity} · limit %${risk.drawdown.max_drawdown_pct}`}>
                   📉 Drawdown −%{risk.drawdown.drawdown_pct} / −%{risk.drawdown.max_drawdown_pct}
+                </span>
+              )}
+              {risk.drawdown?.derisk_on && (risk.drawdown.size_factor ?? 1) < 1 && (
+                <span className="rounded-lg border border-sky-500/40 bg-sky-950/30 px-3 py-1 text-xs font-semibold text-sky-200"
+                  title="Drawdown nedeniyle pozisyon boyutu kademeli kısıldı (defensif)">
+                  🔻 de-risk {risk.drawdown.size_factor}×
                 </span>
               )}
               {risk.regime?.active && (

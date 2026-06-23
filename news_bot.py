@@ -2467,6 +2467,26 @@ def ablation(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int =
         return {"ok": True, **nbt.ablation(results, usdt, chase_pct=chase_pct, rvol_min=rvol_min)}
 
 
+def _ablation_search_impl(hours: float, min_impact: int, limit: int, sl: float, tp: float,
+                          fee: float, usdt: float, chase_pct: float, rvol_min: float,
+                          min_improve_pct: float) -> dict[str, Any]:
+    """Açgözlü çok-gate aramasının ağ-yoğun çekirdeği (search + apply ortak kullanır).
+    _heavy_guard ALTINDA çağrılmalı (çağıran tutar)."""
+    import news_backtest as nbt
+    rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+    candidates = nbt._signals_from_rows(rows)
+    if not candidates:
+        return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+    signals = nbt.prefetch(candidates, int(hours * 60))
+    if not signals:
+        return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+    results = nbt.simulate_all(signals, sl, tp, fee)
+    if not results:
+        return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
+    return {"ok": True, **nbt.ablation_search(results, usdt, chase_pct=chase_pct,
+                                              rvol_min=rvol_min, min_improve_pct=min_improve_pct)}
+
+
 @app.get("/ablation/search")
 def ablation_search(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
                     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
@@ -2477,21 +2497,36 @@ def ablation_search(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit
     `/ablation` her gate'i izole ölçer; bu gateleri BİRLİKTE arar (ileri-seçim): boş kümeden
     başlar, her adımda anlamlı iyileşme (kestiği işlemler net-negatif + ≥`min_improve_pct`)
     katan gate'i ekler. `recommended_settings` = canlıya ELLE uygulanabilir ayar fragmanı
-    (oto-uygulanmaz). Ağ-yoğun, _heavy_guard."""
-    import news_backtest as nbt
+    (oto-uygulanmaz; POST /ablation/apply ile korkuluklu uygula). Ağ-yoğun, _heavy_guard."""
     with _heavy_guard():
-        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
-        candidates = nbt._signals_from_rows(rows)
-        if not candidates:
-            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
-        signals = nbt.prefetch(candidates, int(hours * 60))
-        if not signals:
-            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
-        results = nbt.simulate_all(signals, sl, tp, fee)
-        if not results:
-            return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
-        return {"ok": True, **nbt.ablation_search(results, usdt, chase_pct=chase_pct,
-                                                  rvol_min=rvol_min, min_improve_pct=min_improve_pct)}
+        return _ablation_search_impl(hours, min_impact, limit, sl, tp, fee, usdt,
+                                     chase_pct, rvol_min, min_improve_pct)
+
+
+@app.post("/ablation/apply", dependencies=[Depends(require_token)])
+def post_ablation_apply(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
+                        sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
+                        chase_pct: float = 5.0, rvol_min: float = 1.5,
+                        min_improve_pct: float = 0.05) -> dict[str, Any]:
+    """Ablation aramasının önerdiği gate'leri KORKULUKLARLA uygula (açık kullanıcı eylemi).
+
+    Aramayı sunucuda yeniden koşar (güvenilir öneri) ve `recommended_settings`'i yalnız
+    güvenli KARAR-EŞİĞİ alanlarında kıstırarak uygular (`trader.apply_ablation_recommendation`)
+    — risk/boyut/kaldıraç ayarlarına dokunmaz. Öneri boşsa no-op. Ağ-yoğun, _heavy_guard."""
+    with _heavy_guard():
+        res = _ablation_search_impl(hours, min_impact, limit, sl, tp, fee, usdt,
+                                    chase_pct, rvol_min, min_improve_pct)
+    if not res.get("ok"):
+        return {"applied": False, "reason": res.get("reason", "arama başarısız"), "changes": []}
+    rec = res.get("recommended_settings") or {}
+    if not rec:
+        return {"applied": False, "reason": "öneri yok (hiçbir gate anlamlı iyileşme katmadı)",
+                "changes": [], "verdict": res.get("verdict")}
+    applied = trader.apply_ablation_recommendation(rec)
+    if applied["applied"]:
+        notify_remote("🔬 Ablation kalibrasyonu: " + ", ".join(
+            f"{c['field']} {c['from']}→{c['to']}" for c in applied["changes"]))
+    return {**applied, "recommended_settings": rec, "improvement_pct": res.get("improvement_pct")}
 
 
 def _run_backtest_impl(

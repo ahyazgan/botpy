@@ -24,6 +24,7 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -315,6 +316,88 @@ def signal_scorecard(signals: list[dict]) -> dict:
         "overall": _stat(rows),
         "by_source": _group(lambda r: r.get("source", "?")),
         "by_impact": _group(lambda r: r.get("impact", "?")),
+    }
+
+
+# Haber kategorisi sınıflandırması — "hangi haber TİPİ fiyat oynatıyor" alpha analizi.
+# Öncelik sırası önemli (spesifik/güçlü önce); ilk eşleşen kazanır, yoksa "other".
+_CATEGORY_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("hack", re.compile(r"\b(hack|hacked|exploit|breach|stolen|drained|attack)\b", re.I)),
+    ("insolvency", re.compile(r"\b(bankrupt|bankruptcy|insolvent|collapse|collapses|default)\b", re.I)),
+    ("etf", re.compile(r"\betf\b", re.I)),
+    ("delisting", re.compile(r"\b(delist|delisting|suspend|halts?)\b", re.I)),
+    ("listing", re.compile(r"\b(will list|listing|lists|adds|added)\b", re.I)),
+    ("legal", re.compile(r"\b(lawsuit|sues|sued|charges|fraud|investigat|sec\b|cftc|settl)\w*", re.I)),
+    ("ban", re.compile(r"\b(ban|banned|bans|outlaw|illegal|restrict)\w*", re.I)),
+    ("institutional", re.compile(r"\b(blackrock|fidelity|grayscale|institutional|microstrategy)\b", re.I)),
+    ("partnership", re.compile(r"\b(partner|partnership|integrat|adopt|collaborat)\w*", re.I)),
+    ("upgrade", re.compile(r"\b(mainnet|upgrade|hard fork|launch|launches|live)\w*", re.I)),
+    ("unlock", re.compile(r"\b(unlock|vesting|token release|emission)\w*", re.I)),
+    ("crash", re.compile(r"\b(crash|plunge|dump|liquidat|sell-?off|tumbl|slump)\w*", re.I)),
+    ("rally", re.compile(r"\b(surge|surges|rally|rallies|all-?time high|\bath\b|soars?|pump)\w*", re.I)),
+    ("macro", re.compile(r"\b(fed|federal reserve|cpi|interest rate|inflation|fomc)\b", re.I)),
+]
+
+
+def _categorize(title: str) -> str:
+    """Haber başlığını bir kategoriye eşle (alpha kırılımı için). İlk eşleşen, yoksa 'other'. Saf."""
+    t = title or ""
+    for name, pat in _CATEGORY_PATTERNS:
+        if pat.search(t):
+            return name
+    return "other"
+
+
+def alpha_analysis(results: list[dict], usdt: float = 100.0, min_n: int = 3) -> dict:
+    """Alpha kırılımı: hangi haber KATEGORİSİ ve KAYNAĞI gerçekten para/hareket üretiyor (saf).
+
+    `signal_scorecard` ham yön isabetini ölçer; bu, kategori/kaynak bazında hem ham
+    yön hareketini (`avg_move_pct`/`hit_rate`) hem SL/TP simüle net'i (`avg_net_pct`/
+    `win_rate`/`total_pnl`) birleştirir → "ETF haberi +%X taşıyor, ortaklık gürültü"
+    gibi oynatılabilir alpha. `min_n` altı grup 'thin' işaretlenir (gürültü uyarısı).
+
+    Döner: `by_category` + `by_source` (her biri sıralı), `best`/`worst` kategori
+    (yeterli örnekli, avg_net'e göre), `n`.
+    """
+    rows = []
+    for r in results:
+        m = _directional_move(r)
+        rows.append({**r, "category": _categorize(r.get("title", "")),
+                     "move_pct": round(m, 3) if m is not None else None})
+
+    def _stat(v: list[dict]) -> dict:
+        moves = [x["move_pct"] for x in v if x["move_pct"] is not None]
+        hits = sum(1 for x in moves if x > 0)
+        base = _summarize(v, usdt)
+        return {
+            "n": len(v),
+            "hit_rate": round(hits / len(moves) * 100, 1) if moves else None,
+            "avg_move_pct": round(sum(moves) / len(moves), 3) if moves else None,
+            "win_rate": base.get("win_rate"),
+            "avg_net_pct": base.get("avg_net_pct"),
+            "total_pnl_usdt": base.get("total_pnl_usdt"),
+            "thin": len(v) < min_n,
+        }
+
+    def _group(key_fn: Any) -> dict:
+        buckets: dict[str, list[dict]] = {}
+        for r in rows:
+            buckets.setdefault(str(key_fn(r)), []).append(r)
+        # avg_net'e göre azalan sırala (en kârlı önce)
+        items = [(k, _stat(v)) for k, v in buckets.items()]
+        items.sort(key=lambda kv: (kv[1]["avg_net_pct"] or -1e9), reverse=True)
+        return dict(items)
+
+    by_cat = _group(lambda r: r["category"])
+    ranked = [(k, s) for k, s in by_cat.items() if not s["thin"] and s["avg_net_pct"] is not None]
+    return {
+        "n": len(rows),
+        "by_category": by_cat,
+        "by_source": _group(lambda r: r.get("source", "?")),
+        "best": ranked[0][0] if ranked else None,
+        "worst": ranked[-1][0] if ranked else None,
+        "note": "Yön hareketi (avg_move/hit) edge'in HAM gücü; net (SL/TP) gerçekleşen P&L. "
+                "thin=örnek az (gürültü). Kategori bazında auto_min_impact/kaynak kararı için.",
     }
 
 

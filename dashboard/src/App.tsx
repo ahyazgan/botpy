@@ -196,6 +196,12 @@ type AblationSearch = {
   selected?: { gate: string; desc: string; step_improve_pct: number; cut_n: number; cut_avg_net_pct: number }[];
   recommended_settings?: Record<string, number | boolean>;
 };
+type AlphaStat = { n: number; hit_rate: number | null; avg_move_pct: number | null; win_rate: number | null; avg_net_pct: number | null; total_pnl_usdt: number | null; thin: boolean };
+type AlphaAnalysis = {
+  ok?: boolean; reason?: string; n?: number;
+  by_category?: Record<string, AlphaStat>; by_source?: Record<string, AlphaStat>;
+  best?: string | null; worst?: string | null;
+};
 
 type Performance = {
   total_trades: number;
@@ -533,6 +539,8 @@ export default function App() {
   const [pretrade, setPretrade] = useState<(Tuning & { reason?: string; tested?: number }) | null>(null);
   const [pretradeRunning, setPretradeRunning] = useState(false);
   const [ablation, setAblation] = useState<AblationSearch | null>(null);
+  const [alpha, setAlpha] = useState<AlphaAnalysis | null>(null);
+  const [alphaRunning, setAlphaRunning] = useState(false);
   const [ablationRunning, setAblationRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
@@ -792,6 +800,19 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Ablasyon hatası");
     } finally {
       setAblationRunning(false);
+    }
+  };
+
+  const runAlpha = async () => {
+    setAlphaRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/alpha`);
+      if (!r.ok) throw new Error(`alpha ${r.status}`);
+      setAlpha(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Alpha analizi hatası");
+    } finally {
+      setAlphaRunning(false);
     }
   };
 
@@ -2255,8 +2276,60 @@ export default function App() {
             >
               {ablationRunning ? "Aranıyor…" : "🔬 Gate ablasyonu"}
             </button>
+            <button
+              type="button"
+              onClick={() => void runAlpha()}
+              disabled={alphaRunning}
+              title="Hangi haber KATEGORİSİ (hack/ETF/listeleme/ortaklık...) ve kaynak gerçekten fiyat oynatıyor — arşiv verisiyle alpha kırılımı (ağ-yoğun)"
+              className="rounded-md border border-indigo-500/40 bg-indigo-950/40 px-3 py-1 text-xs font-semibold text-indigo-200 hover:bg-indigo-900/50 disabled:opacity-50"
+            >
+              {alphaRunning ? "Analiz…" : "💎 Alpha analizi"}
+            </button>
           </div>
         </div>
+
+        {/* Alpha: hangi haber kategorisi/kaynağı para oynatıyor */}
+        {alpha && (
+          <div className="mb-3 rounded-2xl border border-indigo-500/30 bg-indigo-950/20 px-4 py-3 text-sm">
+            {alpha.ok === false ? (
+              <p className="text-zinc-500">{alpha.reason ?? "Yetersiz veri."}</p>
+            ) : (
+              <>
+                <div className="mb-2 flex flex-wrap items-center gap-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-indigo-300/80">💎 Alpha — kategori kırılımı</span>
+                  <span className="text-zinc-500">{alpha.n} sinyal</span>
+                  {alpha.best && <span className="rounded bg-emerald-900/50 px-2 py-0.5 text-xs text-emerald-200">en iyi: {alpha.best}</span>}
+                  {alpha.worst && <span className="rounded bg-red-900/50 px-2 py-0.5 text-xs text-red-200">en kötü: {alpha.worst}</span>}
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="text-zinc-600">
+                        <th className="pb-1 font-normal">kategori</th>
+                        <th className="pb-1 text-right font-normal">n</th>
+                        <th className="pb-1 text-right font-normal">isabet</th>
+                        <th className="pb-1 text-right font-normal">ort. hareket</th>
+                        <th className="pb-1 text-right font-normal">net (SL/TP)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(alpha.by_category ?? {}).map(([cat, s]) => (
+                        <tr key={cat} className={`border-t border-white/5 ${s.thin ? "opacity-50" : ""}`}>
+                          <td className="py-1 font-medium text-zinc-200">{cat}{s.thin ? " (ince)" : ""}</td>
+                          <td className="py-1 text-right tabular-nums text-zinc-400">{s.n}</td>
+                          <td className="py-1 text-right tabular-nums text-zinc-400">{s.hit_rate != null ? `${s.hit_rate}%` : "—"}</td>
+                          <td className={`py-1 text-right tabular-nums ${(s.avg_move_pct ?? 0) >= 0 ? "text-emerald-300" : "text-red-300"}`}>{s.avg_move_pct != null ? `${s.avg_move_pct > 0 ? "+" : ""}${s.avg_move_pct}%` : "—"}</td>
+                          <td className={`py-1 text-right tabular-nums font-semibold ${(s.avg_net_pct ?? 0) >= 0 ? "text-emerald-300" : "text-red-300"}`}>{s.avg_net_pct != null ? `${s.avg_net_pct > 0 ? "+" : ""}${s.avg_net_pct}%` : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="mt-2 text-[11px] text-zinc-500">Hareket = edge'in ham gücü · net = SL/TP gerçekleşen · ince = örnek az (gürültü)</p>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Gate ablasyonu: hangi filtre kombinasyonu edge katıyor + öneri */}
         {ablation && (

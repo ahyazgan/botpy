@@ -2678,6 +2678,57 @@ def readiness() -> dict[str, Any]:
                     "+ /brain-veto-review (avg_net<0)."}
 
 
+_PREFLIGHT_RANK = {"critical": 3, "warn": 2, "info": 1, "ok": 0}
+
+
+@app.get("/preflight")
+def preflight() -> dict[str, Any]:
+    """Canlıya geçiş operasyonel ön-uçuş: sistem gerçek parayı riske atacak şekilde
+    GÜVENLİ yapılandırılmış mı (anahtarlar/koruyucu-stop/risk-limitleri/besleme/bildirim).
+
+    `/readiness` track-record edge'ini (strateji yeterince iyi mi) sorgular; bu ayrı bir
+    eksen — ops/konfig güvenliği. Salt gözlem, ağsız. 'critical' eksik = canlıya geçme."""
+    checks = trader.preflight()
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    # Besleme sağlığı: WS kopuk/bayatsa kör giriş riski (oto-işlem kapısı da bunu kullanır)
+    if not USE_TREENEWS:
+        add("Haber beslemesi (WS)", "warn", "TreeNews kapalı — yalnız RSS/polling yedek")
+    elif _ws_feed_stale():
+        add("Haber beslemesi (WS)", "critical",
+            f"BAYAT/KOPUK — son mesaj {_ws_last_msg_age()}s önce (kör giriş riski)")
+    elif _ws_state.get("connected"):
+        add("Haber beslemesi (WS)", "ok", f"bağlı — son mesaj {_ws_last_msg_age()}s önce")
+    else:
+        add("Haber beslemesi (WS)", "warn", "henüz bağlanmadı (başlangıç grace)")
+
+    # Uzak bildirim: masadan uzaktayken sinyal/uyarı alabilmek için
+    add("Uzak bildirim (Telegram/Discord)",
+        "ok" if getattr(_notifier, "enabled", False) else "warn",
+        "etkin" if getattr(_notifier, "enabled", False)
+        else "kapalı — masadan uzaktayken uyarı/işlem bildirimi gelmez")
+
+    # Mutasyon uçları koruması (sunucu dışa açılırsa)
+    add("API token koruması", "ok" if API_TOKEN else "info",
+        "ayarlı (mutasyon uçları korumalı)" if API_TOKEN
+        else "yok — yerel kullanımda sorun değil; sunucu dışa açılırsa ayarla")
+
+    worst = max((_PREFLIGHT_RANK.get(c["status"], 0) for c in checks), default=0)
+    if worst >= 3:
+        verdict = "CANLIYA HAZIR DEĞİL — kritik güvenlik eksiği var (aşağıyı düzelt)"
+    elif worst == 2:
+        verdict = "DİKKATLE — bloke edici yok ama uyarıları gözden geçir"
+    else:
+        verdict = "OPERASYONEL OLARAK HAZIR — edge için ayrıca /readiness + /brain-backtest"
+    counts = {s: sum(1 for c in checks if c["status"] == s)
+              for s in ("critical", "warn", "info", "ok")}
+    return {"verdict": verdict, "paper_trading": trader.S.paper_trading,
+            "counts": counts, "checks": checks,
+            "note": "Bu operasyonel/konfig güvenliği ölçer; strateji edge'i için /readiness."}
+
+
 @app.get("/halt")
 def get_halt() -> dict[str, Any]:
     """Operasyonel devre kesici durumu (anomalide oto-işlem durdurulur)."""

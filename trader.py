@@ -2026,6 +2026,77 @@ def get_risk() -> dict[str, Any]:
     }
 
 
+def preflight() -> list[dict[str, Any]]:
+    """Canlıya geçiş operasyonel ön-uçuş kontrolleri (saf — ağsız, S + env okur).
+
+    `/readiness` track-record edge'ini sorgular; bu fonksiyon AYRI bir ekseni:
+    sistem gerçek parayı riske atacak şekilde **güvenli yapılandırılmış mı**.
+    Her kontrol: name/status (ok|warn|critical|info)/detail. Canlıya geçiş için
+    'critical' eksikler bloke edicidir; paper modunda canlı-özel kontroller yine
+    'canlıya geçince gerekecek' diye gösterilir.
+
+    Trade güvenliği için `news_bot._preflight` bunu besleme-sağlığı (WS) + uzak
+    bildirim + token kontrolleriyle birleştirir ve nihai verdikt üretir.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    live = not S.paper_trading
+    add("İşlem modu", "info",
+        "CANLI — gerçek emir" if live else "PAPER — simülasyon (gerçek emir yok)")
+
+    # Canlı API anahtarları (canlıda kritik; paper'da uyarı/bilgi)
+    if has_live_keys():
+        add("Borsa API anahtarları", "ok", "BINANCE_API_KEY/SECRET tanımlı")
+    else:
+        add("Borsa API anahtarları", "critical" if live else "info",
+            "yok — canlı emir gönderilemez (.env BINANCE_API_KEY/SECRET)")
+
+    # Stop-loss güvencesi: SL/TP veya ATR çıkışı açık olmalı
+    if S.use_sl_tp and (S.stop_loss_pct > 0 or S.use_atr_exits):
+        add("Zarar durdurma (SL)", "ok",
+            f"SL=%{S.stop_loss_pct:g}" + (" + ATR" if S.use_atr_exits else ""))
+    else:
+        add("Zarar durdurma (SL)", "critical", "SL kapalı — korumasız pozisyon riski")
+
+    # Borsa-native koruyucu stop (bot çökse de korur) — canlıda kritik
+    if S.exchange_native_stops:
+        add("Borsa koruyucu stop", "ok", "canlıda borsaya DURAN SL/TP konur (çökmeye dayanıklı)")
+    else:
+        add("Borsa koruyucu stop", "critical" if live else "warn",
+            "kapalı — bot çökerse/internet giderse pozisyon korumasız")
+
+    # Anomali devre kesici
+    add("Anomali devre kesici", "ok" if S.auto_halt_on_anomaly else "warn",
+        "açık" if S.auto_halt_on_anomaly else "kapalı — emir-hata serisinde durmaz")
+
+    # Risk limitleri (sınırsız zarar/maruziyet = kritik)
+    add("Günlük zarar limiti", "ok" if S.daily_loss_limit_usdt > 0 else "critical",
+        f"{S.daily_loss_limit_usdt:g} USDT" if S.daily_loss_limit_usdt > 0
+        else "0 = SINIRSIZ günlük zarar (kill-switch yok)")
+    add("Toplam maruziyet tavanı", "ok" if S.max_total_exposure_usdt > 0 else "warn",
+        f"{S.max_total_exposure_usdt:g} USDT" if S.max_total_exposure_usdt > 0 else "0 = sınırsız")
+    add("Coin maruziyet tavanı", "ok" if S.max_per_coin_usdt > 0 else "warn",
+        f"{S.max_per_coin_usdt:g} USDT" if S.max_per_coin_usdt > 0 else "0 = sınırsız")
+
+    # Kaldıraç aklı (futures)
+    if S.market == "futures" and S.leverage > 10:
+        add("Kaldıraç", "warn", f"{S.leverage}x — yüksek; tasfiye mesafesi dar")
+    elif S.market == "futures":
+        add("Kaldıraç", "ok", f"{S.leverage}x")
+
+    # Açık devre kesici → şu an işlem açılmaz
+    halt = get_halt()
+    if halt["active"]:
+        add("Devre kesici durumu", "critical", f"AKTİF — oto-işlem durdurulmuş: {halt['reason']}")
+    else:
+        add("Devre kesici durumu", "ok", "temiz")
+
+    return checks
+
+
 def daily_summary(date: str | None = None) -> dict[str, Any]:
     """Bir günün (varsayılan bugün) işlem özeti: kapanan işlemler + anlık maruziyet.
 

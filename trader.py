@@ -58,6 +58,7 @@ class Settings:
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
+    halt_trade_on_latency: bool = True # boru hattı gecikme SLA'sı aşıldıysa yeni oto-işlem açma
     max_news_age_sec: int = 0          # >0: haber bu kadar saniyeden eskiyse girme (hareket bitti)
     max_same_direction: int = 0        # >0: aynı yönde açık pozisyon sayısı tavanı (korelasyon riski)
     # Otomatik çıkış
@@ -144,7 +145,7 @@ _PERSIST_KEYS = (
     "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
     "brain_self_improve", "brain_recalibrate", "brain_recalibrate_min",
     "brain_vote_count", "cooldown_sec",
-    "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
+    "halt_trade_on_stale", "halt_trade_on_latency", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "use_atr_trailing", "atr_trailing_mult",
@@ -584,6 +585,69 @@ def brain_scorecard() -> dict[str, Any]:
             "escalation": _escalation_accuracy(rows),
             "rubric": _rubric_correlation(rows),
             **sci}
+
+
+def _agg_pnl(b: list[dict[str, Any]]) -> dict[str, Any]:
+    """Kapanan işlem alt-kümesinden n/win_rate/avg_pnl (saf)."""
+    if not b:
+        return {"n": 0, "win_rate": None, "avg_pnl": None}
+    wins = sum(1 for c in b if c["pnl"] > 0)
+    return {"n": len(b), "win_rate": round(wins / len(b), 2),
+            "avg_pnl": round(sum(c["pnl"] for c in b) / len(b), 2)}
+
+
+def brain_attribution(min_layer_samples: int = 5) -> dict[str, Any]:
+    """Beyin KATMAN atıfı: hangi katman (eskalasyon/oylama/rekalibrasyon/rubrik)
+    gerçek kapanmış işlemlerde edge katıyor — tek konsolide rapor.
+
+    Dağınık sinyalleri (brain_scorecard/escalation/rubric) tek "hangi katman para
+    kazandırıyor" görünümünde toplar; her katman için verdikt (edge+/edge-/yetersiz).
+    Karmaşıklığı veriyle budamak için — bir katman edge katmıyorsa kapatmayı düşün.
+    Saf; canlı-anlık girdiler ablate edilemez (bkz /ablation mekanik gateler içindir).
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None and isinstance(c.get("brain"), dict)]
+
+    def _verdict(sub: dict[str, Any], ref: dict[str, Any]) -> str:
+        if sub["n"] < min_layer_samples or ref.get("avg_pnl") is None or sub["avg_pnl"] is None:
+            return "yetersiz-veri"
+        return "edge+" if sub["avg_pnl"] > ref["avg_pnl"] else "edge-"
+
+    overall = _agg_pnl(rows)
+
+    # 1) Eskalasyon: Sonnet ikinci-bakış edge katıyor mu (taban = eskale olmayan)
+    esc = _escalation_accuracy(rows)
+    esc["verdict"] = _verdict(esc["escalated"], esc["base"])
+
+    # 2) Oylama: oybirliği (agreement≈1) vs bölünmüş oy sonuçları
+    voted = [c for c in rows if isinstance(c["brain"].get("vote"), dict)]
+    unanimous = [c for c in voted if float(c["brain"]["vote"].get("agreement", 0)) >= 0.999]
+    split = [c for c in voted if float(c["brain"]["vote"].get("agreement", 0)) < 0.999]
+    vote: dict[str, Any] = {"n": len(voted), "unanimous": _agg_pnl(unanimous),
+                            "split": _agg_pnl(split)}
+    vote["verdict"] = _verdict(vote["unanimous"], vote["split"])
+
+    # 3) Rekalibrasyon: ham conviction düzeltilen işlemler (conviction_raw saklı)
+    recal = [c for c in rows if c["brain"].get("conviction_raw") is not None]
+    shifts = [float(c["brain"]["conviction"]) - float(c["brain"]["conviction_raw"]) for c in recal]
+    recalibration = {**_agg_pnl(recal),
+                     "avg_shift": round(sum(shifts) / len(shifts), 3) if shifts else None}
+
+    # 4) Rubrik: hangi alt-skor boyutu P&L ile korele (sinyal taşıyor)
+    rubric = _rubric_correlation(rows)
+    noisy = [k for k, v in rubric.items() if v is None or abs(v) < 0.1]
+
+    return {
+        "samples": len(rows), "overall": overall,
+        "layers": {
+            "escalation": esc,
+            "voting": vote,
+            "recalibration": recalibration,
+            "rubric": {"correlations": rubric, "noisy_dimensions": noisy},
+        },
+        "note": "edge+ = katman taban/karşılaştırmadan daha iyi ort. P&L üretti. "
+                "Yetersiz-veri katmanlar daha çok kapanmış işlem bekliyor.",
+    }
 
 
 def _calibration_science(pairs: list[tuple[float, int]]) -> dict[str, Any]:
@@ -1657,6 +1721,7 @@ def _portfolio_heat(new_sym: str, new_side: str,
 
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None,
+                  latency_slow: bool = False,
                   price_series: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
 
@@ -1668,6 +1733,7 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
 
     `feed_stale`: haber akışı (WS) kopuk mu — güvenlik durdurması için çağıran geçirir.
     `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
+    `latency_slow`: boru hattı gecikme SLA'sı aşıldı mı — çağıran (news_bot) geçirir.
     """
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
     # Operasyonel devre kesici: anomali sonrası yeni oto-işlem durdurulmuş
@@ -1676,6 +1742,9 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # Güvenlik kapısı: akış kopukken kör girme (gerçek-zamanlı teyit güvenilmez)
     if S.halt_trade_on_stale and feed_stale:
         return no("haber akışı kopuk — güvenlik durdurması")
+    # Güvenlik kapısı: boru hattı yavaş (SLA aşıldı) — hareketin gerisinde gireriz
+    if S.halt_trade_on_latency and latency_slow:
+        return no("boru hattı gecikme SLA aşıldı — güvenlik durdurması")
     # Güvenlik kapısı: haber çok eskiyse hareket büyük olasılıkla bitmiştir
     if S.max_news_age_sec > 0 and news_age_sec is not None and news_age_sec > S.max_news_age_sec:
         return no(f"haber çok eski ({news_age_sec:.0f}s > {S.max_news_age_sec}s)")
@@ -1785,6 +1854,7 @@ def get_shadow_overrides() -> dict[str, Any]:
 
 def shadow_decision(item: Any, *, feed_stale: bool = False,
                     news_age_sec: float | None = None,
+                    latency_slow: bool = False,
                     price_series: dict[str, list[float]] | None = None
                     ) -> dict[str, Any] | None:
     """Aday ayarla (gölge) auto_decision'ı SANAL çalıştır — gerçek emir YOK, S kalıcı değil.
@@ -1799,7 +1869,7 @@ def shadow_decision(item: Any, *, feed_stale: bool = False,
     if not _shadow_overrides:
         return None
     live = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                         price_series=price_series)
+                         latency_slow=latency_slow, price_series=price_series)
     # S'i geçici override et — auto_decision iç kilitleri (_open_side_count vb.) aldığından
     # BURADA _lock TUTMA (yeniden-giriş = deadlock). Gölge, process_items'ten sıralı çağrılır.
     saved = {k: getattr(S, k) for k in _shadow_overrides}
@@ -1807,7 +1877,7 @@ def shadow_decision(item: Any, *, feed_stale: bool = False,
         for k, v in _shadow_overrides.items():
             setattr(S, k, v)
         shadow = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                               price_series=price_series)
+                               latency_slow=latency_slow, price_series=price_series)
     finally:
         for k, v in saved.items():
             setattr(S, k, v)
@@ -1859,12 +1929,13 @@ def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str,
 
 def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                      news_age_sec: float | None = None,
+                     latency_slow: bool = False,
                      brain: Any = None,
                      price_series: dict[str, list[float]] | None = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
     d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                      price_series=price_series)
+                      latency_slow=latency_slow, price_series=price_series)
     if not d["would_trade"]:
         return None
     usdt = d["usdt"]
@@ -2024,6 +2095,126 @@ def get_risk() -> dict[str, Any]:
         # Rejim adaptasyon durumu: eşik geçici sıkılaştırıldı mı
         "regime": get_regime_state(),
     }
+
+
+def preflight() -> list[dict[str, Any]]:
+    """Canlıya geçiş operasyonel ön-uçuş kontrolleri (saf — ağsız, S + env okur).
+
+    `/readiness` track-record edge'ini sorgular; bu fonksiyon AYRI bir ekseni:
+    sistem gerçek parayı riske atacak şekilde **güvenli yapılandırılmış mı**.
+    Her kontrol: name/status (ok|warn|critical|info)/detail. Canlıya geçiş için
+    'critical' eksikler bloke edicidir; paper modunda canlı-özel kontroller yine
+    'canlıya geçince gerekecek' diye gösterilir.
+
+    Trade güvenliği için `news_bot._preflight` bunu besleme-sağlığı (WS) + uzak
+    bildirim + token kontrolleriyle birleştirir ve nihai verdikt üretir.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    live = not S.paper_trading
+    add("İşlem modu", "info",
+        "CANLI — gerçek emir" if live else "PAPER — simülasyon (gerçek emir yok)")
+
+    # Canlı API anahtarları (canlıda kritik; paper'da uyarı/bilgi)
+    if has_live_keys():
+        add("Borsa API anahtarları", "ok", "BINANCE_API_KEY/SECRET tanımlı")
+    else:
+        add("Borsa API anahtarları", "critical" if live else "info",
+            "yok — canlı emir gönderilemez (.env BINANCE_API_KEY/SECRET)")
+
+    # Stop-loss güvencesi: SL/TP veya ATR çıkışı açık olmalı
+    if S.use_sl_tp and (S.stop_loss_pct > 0 or S.use_atr_exits):
+        add("Zarar durdurma (SL)", "ok",
+            f"SL=%{S.stop_loss_pct:g}" + (" + ATR" if S.use_atr_exits else ""))
+    else:
+        add("Zarar durdurma (SL)", "critical", "SL kapalı — korumasız pozisyon riski")
+
+    # Borsa-native koruyucu stop (bot çökse de korur) — canlıda kritik
+    if S.exchange_native_stops:
+        add("Borsa koruyucu stop", "ok", "canlıda borsaya DURAN SL/TP konur (çökmeye dayanıklı)")
+    else:
+        add("Borsa koruyucu stop", "critical" if live else "warn",
+            "kapalı — bot çökerse/internet giderse pozisyon korumasız")
+
+    # Anomali devre kesici
+    add("Anomali devre kesici", "ok" if S.auto_halt_on_anomaly else "warn",
+        "açık" if S.auto_halt_on_anomaly else "kapalı — emir-hata serisinde durmaz")
+
+    # Risk limitleri (sınırsız zarar/maruziyet = kritik)
+    add("Günlük zarar limiti", "ok" if S.daily_loss_limit_usdt > 0 else "critical",
+        f"{S.daily_loss_limit_usdt:g} USDT" if S.daily_loss_limit_usdt > 0
+        else "0 = SINIRSIZ günlük zarar (kill-switch yok)")
+    add("Toplam maruziyet tavanı", "ok" if S.max_total_exposure_usdt > 0 else "warn",
+        f"{S.max_total_exposure_usdt:g} USDT" if S.max_total_exposure_usdt > 0 else "0 = sınırsız")
+    add("Coin maruziyet tavanı", "ok" if S.max_per_coin_usdt > 0 else "warn",
+        f"{S.max_per_coin_usdt:g} USDT" if S.max_per_coin_usdt > 0 else "0 = sınırsız")
+
+    # Kaldıraç aklı (futures)
+    if S.market == "futures" and S.leverage > 10:
+        add("Kaldıraç", "warn", f"{S.leverage}x — yüksek; tasfiye mesafesi dar")
+    elif S.market == "futures":
+        add("Kaldıraç", "ok", f"{S.leverage}x")
+
+    # Açık devre kesici → şu an işlem açılmaz
+    halt = get_halt()
+    if halt["active"]:
+        add("Devre kesici durumu", "critical", f"AKTİF — oto-işlem durdurulmuş: {halt['reason']}")
+    else:
+        add("Devre kesici durumu", "ok", "temiz")
+
+    return checks
+
+
+def connectivity_probe() -> dict[str, Any]:
+    """Canlı borsa bağlantı probu (AĞ — auth + saat kayması + bakiye).
+
+    Gerçek emir GÖNDERMEDEN borsanın erişilebilir ve anahtarların geçerli olduğunu
+    doğrular: (1) sunucu saat kayması (imza reddi riski), (2) kimlik doğrulama,
+    (3) serbest USDT bakiyesi. Paper modda/anahtar yoksa atlar. Kritik = canlıya geçme.
+    """
+    if not has_live_keys():
+        return {"ok": False, "skipped": True, "reason": "canlı anahtar yok (.env)", "checks": []}
+    checks: list[dict[str, Any]] = []
+    ok = True
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    try:
+        ex = _get_exchange()
+    except Exception as e:
+        return {"ok": False, "skipped": False,
+                "checks": [{"check": "Borsa bağlantısı", "status": "critical",
+                            "detail": f"kurulamadı: {e}"}]}
+
+    # 1) Saat kayması: imzalı isteklerde borsa zamanıyla fark çok büyükse emir reddedilir
+    try:
+        server_ms = int(ex.fetch_time())
+        skew = abs(server_ms - int(time.time() * 1000))
+        if skew <= 1000:
+            add("Saat kayması", "ok", f"{skew} ms")
+        elif skew <= 5000:
+            add("Saat kayması", "warn", f"{skew} ms — imza reddi riski (NTP senkronla)")
+        else:
+            add("Saat kayması", "critical", f"{skew} ms — emir imzaları reddedilir (NTP senkronla)")
+            ok = False
+    except Exception as e:
+        add("Saat kayması", "warn", f"okunamadı: {e}")
+
+    # 2) Kimlik doğrulama + 3) bakiye (tek özel-uç çağrısı)
+    try:
+        bal = ex.fetch_balance() or {}
+        free = float((bal.get("free") or {}).get("USDT", 0) or 0)
+        add("Kimlik doğrulama", "ok", "anahtarlar geçerli (özel uç erişildi)")
+        add("USDT bakiye", "ok" if free > 0 else "warn", f"{free:.2f} USDT serbest")
+    except Exception as e:
+        add("Kimlik doğrulama", "critical", f"başarısız: {e}")
+        ok = False
+
+    return {"ok": ok, "skipped": False, "checks": checks}
 
 
 def daily_summary(date: str | None = None) -> dict[str, Any]:
@@ -2621,17 +2812,39 @@ def get_settings() -> dict[str, Any]:
 
 
 def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    """Ayarları uygula (transaksiyonel: reddedilirse kısmi commit YOK).
+
+    Canlı oto-işlemi ETKİNLEŞTİREN bir değişiklik + ön-uçuşta (`preflight`) kritik
+    eksik varsa GUARD-RAIL devreye girer ve değişiklik bloklanır (kör canlıya geçiş
+    önleme). Zaten canlı+oto iken diğer alanları düzenlemek bloklanmaz (kilitlenme yok).
+    """
     global _exchange
+    snapshot = {k: getattr(S, k) for k in _PERSIST_KEYS}
     market_changed = "market" in patch and patch["market"] != S.market
-    for k in _PERSIST_KEYS:
-        if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
-            setattr(S, k, patch[k])
-    if "paper_trading" in patch and patch["paper_trading"] is not None:
-        S.paper_trading = bool(patch["paper_trading"])
-    if "auto_trade" in patch and patch["auto_trade"] is not None:
-        if patch["auto_trade"] and not S.paper_trading and not has_live_keys():
-            raise RuntimeError("Canlı otomatik işlem için .env'de Binance anahtarları gerekli")
-        S.auto_trade = bool(patch["auto_trade"])
+    try:
+        for k in _PERSIST_KEYS:
+            if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
+                setattr(S, k, patch[k])
+        if "paper_trading" in patch and patch["paper_trading"] is not None:
+            S.paper_trading = bool(patch["paper_trading"])
+        if "auto_trade" in patch and patch["auto_trade"] is not None:
+            if patch["auto_trade"] and not S.paper_trading and not has_live_keys():
+                raise RuntimeError("Canlı otomatik işlem için .env'de Binance anahtarları gerekli")
+            S.auto_trade = bool(patch["auto_trade"])
+        # Guard-rail: canlı oto-işlemi ETKİNLEŞTİREN değişiklik + ön-uçuş kritik → blokla
+        enabling_live = S.auto_trade and not S.paper_trading and (
+            bool(patch.get("auto_trade")) or patch.get("paper_trading") is False)
+        if enabling_live:
+            crit = [c for c in preflight() if c["status"] == "critical"]
+            if crit:
+                raise RuntimeError(
+                    "Canlıya geçiş engellendi — ön-uçuş kritik eksik(ler): "
+                    + "; ".join(f"{c['check']} ({c['detail']})" for c in crit)
+                    + ". /preflight ile düzelt veya halt_trade_on_latency gibi kapıyı gözden geçir.")
+    except Exception:
+        for k, v in snapshot.items():   # kısmi commit'i geri al
+            setattr(S, k, v)
+        raise
     if market_changed:
         _exchange = None
     with _lock:

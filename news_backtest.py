@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import requests
 
@@ -68,6 +69,10 @@ def _signals_from_rows(rows: list[dict]) -> list[dict]:
             "symbol": n["symbol"], "direction": n["direction"], "time": t,
             "impact": n["impact"], "title": n["title"][:60],
             "source": n.get("source", "?"),
+            # Ablation/sinyal-kalitesi gateleri için taşınan opsiyonel meta (yoksa None)
+            "rel_volume": n.get("rel_volume"),
+            "price_24h_pct": n.get("price_24h_pct"),
+            "confirmed": n.get("confirmed"),
         })
     return out
 
@@ -366,6 +371,152 @@ def breakdown(results: list[dict], usdt: float = 100.0) -> dict:
         "by_impact": _group(lambda r: r.get("impact", "?")),
         "by_direction": _group(lambda r: r.get("direction", "?")),
         "by_source": _group(lambda r: r.get("source", "?")),
+    }
+
+
+def _directional_24h(r: dict) -> float | None:
+    """Arşivlenmiş 24s hareketi haber yönünde (chase-guard için). price_24h_pct yoksa None."""
+    p = r.get("price_24h_pct")
+    if p is None:
+        return None
+    return float(p) if r.get("direction") == "bullish" else -float(p)
+
+
+def _ablation_gates(chase_pct: float, rvol_min: float, high_impact: int) -> list[dict]:
+    """Mekanik gate tanımları (ad/açıklama/keep/has/settings-hint). Saf.
+
+    `settings`: gate'i canlıya uygulayan ayar fragmanı (öneri çıktısı için).
+    `ablation` ve `ablation_search` ortak bu tanımları kullanır.
+    """
+    return [
+        {"gate": f"impact>={high_impact}", "desc": "yalnız yüksek-güç haber",
+         "keep": lambda r: r.get("impact", 0) >= high_impact, "has": lambda r: True,
+         "settings": {"auto_min_impact": high_impact}},
+        {"gate": "confirmed", "desc": "yalnız fiyat-teyitli sinyal",
+         "keep": lambda r: bool(r.get("confirmed")), "has": lambda r: r.get("confirmed") is not None,
+         "settings": {"auto_require_confirm": True}},
+        {"gate": f"rvol>={rvol_min:g}", "desc": "düşük göreceli hacmi ele (fake/likiditesiz)",
+         "keep": lambda r: (r.get("rel_volume") or 0) >= rvol_min,
+         "has": lambda r: r.get("rel_volume") is not None,
+         "settings": {"min_rel_volume": rvol_min}},
+        {"gate": f"chase-guard<{chase_pct:g}%", "desc": "24s'te haber yönünde çok oynamışı ele (geç giriş)",
+         "keep": lambda r: (_directional_24h(r) or 0.0) < chase_pct,
+         "has": lambda r: r.get("price_24h_pct") is not None,
+         "settings": {"skip_already_priced_pct": chase_pct}},
+    ]
+
+
+def ablation(results: list[dict], usdt: float = 100.0, *,
+             chase_pct: float = 5.0, rvol_min: float = 1.5,
+             high_impact: int = 9, min_subset: int = 5) -> dict:
+    """Mekanik sinyal-kalitesi gatelerinin net katkısını ölç (saf, ağsız).
+
+    Beyin katmanlarının çoğu canlı-anlık girdiye (orderbook/rejim/küme) dayandığı
+    için geçmişe kurulamaz (bkz. /brain-backtest). Ama **mekanik gateler** arşiv
+    metasının deterministik fonksiyonu → her sinyal BİR KEZ simüle edilir, sonra
+    gate = hangi alt-kümeyi kabul ettiği. Pahalı kısım tek prefetch'tir.
+
+    Her gate için: `kept` (gate AÇIK alt-kümesi) + `removed` (gate'in BLOKLADIĞI
+    işlemler) özetleri + `delta_avg_pct` (ort. edge iyileşmesi) + `verdict`. Gate
+    "işe yarar" ⇔ bloklananların ort. net'i NEGATİF (kaybedeni eliyor) ve kalan
+    edge pozitif kalıyor. Verisi yetersiz (alt-küme < `min_subset`) gate atlanır.
+    """
+    base = _summarize(results, usdt)
+    base_avg = base.get("avg_net_pct", 0.0)
+    gates = _ablation_gates(chase_pct, rvol_min, high_impact)
+
+    out: list[dict] = []
+    for g in gates:
+        name, desc, keep, has = g["gate"], g["desc"], g["keep"], g["has"]
+        usable = [r for r in results if has(r)]
+        if len(usable) < min_subset:
+            out.append({"gate": name, "desc": desc, "status": "yetersiz-veri",
+                        "applicable_n": len(usable)})
+            continue
+        kept = [r for r in usable if keep(r)]
+        removed = [r for r in usable if not keep(r)]
+        if len(kept) < min_subset or len(removed) < min_subset:
+            out.append({"gate": name, "desc": desc, "status": "yetersiz-bölünme",
+                        "kept_n": len(kept), "removed_n": len(removed)})
+            continue
+        k_sum = _summarize(kept, usdt)
+        r_sum = _summarize(removed, usdt)
+        # Gate kalan işlemlerin ort. edge'ini ne kadar artırdı (uygulanabilir tabana göre)
+        u_avg = _summarize(usable, usdt).get("avg_net_pct", 0.0)
+        delta = round(k_sum["avg_net_pct"] - u_avg, 3)
+        pays = r_sum["avg_net_pct"] < 0 and k_sum["avg_net_pct"] > 0
+        out.append({
+            "gate": name, "desc": desc,
+            "status": "işe-yarar" if pays else ("nötr/zararlı" if delta <= 0 else "kısmi"),
+            "delta_avg_pct": delta,            # +: gate edge'i artırıyor
+            "kept": k_sum, "removed": r_sum,   # removed.avg_net<0 ⇒ kaybedeni eliyor
+        })
+
+    return {"baseline": base, "base_avg_net_pct": base_avg, "gates": out,
+            "note": "Yalnız mekanik gateler ablate edilir; canlı-anlık beyin girdileri "
+                    "(orderbook/rejim/küme) geçmişe kurulamaz."}
+
+
+def ablation_search(results: list[dict], usdt: float = 100.0, *,
+                    chase_pct: float = 5.0, rvol_min: float = 1.5, high_impact: int = 9,
+                    min_subset: int = 5, min_improve_pct: float = 0.05) -> dict:
+    """Açgözlü ileri-seçim: edge'i en çok artıran gate kombinasyonunu bul (saf, ağsız).
+
+    Tek-tek `ablation` her gate'i izole ölçer; bu fonksiyon gateleri BİRLİKTE arar:
+    boş kümeden başla, her adımda mevcut kalan sete uygulandığında ort. net'i en çok
+    artıran (ve **anlamlı** — kestiği işlemler ≥ `min_subset` ve net-negatif, iyileşme
+    ≥ `min_improve_pct`) gate'i ekle; iyileştiren gate kalmayınca dur. Aşırı-uydurma
+    (gürültüye gate ekleme) `min_subset`+`min_improve_pct` ile sınırlanır.
+
+    Döner: `selected` (seçilen gateler + adım metrikleri), `final` (son kept özeti),
+    `recommended_settings` (seçili gatelerin canlıya uygulanabilir ayar fragmanı),
+    `improvement_pct` (taban→son ort. net farkı).
+    """
+    base = _summarize(results, usdt)
+    gates = _ablation_gates(chase_pct, rvol_min, high_impact)
+    current = list(results)
+    selected: list[dict] = []
+    rec: dict[str, Any] = {}
+    remaining = list(gates)
+
+    while remaining:
+        best = None
+        for g in remaining:
+            # Yalnız bu gate'in uygulanabildiği (has) işlemler değerlendirilir; gerisi korunur
+            applic = [r for r in current if g["has"](r)]
+            removed = [r for r in applic if not g["keep"](r)]
+            kept = [r for r in current if not (g["has"](r) and not g["keep"](r))]
+            if len(removed) < min_subset or len(kept) < min_subset:
+                continue
+            cur_avg = _summarize(current, usdt)["avg_net_pct"]
+            new_avg = _summarize(kept, usdt)["avg_net_pct"]
+            rem_avg = _summarize(removed, usdt)["avg_net_pct"]
+            improve = new_avg - cur_avg
+            # Anlamlılık: kestikleri net-negatif olmalı + yeterli iyileşme
+            if rem_avg < 0 and improve >= min_improve_pct and (best is None or improve > best["improve"]):
+                best = {"g": g, "improve": improve, "new_avg": new_avg,
+                        "rem_avg": rem_avg, "removed_n": len(removed), "kept": kept}
+        if best is None:
+            break
+        g = best["g"]
+        selected.append({
+            "gate": g["gate"], "desc": g["desc"],
+            "step_improve_pct": round(best["improve"], 3),
+            "cut_n": best["removed_n"], "cut_avg_net_pct": round(best["rem_avg"], 3),
+            "kept_avg_net_pct": round(best["new_avg"], 3),
+        })
+        rec.update(g["settings"])
+        current = best["kept"]
+        remaining.remove(g)
+
+    final = _summarize(current, usdt)
+    improvement = round(final.get("avg_net_pct", 0.0) - base.get("avg_net_pct", 0.0), 3)
+    return {
+        "baseline": base, "final": final, "improvement_pct": improvement,
+        "selected": selected, "recommended_settings": rec,
+        "verdict": ("kombinasyon edge katıyor — ELLE uygula düşün" if selected
+                    else "hiçbir gate anlamlı iyileşme katmadı (mevcut ayar yeterli)"),
+        "note": "ÖNERİ — oto-uygulanmaz; kontrol kullanıcıda. PATCH /settings ile uygula.",
     }
 
 

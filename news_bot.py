@@ -41,6 +41,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
+import latency
+import sourcehealth
 import storage
 import trader
 from netutil import get_json, get_stats
@@ -76,6 +78,12 @@ def require_token(x_api_token: str | None = Header(default=None)) -> None:
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
+# Failover: asıl gerçek-zamanlı kaynak (TreeNews WS) bayatlayınca RSS/Binance
+# yedeği bu HIZLI aralıkta tarar (20s yerine) → kopuk realtime'da boşluğu doldur.
+SCAN_INTERVAL_FAST_SEC = int(os.environ.get("SCAN_INTERVAL_FAST_SEC", "5"))
+# Yedek kaynak sağlığı: üst üste bu kadar hata veren kaynağı geçici devre dışı bırak.
+SOURCE_FAIL_THRESHOLD = int(os.environ.get("SOURCE_FAIL_THRESHOLD", "3"))
+SOURCE_COOLDOWN_SEC = float(os.environ.get("SOURCE_COOLDOWN_SEC", "300"))
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -188,6 +196,8 @@ class NewsItem:
     atr_pct: float | None = None    # son mumların ortalama gerçek aralığı (%) — ATR çıkış için
     confirmed: bool = False         # haber + fiyat hareketi uyumlu mu
     price_note: str = ""            # teyit açıklaması
+    # gecikme ölçümü — alım anı (monotonic, serialize edilmez); boru hattı süreleri için
+    recv_monotonic: float = field(default_factory=time.monotonic, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +261,8 @@ _metrics: dict[str, int] = {
     "scan_errors_total": 0,     # arka plan tarama hatası sayısı
     "reconcile_drift_total": 0, # mutabakatta bulunan hayalet pozisyon (news_bot gözlemler)
     "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
+    "failover_scans_total": 0,  # WS bayatken hızlı yedek tarama sayısı (kaynak redundansı)
+    "source_disabled_total": 0, # üst üste hata sonrası devre dışı bırakılan yedek kaynak sayısı
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -316,6 +328,15 @@ def update_news_settings(patch: dict[str, Any]) -> dict[str, Any]:
 def fetch_rss(name: str, url: str) -> list[NewsItem]:
     items: list[NewsItem] = []
     d = feedparser.parse(url)
+    # feedparser HTTP hatasında (403/500) istisna ATMAZ — boş feed döner. Kaynak sağlık
+    # makinesinin kalıcı-bozuk feed'i yakalayabilmesi için gerçek hatayı yüzeye çıkar:
+    status = getattr(d, "status", None)
+    if isinstance(status, int) and status >= 400:
+        raise RuntimeError(f"RSS HTTP {status}")
+    # Geçerli XML olmayan yanıt (örn. blok/hata sayfası) + hiç entry yok → erişim hatası say.
+    # (Geçerli feed'in benign bozo'su [encoding vb.] entry içerir → bu dala girmez.)
+    if not d.entries and getattr(d, "bozo", False) and getattr(d, "bozo_exception", None) is not None:
+        raise RuntimeError(f"RSS erişim/ayrıştırma hatası: {d.bozo_exception}")
     for e in d.entries[:40]:
         title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()
@@ -394,18 +415,46 @@ def set_rss_feeds(feeds: dict[str, str]) -> dict[str, str]:
     return clean
 
 
+# Yedek kaynak sağlık kaydı (RSS feed'leri + Binance duyuruları için durum-makinesi)
+_source_health = sourcehealth.SourceHealth(SOURCE_FAIL_THRESHOLD, SOURCE_COOLDOWN_SEC)
+_BINANCE_SOURCE = "Binance duyuruları"
+
+
+def _on_source_result(name: str, ok: bool, error: str = "") -> None:
+    """Kaynak çekim sonucunu sağlık kaydına işle; devre dışı/toparlandı geçişlerini bildir."""
+    transition = (_source_health.record_success(name) if ok
+                  else _source_health.record_failure(name, error))
+    if transition == "disabled":
+        _metrics["source_disabled_total"] += 1
+        log.warning("Kaynak DEVRE DIŞI (üst üste hata): %s", name)
+        notify_remote(f"⚠️ KAYNAK DEVRE DIŞI: '{name}' üst üste hata verdi, geçici "
+                      f"devre dışı (cooldown). Son hata: {error[:120]}")
+    elif transition == "recovered":
+        log.info("Kaynak toparlandı: %s", name)
+        notify_remote(f"✅ KAYNAK TOPARLANDI: '{name}' yeniden çalışıyor.")
+
+
 def fetch_all(session: requests.Session) -> list[NewsItem]:
-    """Tüm kaynakları çek; biri patlarsa diğerleri devam etsin."""
+    """Tüm kaynakları çek; biri patlarsa diğerleri devam etsin.
+
+    Her kaynağın sağlığı izlenir (`_source_health`): üst üste hata veren kaynak
+    geçici DEVRE DIŞI bırakılıp atlanır (sürekli timeout'la taramayı yavaşlatmasın),
+    cooldown sonrası yeniden denenir. Geçişler uzak kanaldan bildirilir.
+    """
     out: list[NewsItem] = []
-    for name, url in get_rss_feeds().items():
+    feeds: list[tuple[str, str | None]] = list(get_rss_feeds().items())
+    feeds.append((_BINANCE_SOURCE, None))   # None = Binance duyuru kaynağı (sentinel)
+    for name, url in feeds:
+        if _source_health.is_disabled(name):
+            continue   # devre dışı: cooldown dolana dek atla
         try:
-            out.extend(fetch_rss(name, url))
+            items = (fetch_binance_announcements(session) if url is None
+                     else fetch_rss(name, url))
+            out.extend(items)
+            _on_source_result(name, True)
         except Exception as e:
-            log.warning("RSS başarısız (%s): %s", name, e)
-    try:
-        out.extend(fetch_binance_announcements(session))
-    except Exception as e:
-        log.warning("Binance duyuru başarısız: %s", e)
+            log.warning("Kaynak başarısız (%s): %s", name, e)
+            _on_source_result(name, False, str(e))
     return out
 
 
@@ -912,6 +961,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
     # Çoklu-oylama: N bağımsız çağrı → çoğunluk enter + medyan conviction (gürültü azaltma).
     # vote_count=1 ise tek çağrı (eski davranış). Bağımsızlık: aynı model, ayrı API çağrıları.
     n_votes = max(1, trader.S.brain_vote_count)
+    _t_brain = time.monotonic()
     r, vote = _brain_vote(client, ENTRY_BRAIN_MODEL, ctx, n_votes)
     model_used, escalated = ENTRY_BRAIN_MODEL, False
     # İki-kademeli: kararsız bantta daha güçlü modele ikinci bakış (nihai karar onun)
@@ -938,6 +988,9 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
     }
     if vote is not None:
         out["vote"] = vote   # şeffaflık: oy sayısı + enter-oranı + oybirliği
+    if not backtest:
+        # Beyin (Claude) çağrı gecikmesi — Tier-2'de asıl maliyet; eskalasyon/oylama dahil
+        latency.record("brain", (time.monotonic() - _t_brain) * 1000.0)
     return out
 
 
@@ -1379,6 +1432,29 @@ def _parse_time(s: str | None) -> datetime | None:
         return None
 
 
+def _source_bucket(item: NewsItem) -> str:
+    """Kaynak adını kaba bir kategoriye indir (gecikme kırılımı; kardinalite kontrolü)."""
+    s = (item.source or "").lower()
+    if s.startswith("⚡") or "tree" in s:
+        return "treenews"
+    if "binance" in s:
+        return "binance"
+    return "rss"
+
+
+def _ingest_ms(item: NewsItem) -> float | None:
+    """Kaynak yayını → bot alımı gecikmesi (ms). published bilinmiyorsa None.
+
+    TreeNews/RSS yayın zamanı ile bizim alım (fetched_at) zamanımız arasındaki fark:
+    kaynak + ağ gecikmesini ölçer. Saat kayması negatif verirse tracker yok sayar.
+    """
+    pub = _parse_time(item.published)
+    recv = _parse_time(item.fetched_at)
+    if pub is None or recv is None:
+        return None
+    return (recv - pub).total_seconds() * 1000.0
+
+
 def _too_old(item: NewsItem) -> bool:
     t = _parse_time(item.published) or _parse_time(item.fetched_at)
     if t is None:
@@ -1441,7 +1517,7 @@ def _portfolio_series(item: NewsItem) -> dict[str, list[float]] | None:
 def _trade_context(item: NewsItem) -> dict[str, Any]:
     """Oto-işlem güvenlik kapıları için bağlam (akış durumu + haber yaşı + portföy serisi)."""
     return {"feed_stale": _ws_feed_stale(), "news_age_sec": _news_age_sec(item),
-            "price_series": _portfolio_series(item)}
+            "latency_slow": bool(_latency_breaches()), "price_series": _portfolio_series(item)}
 
 
 def _prune_news() -> None:
@@ -1497,6 +1573,12 @@ def process_items(
     if not new_items:
         return 0, 0
 
+    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı
+    for it in new_items:
+        ms = _ingest_ms(it)
+        latency.record("ingest", ms)
+        latency.record_source(_source_bucket(it), ms)
+
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
 
@@ -1523,8 +1605,10 @@ def process_items(
 
     # Faz 2 — Claude ile rafine et (nihai skor); hata olursa kural skoru geçerli kalır
     if USE_CLAUDE:
+        _t_score = time.monotonic()
         try:
             score_with_claude(new_items)
+            latency.record("score", (time.monotonic() - _t_score) * 1000.0)
         except Exception as e:
             log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
 
@@ -1535,7 +1619,10 @@ def process_items(
     # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
     alerts = [it for it in new_items if it.impact >= threshold]
     _metrics["alerts_total"] += len(alerts)
-    _confirm_alerts(session, alerts)   # paralel fiyat teyidi (çoklu alert'te hız)
+    if alerts:
+        _t_confirm = time.monotonic()
+        _confirm_alerts(session, alerts)   # paralel fiyat teyidi (çoklu alert'te hız)
+        latency.record("confirm", (time.monotonic() - _t_confirm) * 1000.0)
 
     if allow_notify:
         for it in alerts:
@@ -1543,8 +1630,13 @@ def process_items(
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
             _log_shadow_decision(it)    # A/B: aday ayar bu sinyalde ne karar verirdi (sanal)
+            _t_order = time.monotonic()
             pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
             if pos:
+                # Gecikme: karar→emir + uçtan uca alım→emir (manşet aksiyon gecikmesi)
+                _now_mono = time.monotonic()
+                latency.record("order", (_now_mono - _t_order) * 1000.0)
+                latency.record("pipeline", (_now_mono - it.recv_monotonic) * 1000.0)
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
@@ -1622,6 +1714,17 @@ def refresh(session: requests.Session) -> None:
             _status["updated_at"] = _now_iso()
 
 
+def _scan_interval(now: float | None = None) -> int:
+    """Yedek tarama aralığı: asıl realtime kaynak (WS) bayatsa HIZLI, yoksa normal. Saf.
+
+    TreeNews WS kopuk/sessizse RSS+Binance yedeği boşluğu doldurmak için sıklaşır
+    (kaynak redundansı). WS sağlıklıyken normal cadence — gereksiz API yükü yok.
+    """
+    if _ws_feed_stale(now):
+        return min(SCAN_INTERVAL_FAST_SEC, SCAN_INTERVAL_SEC)
+    return SCAN_INTERVAL_SEC
+
+
 def _background_loop(stop: threading.Event) -> None:
     session = requests.Session()
     session.headers.setdefault("User-Agent", "kripto-haber-bot/1.0")
@@ -1629,7 +1732,10 @@ def _background_loop(stop: threading.Event) -> None:
         refresh(session)
         _maybe_daily_digest()      # gün dönümünde dünün özetini gönder
         _maybe_deadman_alert()     # haber akışı durduysa uyar (ölü-adam anahtarı)
-        if stop.wait(SCAN_INTERVAL_SEC):
+        interval = _scan_interval()
+        if interval < SCAN_INTERVAL_SEC:   # failover: WS bayat → hızlı yedek tarama
+            _metrics["failover_scans_total"] += 1
+        if stop.wait(interval):
             break
 
 
@@ -2024,6 +2130,10 @@ _METRIC_META = {
     "botpy_order_rejects_total": ("counter", "Borsa emir red/dolmama (canlı)"),
     "botpy_reconcile_drift_total": ("counter", "Mutabakatta bulunan hayalet pozisyon"),
     "botpy_protect_errors_total": ("counter", "Borsa koruyucu stop konamadı"),
+    "botpy_failover_scans_total": ("counter", "WS bayatken hızlı yedek tarama (failover)"),
+    "botpy_backup_scan_interval_seconds": ("gauge", "Aktif yedek tarama aralığı (failover'da düşer)"),
+    "botpy_source_disabled_total": ("counter", "Üst üste hatada devre dışı bırakılan yedek kaynak"),
+    "botpy_sources_disabled": ("gauge", "Şu an devre dışı yedek kaynak sayısı"),
     "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
     "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
@@ -2036,7 +2146,11 @@ _METRIC_META = {
 
 
 def _render_metrics(values: dict[str, int | float]) -> str:
-    """Prometheus exposition formatı (saf)."""
+    """Prometheus exposition formatı (saf).
+
+    Kayıtlı metrikler `_METRIC_META`'dan; dinamik `botpy_latency_*` gauge'leri
+    (aşama × istatistik kombinasyonu) jenerik olarak yayınlanır.
+    """
     lines = []
     for name, (mtype, help_text) in _METRIC_META.items():
         if name not in values:
@@ -2044,6 +2158,11 @@ def _render_metrics(values: dict[str, int | float]) -> str:
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} {mtype}")
         lines.append(f"{name} {values[name]}")
+    for name in sorted(values):
+        if name.startswith("botpy_latency_"):
+            lines.append(f"# HELP {name} Boru hattı gecikme metriği (ms)")
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name} {values[name]}")
     return "\n".join(lines) + "\n"
 
 
@@ -2066,6 +2185,10 @@ def metrics() -> PlainTextResponse:
         "botpy_order_rejects_total": trader._order_rejects,
         "botpy_reconcile_drift_total": _metrics["reconcile_drift_total"],
         "botpy_protect_errors_total": _metrics["protect_errors_total"],
+        "botpy_failover_scans_total": _metrics["failover_scans_total"],
+        "botpy_backup_scan_interval_seconds": _scan_interval(),
+        "botpy_source_disabled_total": _metrics["source_disabled_total"],
+        "botpy_sources_disabled": sum(1 for v in _source_health.snapshot().values() if v["disabled"]),
         "botpy_halts_total": trader._halts,
         "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
@@ -2078,7 +2201,44 @@ def metrics() -> PlainTextResponse:
     net = get_stats()
     values["botpy_rate_limited_total"] = net["rate_limited"]
     values["botpy_http_retries_total"] = net["retries"]
+    values.update(latency.get_metrics())   # boru hattı gecikme gauge'leri (p50/p95/max/count)
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
+
+
+# Boru hattı gecikme SLA'ları (p95 ms) — aşılırsa "yavaş" sayılır (env ile ayarlanır).
+# Haber-trade'de yavaş boru hattı = hareketin gerisinde giriş; preflight/health uyarır.
+LATENCY_SLA_MS: dict[str, float] = {
+    "ingest": float(os.environ.get("SLA_INGEST_MS", "8000")),    # kaynak→bot (besleme+ağ)
+    "score": float(os.environ.get("SLA_SCORE_MS", "6000")),      # Claude puanlama batch
+    "brain": float(os.environ.get("SLA_BRAIN_MS", "9000")),      # giriş beyni (eskalasyon/oylama)
+    "confirm": float(os.environ.get("SLA_CONFIRM_MS", "5000")),  # fiyat teyidi
+    "pipeline": float(os.environ.get("SLA_PIPELINE_MS", "12000")),  # alım→emir uçtan uca
+}
+
+
+def _latency_sla() -> dict[str, dict[str, Any]]:
+    """Aşama p95'lerini SLA'larla kıyasla (yeterli örneği olanlar)."""
+    return latency.evaluate_sla(latency.summary(), LATENCY_SLA_MS)
+
+
+def _latency_breaches() -> list[str]:
+    """SLA'yı aşan (yavaş) aşama adları."""
+    return [s for s, v in _latency_sla().items() if not v["ok"]]
+
+
+@app.get("/latency")
+def latency_report() -> dict[str, Any]:
+    """Boru hattı gecikme özeti (ms) — haber-trade'in gerçek edge'i.
+
+    Aşamalar: ingest (kaynak→bot), score (Claude puanlama), brain (giriş beyni
+    çağrısı — Tier-2'de asıl maliyet), confirm (fiyat teyidi), order (karar→emir),
+    pipeline (alım→emir uçtan uca). Her aşama count/avg/p50/p95/max/last. `by_source`:
+    kaynak-bazlı ingest kırılımı (hangi besleme yavaş). `sla`: p95'in eşiği aşıp aşmadığı.
+    """
+    sla = _latency_sla()
+    return {"stages": latency.summary(), "by_source": latency.source_summary(),
+            "sla": sla, "sla_ok": all(v["ok"] for v in sla.values()),
+            "breaches": [s for s, v in sla.items() if not v["ok"]]}
 
 
 @app.get("/health")
@@ -2098,11 +2258,27 @@ def health() -> dict[str, Any]:
         "ws_connected": _ws_state["connected"],
         "ws_last_msg_age_sec": _ws_last_msg_age(),
         "feed_stale": _ws_feed_stale(),
+        "backup_scan_interval_sec": _scan_interval(),   # failover'da düşer (hızlı yedek tarama)
+        "latency_breaches": _latency_breaches(),         # SLA aşan boru hattı aşamaları (yavaş)
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],
         "halt_reason": trader.get_halt()["reason"],
     }
+
+
+@app.get("/sources-health")
+def sources_health() -> dict[str, Any]:
+    """Yedek kaynak (RSS + Binance) sağlık kaydı: hangi kaynak çalışıyor/devre dışı.
+
+    Üst üste hata veren kaynak geçici devre dışı bırakılır (cooldown sonrası yeniden
+    denenir); `disabled`=şu an atlanıyor, `retry_in_sec`=ne zaman tekrar denenecek,
+    `consecutive_fails`/`total_*`=istatistik. Asıl realtime kaynak (WS) için /health."""
+    snap = _source_health.snapshot()
+    return {"sources": snap,
+            "disabled": [n for n, v in snap.items() if v["disabled"]],
+            "n_sources": len(snap),
+            "n_disabled": sum(1 for v in snap.values() if v["disabled"])}
 
 
 @app.get("/risk")
@@ -2263,6 +2439,59 @@ def scorecard(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int 
         if not signals:
             return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
         return {"ok": True, **nbt.signal_scorecard(signals)}
+
+
+@app.get("/ablation")
+def ablation(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
+             sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
+             chase_pct: float = 5.0, rvol_min: float = 1.5) -> dict[str, Any]:
+    """Mekanik sinyal-kalitesi gatelerinin net katkısı — "hangi filtre gerçekten para kazandırıyor?"
+
+    Her arşiv sinyali BİR KEZ simüle edilir (SL/TP), sonra her gate (impact eşiği /
+    fiyat-teyidi / RVOL / chase-guard) AÇIK vs KAPALI kıyaslanır: bloklanan işlemlerin
+    ort. net'i negatifse gate kaybedeni eliyor = işe yarıyor. Karmaşıklığı veriyle budamak
+    için. Beyin katmanları canlı-anlık girdiye dayandığından ablate EDİLMEZ (bkz /brain-backtest).
+    Ağ-yoğun (klines indirir), aynı anda tek koşar."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        results = nbt.simulate_all(signals, sl, tp, fee)
+        if not results:
+            return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
+        return {"ok": True, **nbt.ablation(results, usdt, chase_pct=chase_pct, rvol_min=rvol_min)}
+
+
+@app.get("/ablation/search")
+def ablation_search(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
+                    sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
+                    chase_pct: float = 5.0, rvol_min: float = 1.5,
+                    min_improve_pct: float = 0.05) -> dict[str, Any]:
+    """Açgözlü çok-gate araması: edge'i en çok artıran gate KOMBİNASYONU + uygulanabilir öneri.
+
+    `/ablation` her gate'i izole ölçer; bu gateleri BİRLİKTE arar (ileri-seçim): boş kümeden
+    başlar, her adımda anlamlı iyileşme (kestiği işlemler net-negatif + ≥`min_improve_pct`)
+    katan gate'i ekler. `recommended_settings` = canlıya ELLE uygulanabilir ayar fragmanı
+    (oto-uygulanmaz). Ağ-yoğun, _heavy_guard."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        results = nbt.simulate_all(signals, sl, tp, fee)
+        if not results:
+            return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
+        return {"ok": True, **nbt.ablation_search(results, usdt, chase_pct=chase_pct,
+                                                  rvol_min=rvol_min, min_improve_pct=min_improve_pct)}
 
 
 def _run_backtest_impl(
@@ -2627,6 +2856,120 @@ def readiness() -> dict[str, Any]:
                     "+ /brain-veto-review (avg_net<0)."}
 
 
+_PREFLIGHT_RANK = {"critical": 3, "warn": 2, "info": 1, "ok": 0}
+
+
+def _preflight_checks(probe: bool = False) -> list[dict[str, Any]]:
+    """Ön-uçuş kontrol listesini derle: trader ops + besleme/gecikme/bildirim/token
+    (+ probe=True ise canlı bağlantı probu, AĞ)."""
+    checks = trader.preflight()
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"check": name, "status": status, "detail": detail})
+
+    # Besleme sağlığı: WS kopuk/bayatsa kör giriş riski (oto-işlem kapısı da bunu kullanır)
+    if not USE_TREENEWS:
+        add("Haber beslemesi (WS)", "warn", "TreeNews kapalı — yalnız RSS/polling yedek")
+    elif _ws_feed_stale():
+        add("Haber beslemesi (WS)", "critical",
+            f"BAYAT/KOPUK — son mesaj {_ws_last_msg_age()}s önce (kör giriş riski)")
+    elif _ws_state.get("connected"):
+        add("Haber beslemesi (WS)", "ok", f"bağlı — son mesaj {_ws_last_msg_age()}s önce")
+    else:
+        add("Haber beslemesi (WS)", "warn", "henüz bağlanmadı (başlangıç grace)")
+
+    # Boru hattı gecikmesi: yavaşsa hareketin gerisinde gireriz (SLA p95 kontrolü)
+    breaches = _latency_breaches()
+    if breaches:
+        add("Boru hattı gecikmesi (SLA)", "critical" if trader.S.halt_trade_on_latency else "warn",
+            f"YAVAŞ — SLA aşan aşama(lar): {', '.join(breaches)}"
+            + (" (oto-işlem durdurulur)" if trader.S.halt_trade_on_latency else ""))
+    else:
+        add("Boru hattı gecikmesi (SLA)", "ok", "tüm aşamalar SLA içinde")
+
+    # Uzak bildirim: masadan uzaktayken sinyal/uyarı alabilmek için
+    add("Uzak bildirim (Telegram/Discord)",
+        "ok" if getattr(_notifier, "enabled", False) else "warn",
+        "etkin" if getattr(_notifier, "enabled", False)
+        else "kapalı — masadan uzaktayken uyarı/işlem bildirimi gelmez")
+
+    # Mutasyon uçları koruması (sunucu dışa açılırsa)
+    add("API token koruması", "ok" if API_TOKEN else "info",
+        "ayarlı (mutasyon uçları korumalı)" if API_TOKEN
+        else "yok — yerel kullanımda sorun değil; sunucu dışa açılırsa ayarla")
+
+    # Canlı bağlantı probu (AĞ — auth/saat/bakiye); yalnız istenirse
+    if probe:
+        pr = trader.connectivity_probe()
+        if pr.get("skipped"):
+            add("Canlı bağlantı probu", "info", pr.get("reason", "atlandı (paper/anahtar yok)"))
+        else:
+            for c in pr.get("checks", []):
+                add(f"Canlı: {c['check']}", c["status"], c["detail"])
+    return checks
+
+
+def _preflight_verdict(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Kontrol listesinden verdikt + sayım üret (saf)."""
+    worst = max((_PREFLIGHT_RANK.get(c["status"], 0) for c in checks), default=0)
+    if worst >= 3:
+        verdict = "CANLIYA HAZIR DEĞİL — kritik güvenlik eksiği var (aşağıyı düzelt)"
+    elif worst == 2:
+        verdict = "DİKKATLE — bloke edici yok ama uyarıları gözden geçir"
+    else:
+        verdict = "OPERASYONEL OLARAK HAZIR — edge için ayrıca /readiness + /brain-backtest"
+    counts = {s: sum(1 for c in checks if c["status"] == s)
+              for s in ("critical", "warn", "info", "ok")}
+    return {"verdict": verdict, "counts": counts}
+
+
+@app.get("/preflight")
+def preflight(probe: bool = False) -> dict[str, Any]:
+    """Canlıya geçiş operasyonel ön-uçuş: sistem gerçek parayı riske atacak şekilde
+    GÜVENLİ yapılandırılmış mı (anahtarlar/koruyucu-stop/risk-limitleri/besleme/bildirim).
+
+    `/readiness` track-record edge'ini (strateji yeterince iyi mi) sorgular; bu ayrı bir
+    eksen — ops/konfig güvenliği. `probe=true`: canlı borsa bağlantı probu da koşar
+    (auth/saat-kayması/bakiye — AĞ). 'critical' eksik = canlıya geçme (PATCH /settings
+    canlı oto-işlemi de bu kritiklerde bloklar)."""
+    checks = _preflight_checks(probe=probe)
+    res = _preflight_verdict(checks)
+    return {**res, "paper_trading": trader.S.paper_trading, "checks": checks,
+            "note": "Bu operasyonel/konfig güvenliği ölçer; strateji edge'i için /readiness."}
+
+
+@app.get("/golive")
+def golive(probe: bool = False) -> dict[str, Any]:
+    """Canlıya hazırlık kokpiti: iki ekseni TEK verdiktte birleştirir —
+    (a) **edge** (`/readiness`: track-record yeterince iyi mi) + (b) **operasyonel
+    güvenlik** (`/preflight`: sistem güvenli yapılandırılmış mı). `probe=true` canlı
+    bağlantı probunu da koşar (AĞ).
+
+    Nihai verdikt iki tarafın EN KÖTÜSÜdür: ops'ta kritik VEYA edge HENÜZ DEĞİL ise
+    canlıya geçme. İkisi de yeşilse → MİNİK canlı başlat (kontrol kullanıcıda)."""
+    pre_checks = _preflight_checks(probe=probe)
+    pre = _preflight_verdict(pre_checks)
+    rd = readiness()
+    ops_critical = pre["counts"]["critical"] > 0
+    edge_ok = rd["verdict"].startswith("UMUT VERİCİ")
+    edge_blocked = rd["verdict"].startswith(("HENÜZ DEĞİL", "VERİ YETERSİZ"))
+    if ops_critical:
+        verdict = "CANLIYA GEÇME — operasyonel kritik eksik (bkz preflight)"
+    elif edge_blocked:
+        verdict = f"CANLIYA GEÇME — edge hazır değil ({rd['verdict'].split('—')[0].strip()})"
+    elif edge_ok and pre["counts"]["warn"] == 0:
+        verdict = "HAZIR — MİNİK canlı başlatmayı düşün (kontrol sende)"
+    else:
+        verdict = "NEREDEYSE — uyarıları gözden geçir; edge'i /brain-backtest ile doğrula"
+    return {
+        "verdict": verdict,
+        "operational": {**pre, "checks": pre_checks},
+        "edge": rd,
+        "blockers": [c for c in pre_checks if c["status"] == "critical"],
+        "note": "PATCH /settings canlı oto-işlemi operasyonel kritiklerde otomatik bloklar.",
+    }
+
+
 @app.get("/halt")
 def get_halt() -> dict[str, Any]:
     """Operasyonel devre kesici durumu (anomalide oto-işlem durdurulur)."""
@@ -2644,6 +2987,15 @@ def brain_scorecard() -> dict[str, Any]:
     """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).
     `calibrated` = yüksek konviksiyon daha yüksek ort. P&L üretiyor mu (beyin edge katıyor mu)."""
     return trader.brain_scorecard()
+
+
+@app.get("/brain-attribution")
+def brain_attribution() -> dict[str, Any]:
+    """Beyin KATMAN atıfı: hangi katman (eskalasyon/oylama/rekalibrasyon/rubrik) gerçek
+    kapanmış işlemlerde edge katıyor — tek konsolide rapor. `/ablation` mekanik gateleri
+    ölçer; bu beyin katmanlarını ölçer. Her katman: edge+/edge-/yetersiz-veri verdikti.
+    Karmaşıklığı veriyle budamak için (edge katmayan katmanı kapatmayı düşün)."""
+    return trader.brain_attribution()
 
 
 @app.get("/brain-log")

@@ -162,6 +162,11 @@ type Readiness = {
   verdict: string; samples: number; win_rate: number | null; profit_factor: number | null;
   max_drawdown: number | null; checks: ReadinessCheck[]; note: string;
 };
+type ComplexityLayer = { layer: string; category: "structural" | "data-ready" | "premature"; needs_trades: number | null };
+type Complexity = {
+  closed_trades: number; n_active_layers: number; active_layers: ComplexityLayer[];
+  premature: string[]; claude_cost: { calls_per_qualifying_entry: number }; verdict: string; advice: string[];
+};
 type PreflightCheck = { check: string; status: "ok" | "warn" | "critical" | "info"; detail: string };
 type GoLive = {
   verdict: string;
@@ -583,6 +588,7 @@ export default function App() {
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [complexity, setComplexity] = useState<Complexity | null>(null);
   const [golive, setGolive] = useState<GoLive | null>(null);
   const [srcHealth, setSrcHealth] = useState<SourcesHealth | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
@@ -617,7 +623,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes, cxRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -638,6 +644,7 @@ export default function App() {
         fetch(`${API_BASE}/latency`),
         fetch(`${API_BASE}/latency/history?stage=pipeline&hours=24`),
         fetch(`${API_BASE}/events?limit=30`),
+        fetch(`${API_BASE}/complexity`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -680,6 +687,7 @@ export default function App() {
       if (latRes.ok) setLatency(await latRes.json());
       if (latHistRes.ok) setLatencyHist((await latHistRes.json()).points ?? []);
       if (evRes.ok) setOpsEvents(await evRes.json());
+      if (cxRes.ok) setComplexity(await cxRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2043,6 +2051,39 @@ export default function App() {
                   ))}
                 </div>
                 <p className="mt-2 text-[11px] text-zinc-500">{golive.note}</p>
+              </div>
+            )}
+            {complexity && (
+              <div className="mt-3 border-t border-zinc-700/50 pt-2">
+                <div className="mb-1 flex flex-wrap items-baseline gap-2">
+                  <span className="text-xs font-bold text-white">🧪 Karmaşıklık denetimi</span>
+                  <span className={`text-xs font-semibold ${
+                    complexity.verdict.startsWith("ERKEN") ? "text-red-300"
+                      : complexity.verdict.startsWith("İZLE") ? "text-amber-300" : "text-emerald-300"}`}>
+                    {complexity.verdict}
+                  </span>
+                  <span className="text-[11px] text-zinc-500">
+                    {complexity.n_active_layers} aktif katman · {complexity.closed_trades} işlem
+                    {complexity.claude_cost.calls_per_qualifying_entry > 0 ? ` · ~${complexity.claude_cost.calls_per_qualifying_entry} Claude/aday` : ""}
+                  </span>
+                </div>
+                {complexity.active_layers.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 text-[11px]">
+                    {complexity.active_layers.map((l) => (
+                      <span key={l.layer} className={`rounded px-1.5 py-0.5 ${
+                        l.category === "premature" ? "bg-red-900/50 text-red-200"
+                          : l.category === "data-ready" ? "bg-emerald-900/40 text-emerald-200" : "bg-zinc-800 text-zinc-400"}`}
+                        title={l.category === "premature" ? `Veri yetersiz (≥${l.needs_trades} gerekli)` : l.category}>
+                        {l.category === "premature" ? "⚠ " : ""}{l.layer}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {complexity.advice.length > 0 && (
+                  <ul className="mt-1.5 text-[11px] text-amber-300/80">
+                    {complexity.advice.map((a, i) => <li key={i}>• {a}</li>)}
+                  </ul>
+                )}
               </div>
             )}
           </div>

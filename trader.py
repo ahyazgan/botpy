@@ -2168,6 +2168,82 @@ def preflight() -> list[dict[str, Any]]:
     return checks
 
 
+def complexity_audit(closed_n: int) -> dict[str, Any]:
+    """Karmaşıklık/overfitting denetimi: aktif opt-in katmanları kanıtla kıyasla (saf).
+
+    `/ablation` mekanik gateleri, `/brain-attribution` beyin katmanlarını GERÇEK sonuçla
+    ölçer; bu fonksiyon ondan ÖNCE gelir — "elimdeki veri bu katmanı açmaya yeter mi?".
+    Her aktif (ON) katman sınıflanır: `structural` (geçmiş veri gerektirmez, çalışır) /
+    `data-ready` (veri-aç katman + yeterli kapanmış işlem var) / `premature` (veri-aç
+    ama örnek yetersiz → no-op veya gürültüden öğrenme). Claude maliyet çarpanı hesaplanır.
+
+    `closed_n`: kapanmış gerçek işlem sayısı (kanıt tabanı). 'premature' katman = erken
+    karmaşıklık → veri birikene dek kapat. Yalın çekirdek (eşik+teyit+SL/TP) hep güvenli.
+    """
+    # (flag, etiket, gereken_min_işlem|None=yapısal, kategori-ipucu)
+    registry: list[tuple[bool, str, int | None]] = [
+        (S.size_by_kelly, "Kelly boyutlama", S.kelly_min_trades),
+        (S.brain_recalibrate, "Conviction rekalibrasyon", S.brain_recalibrate_min),
+        (S.suppress_losing_sources, "Kaynak susturma", S.min_source_samples),
+        (S.use_learned_vetoes, "Öğrenilmiş vetolar", 20),
+        (S.brain_self_improve, "Beyin kendini-iyileştirme", 15),
+        (S.regime_adapt, "Rejim adaptasyonu", 10),
+        (S.auto_tune, "Oto-kalibrasyon (auto_tune)", 20),
+        (S.brain_vote_count > 1, f"Çoklu-oylama (×{S.brain_vote_count})", 30),
+        # yapısal (geçmiş veri gerektirmez — çalışır, ama hâlâ karmaşıklık)
+        (S.size_by_impact, "Güç-bazlı boyutlama", None),
+        (S.size_by_volume, "Hacim-bazlı boyutlama", None),
+        (S.rvol_scale_by_impact, "İmpact-ölçekli RVOL", None),
+        (S.risk_parity, "Risk-eşitleme", None),
+        (S.portfolio_risk, "Portföy-ısı boyutlama", None),
+        (S.use_entry_brain, "Giriş beyni (canlı-girdi, offline doğrulanamaz)", None),
+        (S.brain_escalate, "Beyin eskalasyonu", None),
+    ]
+    active: list[dict[str, Any]] = []
+    premature: list[str] = []
+    for on, label, need in registry:
+        if not on:
+            continue
+        if need is None:
+            cat = "structural"
+        elif closed_n >= need:
+            cat = "data-ready"
+        else:
+            cat = "premature"
+            premature.append(f"{label} (≥{need} işlem gerekli, {closed_n} var)")
+        active.append({"layer": label, "category": cat, "needs_trades": need})
+
+    # Claude maliyet çarpanı (gate'leri geçen aday başına giriş-beyni çağrısı)
+    per_entry: float = (max(1, S.brain_vote_count) if S.use_entry_brain else 0)
+    if S.use_entry_brain and S.brain_escalate:
+        per_entry += 0.3   # kararsız bantta ara sıra ikinci (güçlü) model çağrısı
+    claude = {"entry_brain": S.use_entry_brain, "vote_count": S.brain_vote_count,
+              "escalate": S.brain_escalate, "calls_per_qualifying_entry": round(per_entry, 1)}
+
+    n_active = len(active)
+    if premature:
+        verdict = (f"ERKEN KARMAŞIKLIK — {len(premature)} katman veri yetersizken aktif "
+                   "(no-op/gürültü riski)")
+    elif n_active >= 6 and closed_n < 30:
+        verdict = "İZLE — çok sayıda katman aktif, kanıt tabanı henüz ince"
+    elif n_active == 0:
+        verdict = "YALIN — saf mekanik çekirdek (eşik+teyit+SL/TP)"
+    else:
+        verdict = "DİSİPLİNLİ — aktif katmanlar yapısal veya veriyle destekli"
+
+    advice = [f"Kapat: {p}" for p in premature]
+    if per_entry >= 3:
+        advice.append(f"Claude maliyeti yüksek: aday başına ~{per_entry} çağrı "
+                      "(oylama/eskalasyon) — edge kanıtlanana dek azalt.")
+    return {
+        "closed_trades": closed_n, "n_active_layers": n_active,
+        "active_layers": active, "premature": premature,
+        "claude_cost": claude, "verdict": verdict, "advice": advice,
+        "note": "Yalın taban (lean preset) için güvenli başlangıç; katmanları edge "
+                "kanıtlandıkça (bkz /ablation, /brain-attribution) geri ekle.",
+    }
+
+
 def connectivity_probe() -> dict[str, Any]:
     """Canlı borsa bağlantı probu (AĞ — auth + saat kayması + bakiye).
 
@@ -2923,6 +2999,28 @@ PRESETS: dict[str, dict[str, Any]] = {
         "min_rel_volume": 0.0,
         "max_book_frac": 0.0,
         "tier1_skip_confirm_impact": 0,
+    },
+    # MİNİMAL UYGULANABİLİR STRATEJİ: saf mekanik çekirdek — puanla → impact eşiği →
+    # teyit → SL/TP. Tüm spekülatif/öğrenen/boyutlandırma katmanları KAPALI. "Önce
+    # edge'i kanıtla, sonra ekle" disiplini için açık taban (news preset'ine A/B temeli).
+    # Güvenlik altyapısı (native-stop/halt-gate'ler) preset DIŞIDIR — hep açık kalır.
+    "lean": {
+        "stop_loss_pct": 3.0, "take_profit_pct": 6.0, "auto_require_confirm": True,
+        # çıkış: yalnız sabit SL/TP (akıllı çıkış ek katmanları kapalı)
+        "breakeven_pct": 0.0, "partial_tp_pct": 0.0, "trailing_stop_pct": 0.0,
+        "time_stop_min": 0, "partial_tp_levels": "",
+        "use_atr_exits": False, "use_atr_trailing": False,
+        # boyutlama: düz trade_usdt (güç/hacim/Kelly/risk-parity/portföy katmanları kapalı)
+        "size_by_impact": False, "size_by_volume": False, "size_by_kelly": False,
+        "risk_parity": False, "portfolio_risk": False, "rvol_scale_by_impact": False,
+        # giriş beyni yığını kapalı (Claude maliyeti + doğrulanamaz karmaşıklık)
+        "use_entry_brain": False, "brain_escalate": False, "brain_vote_count": 1,
+        "brain_recalibrate": False, "brain_self_improve": False,
+        # öğrenen/uyarlayan katmanlar kapalı (veri birikene dek gürültü)
+        "suppress_losing_sources": False, "use_learned_vetoes": False,
+        "regime_adapt": False, "auto_tune": False,
+        # kapılar: refleks/RVOL/book-frac kapalı (saf eşik+teyit)
+        "tier1_skip_confirm_impact": 0, "min_rel_volume": 0.0, "max_book_frac": 0.0,
     },
 }
 

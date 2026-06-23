@@ -43,7 +43,11 @@ class Settings:
     paper_trading: bool = True       # True = simülasyon
     auto_trade: bool = False         # otomatik işlem
     market: str = "spot"             # "spot" | "futures"
-    trade_usdt: float = 100.0        # pozisyon başına USDT
+    trade_usdt: float = 100.0        # pozisyon başına USDT (sabit taban; risk_per_trade_pct kapalıyken)
+    # Yüzde-bazlı risk: >0 ise pozisyon TABANI = sermayenin bu %'sini SL'de riske atacak
+    # şekilde boyutlanır (sabit lot yerine bakiyeye oranlı). Sermaye = account_equity_usdt
+    # + kümülatif realized (P&L ile birleşik). trade_usdt'yi geçersiz kılar.
+    risk_per_trade_pct: float = 0.0
     leverage: int = 1                # yalnızca futures
     max_positions: int = 20
     auto_min_impact: int = 8
@@ -144,7 +148,7 @@ _order_rejects = 0         # toplam oto-emir red/dolmama (gözlemlenebilirlik)
 _halts = 0                 # devre kesici toplam tetiklenme
 
 _PERSIST_KEYS = (
-    "paper_trading", "auto_trade", "market", "trade_usdt", "leverage",
+    "paper_trading", "auto_trade", "market", "trade_usdt", "risk_per_trade_pct", "leverage",
     "max_positions", "auto_min_impact", "auto_require_confirm",
     "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
     "brain_self_improve", "brain_recalibrate", "brain_recalibrate_min",
@@ -1815,7 +1819,14 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
             return no(f"funding maliyeti yüksek (%{cost:+.3f} > %{S.max_funding_rate_pct})")
     # Boyut: conviction (güce göre) × Kelly (kazanma matematiği) × likidite katmanı
     # (hacme göre) × kayıp serisi freni × risk-eşitleme (SL mesafesine göre).
-    usdt = S.trade_usdt
+    # Taban: yüzde-bazlı risk açıksa sermayenin %'sini SL'de riske at (sabit lot yerine),
+    # değilse sabit trade_usdt. Yüzde-bazlı taban zaten SL-normalize olduğundan risk-eşitleme
+    # (risk_parity) onunla birlikte uygulanmaz (çift-sayım önleme).
+    eff_stop = _effective_stop_pct(getattr(item, "atr_pct", None))
+    if S.risk_per_trade_pct > 0:
+        usdt = _risk_per_trade_base(eff_stop)
+    else:
+        usdt = S.trade_usdt
     if S.size_by_impact:
         usdt *= _size_multiplier(int(item.impact))
     if S.size_by_kelly:
@@ -1826,8 +1837,8 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         usdt *= 0.5
     # Risk-eşitleme (vol-hedef): bu işlemin SL mesafesine göre boyutu eşitle. SL%
     # canlı yolda ATR çıkışı açıksa ATR'den, değilse sabit stop_loss_pct'ten gelir.
-    if S.risk_parity:
-        usdt *= _risk_parity_factor(usdt, _effective_stop_pct(getattr(item, "atr_pct", None)))
+    if S.risk_parity and S.risk_per_trade_pct <= 0:
+        usdt *= _risk_parity_factor(usdt, eff_stop)
     # Portföy-seviye: yeni pozisyon mevcut açık pozisyonlarla koreleyse "tek bahis" → kıs.
     # price_series çağırandan gelir (ağlı); yoksa nötr.
     heat_info: dict[str, Any] | None = None
@@ -2056,6 +2067,25 @@ def _drawdown_state(closed: list[dict[str, Any]], account_base: float) -> dict[s
             "drawdown_pct": round(dd_usdt / peak * 100, 2)}
 
 
+def _account_equity() -> float:
+    """Anlık sermaye = account_equity_usdt tabanı + kümülatif realized (P&L ile birleşik)."""
+    realized = sum(c["pnl"] for c in _closed if c.get("pnl") is not None)
+    return max(0.0, S.account_equity_usdt + realized)
+
+
+def _risk_per_trade_base(stop_pct: float | None) -> float:
+    """Yüzde-bazlı taban boyut: SL tetiklenince sermayenin `risk_per_trade_pct`'i kaybedilir.
+
+    notional = (equity × pct%) / (eff_stop%) → SL mesafesi geniş işlemde küçük, dar işlemde
+    büyük pozisyon (sabit USDT-risk). eff_stop tabanı %0.5'e kıstırılır (div-by-tiny önleme);
+    sonuç sağduyu tavanı 3×sermaye ile sınırlanır (kalan exposure/kaldıraç kapıları ayrıca uygular).
+    """
+    eff = max(0.5, stop_pct if stop_pct and stop_pct > 0 else (S.stop_loss_pct or 3.0))
+    eq = _account_equity()
+    base = eq * S.risk_per_trade_pct / eff   # eq×(pct/100)/(eff/100)
+    return round(max(0.0, min(base, eq * 3.0)), 2)
+
+
 def _profit_factor(scored: list[dict[str, Any]]) -> float | None:
     """Brüt kâr / brüt zarar. Zarar yoksa None (tanımsız). Saf fonksiyon."""
     gross_win = sum(c["pnl"] for c in scored if c["pnl"] > 0)
@@ -2111,6 +2141,7 @@ def get_risk() -> dict[str, Any]:
     with _lock:
         kelly = _kelly_fraction(list(_closed))
         dd = _drawdown_state(_closed, S.account_equity_usdt)
+        equity_now = _account_equity()
     dd_halt = bool(S.max_drawdown_pct > 0 and dd["drawdown_pct"] >= S.max_drawdown_pct)
     return {
         "open_positions": n_open,
@@ -2126,6 +2157,9 @@ def get_risk() -> dict[str, Any]:
         # drawdown kill-switch: sermaye tepeden çok düştüyse yeni işlem açılmaz
         "drawdown": {**dd, "max_drawdown_pct": S.max_drawdown_pct,
                      "account_equity_usdt": S.account_equity_usdt, "halted": dd_halt},
+        # Yüzde-bazlı boyutlama (açıksa): anlık sermaye + işlem başı risk %'si
+        "sizing": {"risk_per_trade_pct": S.risk_per_trade_pct, "equity": round(equity_now, 2),
+                   "mode": "risk_pct" if S.risk_per_trade_pct > 0 else "fixed_usdt"},
         "paper_trading": S.paper_trading,
         "auto_trade": S.auto_trade,
         # Kelly boyut bağlamı (şeffaflık): edge + uygulanan çarpan
@@ -2193,6 +2227,9 @@ def preflight() -> list[dict[str, Any]]:
     add("Drawdown kill-switch", "ok" if S.max_drawdown_pct > 0 else "warn",
         f"%{S.max_drawdown_pct:g} (sermaye tabanı {S.account_equity_usdt:g} USDT)"
         if S.max_drawdown_pct > 0 else "kapalı — tepe-dip düşüşte durdurma yok")
+    add("Pozisyon boyutlama", "info",
+        f"yüzde-bazlı: işlem başı sermayenin %{S.risk_per_trade_pct:g} riski (sermaye {_account_equity():g} USDT)"
+        if S.risk_per_trade_pct > 0 else f"sabit: {S.trade_usdt:g} USDT/işlem")
 
     # Kaldıraç aklı (futures)
     if S.market == "futures" and S.leverage > 10:

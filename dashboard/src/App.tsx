@@ -152,6 +152,25 @@ type Readiness = {
   verdict: string; samples: number; win_rate: number | null; profit_factor: number | null;
   max_drawdown: number | null; checks: ReadinessCheck[]; note: string;
 };
+type PreflightCheck = { check: string; status: "ok" | "warn" | "critical" | "info"; detail: string };
+type GoLive = {
+  verdict: string;
+  operational: { verdict: string; counts: Record<string, number>; checks: PreflightCheck[] };
+  blockers: PreflightCheck[];
+  note: string;
+};
+type SourceStat = {
+  healthy: boolean; disabled: boolean; consecutive_fails: number;
+  total_ok: number; total_fail: number; retry_in_sec: number; last_error: string;
+};
+type SourcesHealth = {
+  sources: Record<string, SourceStat>; disabled: string[]; n_sources: number; n_disabled: number;
+};
+type AblationSearch = {
+  ok?: boolean; reason?: string; verdict?: string; improvement_pct?: number;
+  selected?: { gate: string; desc: string; step_improve_pct: number; cut_n: number; cut_avg_net_pct: number }[];
+  recommended_settings?: Record<string, number | boolean>;
+};
 
 type Performance = {
   total_trades: number;
@@ -297,6 +316,8 @@ type Health = {
   rate_limited?: number;
   trading_halted?: boolean;
   halt_reason?: string;
+  backup_scan_interval_sec?: number;
+  latency_breaches?: string[];
 };
 
 type ClosedTrade = {
@@ -486,6 +507,8 @@ export default function App() {
   const [tuning, setTuning] = useState<Tuning | null>(null);
   const [pretrade, setPretrade] = useState<(Tuning & { reason?: string; tested?: number }) | null>(null);
   const [pretradeRunning, setPretradeRunning] = useState(false);
+  const [ablation, setAblation] = useState<AblationSearch | null>(null);
+  const [ablationRunning, setAblationRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
   const [showArchive, setShowArchive] = useState(false);
@@ -536,6 +559,8 @@ export default function App() {
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [golive, setGolive] = useState<GoLive | null>(null);
+  const [srcHealth, setSrcHealth] = useState<SourcesHealth | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
   const [brainBtRunning, setBrainBtRunning] = useState(false);
   const runBrainBacktest = async () => {
@@ -568,7 +593,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -583,6 +608,8 @@ export default function App() {
         fetch(`${API_BASE}/brain-scorecard`),
         fetch(`${API_BASE}/readiness`),
         fetch(`${API_BASE}/shadow`),
+        fetch(`${API_BASE}/golive`),
+        fetch(`${API_BASE}/sources-health`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -619,6 +646,8 @@ export default function App() {
       if (bsRes.ok) setBrainSc(await bsRes.json());
       if (rdRes.ok) setReadiness(await rdRes.json());
       if (shRes.ok) setShadow(await shRes.json());
+      if (glRes.ok) setGolive(await glRes.json());
+      if (srcRes.ok) setSrcHealth(await srcRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -710,6 +739,19 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Ön-bilgi hatası");
     } finally {
       setPretradeRunning(false);
+    }
+  };
+
+  const runAblation = async () => {
+    setAblationRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/ablation/search`);
+      if (!r.ok) throw new Error(`ablation ${r.status}`);
+      setAblation(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ablasyon hatası");
+    } finally {
+      setAblationRunning(false);
     }
   };
 
@@ -1422,6 +1464,15 @@ export default function App() {
               {!!health.rate_limited && health.rate_limited > 0 && (
                 <span className="text-amber-400" title="Binance rate-limit (429/418) sayısı">⚠ rate-limit ×{health.rate_limited}</span>
               )}
+              {!!health.backup_scan_interval_sec && health.backup_scan_interval_sec < 20 && (
+                <span className="font-semibold text-amber-400" title="Asıl realtime kaynak (WS) bayat — yedek tarama hızlandı (failover aktif)">⚡ failover {health.backup_scan_interval_sec}s</span>
+              )}
+              {!!health.latency_breaches && health.latency_breaches.length > 0 && (
+                <span className="font-semibold text-red-400" title={`Boru hattı gecikme SLA aşıldı (yavaş): ${health.latency_breaches.join(", ")} — oto-işlem durdurulabilir`}>🐢 gecikme: {health.latency_breaches.join(",")}</span>
+              )}
+              {!!srcHealth && srcHealth.n_disabled > 0 && (
+                <span className="font-semibold text-amber-400" title={`Üst üste hata sonrası devre dışı yedek kaynak: ${srcHealth.disabled.join(", ")}`}>🔌 kaynak ×{srcHealth.n_disabled} devre dışı</span>
+              )}
             </>
           )}
           <span className="text-zinc-700">|</span>
@@ -1920,6 +1971,29 @@ export default function App() {
             <p className="mt-2 text-[11px] text-zinc-500">
               pf {readiness.profit_factor ?? "—"} · kazanma %{readiness.win_rate ?? "—"} · max DD {readiness.max_drawdown ?? "—"} · {readiness.note}
             </p>
+            {golive && (
+              <div className="mt-3 border-t border-zinc-700/50 pt-2">
+                <div className="mb-1 flex flex-wrap items-baseline gap-2">
+                  <span className="text-xs font-bold text-white">⚙️ Operasyonel güvenlik</span>
+                  <span className={`text-xs font-semibold ${
+                    golive.verdict.includes("GEÇME") ? "text-red-300"
+                      : golive.verdict.startsWith("HAZIR") ? "text-emerald-300" : "text-amber-300"}`}>
+                    {golive.verdict}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {golive.operational.checks.map((c) => (
+                    <span key={c.check} className={`rounded-md px-2 py-1 ${
+                      c.status === "ok" ? "bg-emerald-900/50 text-emerald-200"
+                        : c.status === "critical" ? "bg-red-900/50 text-red-200"
+                          : c.status === "warn" ? "bg-amber-900/50 text-amber-200" : "bg-zinc-800 text-zinc-400"}`}>
+                      {c.status === "ok" ? "✓" : c.status === "critical" ? "✗" : c.status === "warn" ? "!" : "ℹ"} {c.check}: {c.detail}
+                    </span>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px] text-zinc-500">{golive.note}</p>
+              </div>
+            )}
           </div>
         </section>
       )}
@@ -2012,8 +2086,50 @@ export default function App() {
             >
               {brainVetoRunning ? "Sınanıyor…" : "🧪 Veto denetimi"}
             </button>
+            <button
+              type="button"
+              onClick={() => void runAblation()}
+              disabled={ablationRunning}
+              title="Mekanik gateleri (impact/teyit/RVOL/chase) arşivde birlikte arar — hangi filtre kombinasyonu edge katıyor + uygulanabilir ayar önerisi (ağ-yoğun)"
+              className="rounded-md border border-teal-500/40 bg-teal-950/40 px-3 py-1 text-xs font-semibold text-teal-200 hover:bg-teal-900/50 disabled:opacity-50"
+            >
+              {ablationRunning ? "Aranıyor…" : "🔬 Gate ablasyonu"}
+            </button>
           </div>
         </div>
+
+        {/* Gate ablasyonu: hangi filtre kombinasyonu edge katıyor + öneri */}
+        {ablation && (
+          <div className="mb-3 rounded-2xl border border-teal-500/30 bg-teal-950/20 px-4 py-3 text-sm">
+            {ablation.ok === false ? (
+              <p className="text-zinc-500">{ablation.reason ?? "Yetersiz veri."}</p>
+            ) : (
+              <>
+                <div className="mb-2 flex flex-wrap items-center gap-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-teal-300/80">🔬 Gate ablasyonu</span>
+                  <span className="text-zinc-300">{ablation.verdict}</span>
+                  {!!ablation.improvement_pct && (
+                    <span className="text-zinc-500">ort. net iyileşme: <b className="tabular-nums text-emerald-300">+{ablation.improvement_pct}%</b></span>
+                  )}
+                </div>
+                {!!ablation.selected?.length && (
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    {ablation.selected.map((g) => (
+                      <span key={g.gate} className="rounded-md bg-teal-900/40 px-2 py-1 text-teal-200" title={g.desc}>
+                        ✓ {g.gate} <span className="text-zinc-400">(+{g.step_improve_pct}% · {g.cut_n} kesildi @ {g.cut_avg_net_pct}%)</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {ablation.recommended_settings && Object.keys(ablation.recommended_settings).length > 0 && (
+                  <p className="mt-2 text-[11px] text-zinc-400">
+                    Önerilen ayar (ELLE uygula): <code className="text-teal-300">{JSON.stringify(ablation.recommended_settings)}</code>
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
         {/* Veto denetimi: vetolanan sinyaller gerçekten kaybettirir miydi */}
         {brainVeto && (

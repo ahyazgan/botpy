@@ -138,6 +138,16 @@ type BrainScorecard = {
   escalation: { escalated: EscAgg; base: EscAgg };
   rubric: Record<string, number | null>;
 };
+type BrainAttribution = {
+  samples: number; overall: EscAgg;
+  layers: {
+    escalation: { escalated: EscAgg; base: EscAgg; verdict: string };
+    voting: { n: number; unanimous: EscAgg; split: EscAgg; verdict: string };
+    recalibration: EscAgg & { avg_shift: number | null };
+    rubric: { correlations: Record<string, number | null>; noisy_dimensions: string[] };
+  };
+  note: string;
+};
 type BtSide = { n: number; avg_net_pct: number | null; win_rate: number | null };
 type BrainBacktest = {
   ready: boolean; reason?: string; tested?: number;
@@ -555,6 +565,7 @@ export default function App() {
   const [btRunning, setBtRunning] = useState(false);
   const [btRuns, setBtRuns] = useState<BacktestRun[]>([]);
   const [brainSc, setBrainSc] = useState<BrainScorecard | null>(null);
+  const [brainAttr, setBrainAttr] = useState<BrainAttribution | null>(null);
   const [shadow, setShadow] = useState<{ overrides: Record<string, unknown>; n: number; diverged: number; live_trades: number; shadow_trades: number } | null>(null);
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
@@ -593,7 +604,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -610,6 +621,7 @@ export default function App() {
         fetch(`${API_BASE}/shadow`),
         fetch(`${API_BASE}/golive`),
         fetch(`${API_BASE}/sources-health`),
+        fetch(`${API_BASE}/brain-attribution`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -648,6 +660,7 @@ export default function App() {
       if (shRes.ok) setShadow(await shRes.json());
       if (glRes.ok) setGolive(await glRes.json());
       if (srcRes.ok) setSrcHealth(await srcRes.json());
+      if (baRes.ok) setBrainAttr(await baRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2278,6 +2291,39 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* Beyin katman atıfı: hangi katman (eskalasyon/oylama/rekalibrasyon) edge katıyor */}
+        {brainAttr && brainAttr.samples > 0 && (() => {
+          const vcls = (v: string) => v === "edge+" ? "bg-emerald-900/50 text-emerald-200"
+            : v === "edge-" ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-400";
+          const e = brainAttr.layers.escalation, vo = brainAttr.layers.voting, rc = brainAttr.layers.recalibration;
+          const noisy = brainAttr.layers.rubric.noisy_dimensions;
+          return (
+            <div className="rounded-2xl border border-violet-500/20 bg-violet-950/10 px-4 py-3 text-sm">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-violet-300/80">🧩 Beyin katman atıfı</span>
+                <span className="text-zinc-500">{brainAttr.samples} işlem · hangi katman edge katıyor (kapatmayı düşün: edge−)</span>
+              </div>
+              <div className="flex flex-wrap gap-2 text-[11px]">
+                <span className={`rounded px-2 py-1 font-semibold ${vcls(e.verdict)}`}
+                  title={`Eskale (Sonnet) vs taban (Haiku) gerçek ort. P&L. ${e.verdict}`}>
+                  eskalasyon: {e.verdict} <span className="font-normal opacity-80">({e.escalated.avg_pnl ?? "—"}↑{e.escalated.n} / taban {e.base.avg_pnl ?? "—"}·{e.base.n})</span>
+                </span>
+                <span className={`rounded px-2 py-1 font-semibold ${vcls(vo.verdict)}`}
+                  title={`Oybirliği vs bölünmüş oy gerçek ort. P&L. ${vo.verdict}`}>
+                  oylama: {vo.verdict} <span className="font-normal opacity-80">(oybirliği {vo.unanimous.avg_pnl ?? "—"}·{vo.unanimous.n} / bölünmüş {vo.split.avg_pnl ?? "—"}·{vo.split.n})</span>
+                </span>
+                <span className="rounded bg-zinc-800 px-2 py-1 text-zinc-300"
+                  title="Conviction rekalibrasyonu uygulanan işlemler + ortalama kaydırma (ham→düzeltilmiş)">
+                  rekalibrasyon: {rc.n} işlem{rc.avg_shift != null ? ` · kayma ${rc.avg_shift}` : ""}
+                </span>
+              </div>
+              {noisy.length > 0 && (
+                <p className="mt-2 text-[11px] text-amber-300/80">Gürültülü rubrik boyutları (P&L ile korele değil): {noisy.join(", ")}</p>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Canlı: kapanan gerçek işlemlerden */}
         {tuning && tuning.ready && tuning.suggestions.length > 0 && (

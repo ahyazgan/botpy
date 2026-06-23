@@ -3399,6 +3399,8 @@ def report() -> dict[str, Any]:
                 readiness_verdict=rd["verdict"], complexity=cx,
                 risk_of_ruin=risk.get("risk_of_ruin"), mc_reliable=bool(risk.get("reliable")),
                 n_trades=n)
+    mdd = risk.get("max_drawdown_pct")
+    mdd_p95 = mdd.get("p95") if isinstance(mdd, dict) else None
     return {**a, "components": {
         "edge": {"verdict": rd["verdict"], "samples": rd.get("samples"),
                  "profit_factor": rd.get("profit_factor")},
@@ -3408,7 +3410,7 @@ def report() -> dict[str, Any]:
         "complexity": {"verdict": cx["verdict"], "premature": cx.get("premature") or [],
                        "n_active": cx.get("n_active_layers")},
         "risk": {"ok": risk.get("ok", False), "risk_of_ruin": risk.get("risk_of_ruin"),
-                 "max_dd_p95": (risk.get("max_drawdown_pct") or {}).get("p95"),
+                 "max_dd_p95": mdd_p95,
                  "reliable": risk.get("reliable")},
         "performance": {"trades": n, "win_rate": perf.get("win_rate"),
                         "total_pnl": perf.get("total_pnl"), "profit_factor": perf.get("profit_factor")},

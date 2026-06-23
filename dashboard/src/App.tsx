@@ -63,6 +63,7 @@ type Settings = {
   auto_trade: boolean;
   market: "spot" | "futures";
   trade_usdt: number;
+  risk_per_trade_pct: number;
   leverage: number;
   max_positions: number;
   auto_min_impact: number;
@@ -290,6 +291,7 @@ type Risk = {
   daily_loss_limit_usdt: number;
   trading_halted: boolean;
   drawdown?: { equity: number; peak: number; drawdown_usdt: number; drawdown_pct: number; max_drawdown_pct: number; account_equity_usdt: number; halted: boolean };
+  sizing?: { risk_per_trade_pct: number; equity: number; mode: "risk_pct" | "fixed_usdt" };
   paper_trading: boolean;
   auto_trade: boolean;
   kelly?: { ready: boolean; f_star: number; win_rate: number | null; payoff: number | null; n: number; multiplier: number; enabled: boolean };
@@ -1380,6 +1382,7 @@ export default function App() {
             </div>
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-amber-400/80">Risk limitleri</p>
+              <NumField label="İşlem başı risk % (0=sabit tutar)" value={settings.risk_per_trade_pct} onSave={(v) => patchSettings({ risk_per_trade_pct: v })} />
               <NumField label="Günlük zarar limiti USDT (0=kapalı)" value={settings.daily_loss_limit_usdt} onSave={(v) => patchSettings({ daily_loss_limit_usdt: v })} />
               <NumField label="Drawdown kill-switch % (0=kapalı)" value={settings.max_drawdown_pct} onSave={(v) => patchSettings({ max_drawdown_pct: v })} />
               <NumField label="Sermaye tabanı USDT (drawdown paydası)" value={settings.account_equity_usdt} onSave={(v) => patchSettings({ account_equity_usdt: v })} />
@@ -1966,6 +1969,12 @@ export default function App() {
               {risk.trading_halted && (
                 <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200">
                   ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
+                </span>
+              )}
+              {risk.sizing?.mode === "risk_pct" && (
+                <span className="rounded-lg border border-sky-500/40 bg-sky-950/30 px-3 py-1 text-xs font-semibold text-sky-200"
+                  title={`Sermaye ${risk.sizing.equity} USDT · işlem başı %${risk.sizing.risk_per_trade_pct} risk`}>
+                  📐 %{risk.sizing.risk_per_trade_pct} risk/işlem (eq {risk.sizing.equity})
                 </span>
               )}
               {risk.drawdown?.halted && (

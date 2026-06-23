@@ -587,6 +587,69 @@ def brain_scorecard() -> dict[str, Any]:
             **sci}
 
 
+def _agg_pnl(b: list[dict[str, Any]]) -> dict[str, Any]:
+    """Kapanan işlem alt-kümesinden n/win_rate/avg_pnl (saf)."""
+    if not b:
+        return {"n": 0, "win_rate": None, "avg_pnl": None}
+    wins = sum(1 for c in b if c["pnl"] > 0)
+    return {"n": len(b), "win_rate": round(wins / len(b), 2),
+            "avg_pnl": round(sum(c["pnl"] for c in b) / len(b), 2)}
+
+
+def brain_attribution(min_layer_samples: int = 5) -> dict[str, Any]:
+    """Beyin KATMAN atıfı: hangi katman (eskalasyon/oylama/rekalibrasyon/rubrik)
+    gerçek kapanmış işlemlerde edge katıyor — tek konsolide rapor.
+
+    Dağınık sinyalleri (brain_scorecard/escalation/rubric) tek "hangi katman para
+    kazandırıyor" görünümünde toplar; her katman için verdikt (edge+/edge-/yetersiz).
+    Karmaşıklığı veriyle budamak için — bir katman edge katmıyorsa kapatmayı düşün.
+    Saf; canlı-anlık girdiler ablate edilemez (bkz /ablation mekanik gateler içindir).
+    """
+    with _lock:
+        rows = [c for c in _closed if c.get("pnl") is not None and isinstance(c.get("brain"), dict)]
+
+    def _verdict(sub: dict[str, Any], ref: dict[str, Any]) -> str:
+        if sub["n"] < min_layer_samples or ref.get("avg_pnl") is None or sub["avg_pnl"] is None:
+            return "yetersiz-veri"
+        return "edge+" if sub["avg_pnl"] > ref["avg_pnl"] else "edge-"
+
+    overall = _agg_pnl(rows)
+
+    # 1) Eskalasyon: Sonnet ikinci-bakış edge katıyor mu (taban = eskale olmayan)
+    esc = _escalation_accuracy(rows)
+    esc["verdict"] = _verdict(esc["escalated"], esc["base"])
+
+    # 2) Oylama: oybirliği (agreement≈1) vs bölünmüş oy sonuçları
+    voted = [c for c in rows if isinstance(c["brain"].get("vote"), dict)]
+    unanimous = [c for c in voted if float(c["brain"]["vote"].get("agreement", 0)) >= 0.999]
+    split = [c for c in voted if float(c["brain"]["vote"].get("agreement", 0)) < 0.999]
+    vote: dict[str, Any] = {"n": len(voted), "unanimous": _agg_pnl(unanimous),
+                            "split": _agg_pnl(split)}
+    vote["verdict"] = _verdict(vote["unanimous"], vote["split"])
+
+    # 3) Rekalibrasyon: ham conviction düzeltilen işlemler (conviction_raw saklı)
+    recal = [c for c in rows if c["brain"].get("conviction_raw") is not None]
+    shifts = [float(c["brain"]["conviction"]) - float(c["brain"]["conviction_raw"]) for c in recal]
+    recalibration = {**_agg_pnl(recal),
+                     "avg_shift": round(sum(shifts) / len(shifts), 3) if shifts else None}
+
+    # 4) Rubrik: hangi alt-skor boyutu P&L ile korele (sinyal taşıyor)
+    rubric = _rubric_correlation(rows)
+    noisy = [k for k, v in rubric.items() if v is None or abs(v) < 0.1]
+
+    return {
+        "samples": len(rows), "overall": overall,
+        "layers": {
+            "escalation": esc,
+            "voting": vote,
+            "recalibration": recalibration,
+            "rubric": {"correlations": rubric, "noisy_dimensions": noisy},
+        },
+        "note": "edge+ = katman taban/karşılaştırmadan daha iyi ort. P&L üretti. "
+                "Yetersiz-veri katmanlar daha çok kapanmış işlem bekliyor.",
+    }
+
+
 def _calibration_science(pairs: list[tuple[float, int]]) -> dict[str, Any]:
     """Conviction tahmininin kalibrasyon bilimi: Brier + ECE + reliability + base-rate.
 

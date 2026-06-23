@@ -2407,6 +2407,33 @@ def ablation(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int =
         return {"ok": True, **nbt.ablation(results, usdt, chase_pct=chase_pct, rvol_min=rvol_min)}
 
 
+@app.get("/ablation/search")
+def ablation_search(hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
+                    sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
+                    chase_pct: float = 5.0, rvol_min: float = 1.5,
+                    min_improve_pct: float = 0.05) -> dict[str, Any]:
+    """Açgözlü çok-gate araması: edge'i en çok artıran gate KOMBİNASYONU + uygulanabilir öneri.
+
+    `/ablation` her gate'i izole ölçer; bu gateleri BİRLİKTE arar (ileri-seçim): boş kümeden
+    başlar, her adımda anlamlı iyileşme (kestiği işlemler net-negatif + ≥`min_improve_pct`)
+    katan gate'i ekler. `recommended_settings` = canlıya ELLE uygulanabilir ayar fragmanı
+    (oto-uygulanmaz). Ağ-yoğun, _heavy_guard."""
+    import news_backtest as nbt
+    with _heavy_guard():
+        rows = get_store().list_signals(limit=limit, min_impact=min_impact)
+        candidates = nbt._signals_from_rows(rows)
+        if not candidates:
+            return {"ok": False, "reason": "yeterli sinyal yok (arşiv boş veya çok yeni)", "n": 0}
+        signals = nbt.prefetch(candidates, int(hours * 60))
+        if not signals:
+            return {"ok": False, "reason": "fiyat verisi indirilemedi (Binance)", "n": 0}
+        results = nbt.simulate_all(signals, sl, tp, fee)
+        if not results:
+            return {"ok": False, "reason": "simüle edilebilir sonuç yok", "n": 0}
+        return {"ok": True, **nbt.ablation_search(results, usdt, chase_pct=chase_pct,
+                                                  rvol_min=rvol_min, min_improve_pct=min_improve_pct)}
+
+
 def _run_backtest_impl(
     sl: float = 3.0, tp: float = 6.0, fee: float = 0.2, usdt: float = 100.0,
     hours: float = 4.0, min_impact: int = ALERT_THRESHOLD, limit: int = 300,
@@ -2900,6 +2927,15 @@ def brain_scorecard() -> dict[str, Any]:
     """Giriş beyni kalibrasyonu: conviction dilimi → gerçek win-rate/P&L (girilen işlemler).
     `calibrated` = yüksek konviksiyon daha yüksek ort. P&L üretiyor mu (beyin edge katıyor mu)."""
     return trader.brain_scorecard()
+
+
+@app.get("/brain-attribution")
+def brain_attribution() -> dict[str, Any]:
+    """Beyin KATMAN atıfı: hangi katman (eskalasyon/oylama/rekalibrasyon/rubrik) gerçek
+    kapanmış işlemlerde edge katıyor — tek konsolide rapor. `/ablation` mekanik gateleri
+    ölçer; bu beyin katmanlarını ölçer. Her katman: edge+/edge-/yetersiz-veri verdikti.
+    Karmaşıklığı veriyle budamak için (edge katmayan katmanı kapatmayı düşün)."""
+    return trader.brain_attribution()
 
 
 @app.get("/brain-log")

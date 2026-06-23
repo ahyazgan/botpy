@@ -42,6 +42,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import latency
+import sourcehealth
 import storage
 import trader
 from netutil import get_json, get_stats
@@ -80,6 +81,9 @@ SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
 # Failover: asıl gerçek-zamanlı kaynak (TreeNews WS) bayatlayınca RSS/Binance
 # yedeği bu HIZLI aralıkta tarar (20s yerine) → kopuk realtime'da boşluğu doldur.
 SCAN_INTERVAL_FAST_SEC = int(os.environ.get("SCAN_INTERVAL_FAST_SEC", "5"))
+# Yedek kaynak sağlığı: üst üste bu kadar hata veren kaynağı geçici devre dışı bırak.
+SOURCE_FAIL_THRESHOLD = int(os.environ.get("SOURCE_FAIL_THRESHOLD", "3"))
+SOURCE_COOLDOWN_SEC = float(os.environ.get("SOURCE_COOLDOWN_SEC", "300"))
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -258,6 +262,7 @@ _metrics: dict[str, int] = {
     "reconcile_drift_total": 0, # mutabakatta bulunan hayalet pozisyon (news_bot gözlemler)
     "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
     "failover_scans_total": 0,  # WS bayatken hızlı yedek tarama sayısı (kaynak redundansı)
+    "source_disabled_total": 0, # üst üste hata sonrası devre dışı bırakılan yedek kaynak sayısı
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -401,18 +406,46 @@ def set_rss_feeds(feeds: dict[str, str]) -> dict[str, str]:
     return clean
 
 
+# Yedek kaynak sağlık kaydı (RSS feed'leri + Binance duyuruları için durum-makinesi)
+_source_health = sourcehealth.SourceHealth(SOURCE_FAIL_THRESHOLD, SOURCE_COOLDOWN_SEC)
+_BINANCE_SOURCE = "Binance duyuruları"
+
+
+def _on_source_result(name: str, ok: bool, error: str = "") -> None:
+    """Kaynak çekim sonucunu sağlık kaydına işle; devre dışı/toparlandı geçişlerini bildir."""
+    transition = (_source_health.record_success(name) if ok
+                  else _source_health.record_failure(name, error))
+    if transition == "disabled":
+        _metrics["source_disabled_total"] += 1
+        log.warning("Kaynak DEVRE DIŞI (üst üste hata): %s", name)
+        notify_remote(f"⚠️ KAYNAK DEVRE DIŞI: '{name}' üst üste hata verdi, geçici "
+                      f"devre dışı (cooldown). Son hata: {error[:120]}")
+    elif transition == "recovered":
+        log.info("Kaynak toparlandı: %s", name)
+        notify_remote(f"✅ KAYNAK TOPARLANDI: '{name}' yeniden çalışıyor.")
+
+
 def fetch_all(session: requests.Session) -> list[NewsItem]:
-    """Tüm kaynakları çek; biri patlarsa diğerleri devam etsin."""
+    """Tüm kaynakları çek; biri patlarsa diğerleri devam etsin.
+
+    Her kaynağın sağlığı izlenir (`_source_health`): üst üste hata veren kaynak
+    geçici DEVRE DIŞI bırakılıp atlanır (sürekli timeout'la taramayı yavaşlatmasın),
+    cooldown sonrası yeniden denenir. Geçişler uzak kanaldan bildirilir.
+    """
     out: list[NewsItem] = []
-    for name, url in get_rss_feeds().items():
+    feeds: list[tuple[str, str | None]] = list(get_rss_feeds().items())
+    feeds.append((_BINANCE_SOURCE, None))   # None = Binance duyuru kaynağı (sentinel)
+    for name, url in feeds:
+        if _source_health.is_disabled(name):
+            continue   # devre dışı: cooldown dolana dek atla
         try:
-            out.extend(fetch_rss(name, url))
+            items = (fetch_binance_announcements(session) if url is None
+                     else fetch_rss(name, url))
+            out.extend(items)
+            _on_source_result(name, True)
         except Exception as e:
-            log.warning("RSS başarısız (%s): %s", name, e)
-    try:
-        out.extend(fetch_binance_announcements(session))
-    except Exception as e:
-        log.warning("Binance duyuru başarısız: %s", e)
+            log.warning("Kaynak başarısız (%s): %s", name, e)
+            _on_source_result(name, False, str(e))
     return out
 
 
@@ -2090,6 +2123,8 @@ _METRIC_META = {
     "botpy_protect_errors_total": ("counter", "Borsa koruyucu stop konamadı"),
     "botpy_failover_scans_total": ("counter", "WS bayatken hızlı yedek tarama (failover)"),
     "botpy_backup_scan_interval_seconds": ("gauge", "Aktif yedek tarama aralığı (failover'da düşer)"),
+    "botpy_source_disabled_total": ("counter", "Üst üste hatada devre dışı bırakılan yedek kaynak"),
+    "botpy_sources_disabled": ("gauge", "Şu an devre dışı yedek kaynak sayısı"),
     "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
     "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
@@ -2143,6 +2178,8 @@ def metrics() -> PlainTextResponse:
         "botpy_protect_errors_total": _metrics["protect_errors_total"],
         "botpy_failover_scans_total": _metrics["failover_scans_total"],
         "botpy_backup_scan_interval_seconds": _scan_interval(),
+        "botpy_source_disabled_total": _metrics["source_disabled_total"],
+        "botpy_sources_disabled": sum(1 for v in _source_health.snapshot().values() if v["disabled"]),
         "botpy_halts_total": trader._halts,
         "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
@@ -2219,6 +2256,20 @@ def health() -> dict[str, Any]:
         "trading_halted": trader.get_halt()["active"],
         "halt_reason": trader.get_halt()["reason"],
     }
+
+
+@app.get("/sources-health")
+def sources_health() -> dict[str, Any]:
+    """Yedek kaynak (RSS + Binance) sağlık kaydı: hangi kaynak çalışıyor/devre dışı.
+
+    Üst üste hata veren kaynak geçici devre dışı bırakılır (cooldown sonrası yeniden
+    denenir); `disabled`=şu an atlanıyor, `retry_in_sec`=ne zaman tekrar denenecek,
+    `consecutive_fails`/`total_*`=istatistik. Asıl realtime kaynak (WS) için /health."""
+    snap = _source_health.snapshot()
+    return {"sources": snap,
+            "disabled": [n for n, v in snap.items() if v["disabled"]],
+            "n_sources": len(snap),
+            "n_disabled": sum(1 for v in snap.values() if v["disabled"])}
 
 
 @app.get("/risk")

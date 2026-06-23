@@ -177,6 +177,8 @@ type LatencyReport = {
   archive_span: { count: number; first_ts: string | null; last_ts: string | null };
 };
 type LatPoint = { ts: string; stage: string; p50: number | null; p95: number | null; max: number | null };
+type OpsEvent = { ts: string; kind: string; severity: "info" | "warn" | "critical"; source: string | null; detail: string | null };
+type OpsEvents = { ok: boolean; events: OpsEvent[]; span: { count: number; last24h: Record<string, number> } };
 type SourceStat = {
   healthy: boolean; disabled: boolean; consecutive_fails: number;
   total_ok: number; total_fail: number; retry_in_sec: number; last_error: string;
@@ -576,6 +578,7 @@ export default function App() {
   const [brainAttr, setBrainAttr] = useState<BrainAttribution | null>(null);
   const [latency, setLatency] = useState<LatencyReport | null>(null);
   const [latencyHist, setLatencyHist] = useState<LatPoint[]>([]);
+  const [opsEvents, setOpsEvents] = useState<OpsEvents | null>(null);
   const [shadow, setShadow] = useState<{ overrides: Record<string, unknown>; n: number; diverged: number; live_trades: number; shadow_trades: number } | null>(null);
   const [shadowEval, setShadowEval] = useState<{ ready: boolean; n: number; edge_pct: number | null; recommend: boolean; shadow_avg: number | null; live_avg: number | null } | null>(null);
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
@@ -614,7 +617,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -634,6 +637,7 @@ export default function App() {
         fetch(`${API_BASE}/brain-attribution`),
         fetch(`${API_BASE}/latency`),
         fetch(`${API_BASE}/latency/history?stage=pipeline&hours=24`),
+        fetch(`${API_BASE}/events?limit=30`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -675,6 +679,7 @@ export default function App() {
       if (baRes.ok) setBrainAttr(await baRes.json());
       if (latRes.ok) setLatency(await latRes.json());
       if (latHistRes.ok) setLatencyHist((await latHistRes.json()).points ?? []);
+      if (evRes.ok) setOpsEvents(await evRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2077,6 +2082,37 @@ export default function App() {
                 </p>
               </>
             )}
+          </div>
+        </section>
+      )}
+
+      {/* Operasyonel olay zaman çizelgesi — incident günlüğü (post-mortem) */}
+      {opsEvents && opsEvents.events.length > 0 && (
+        <section className="mx-auto mt-6 max-w-5xl">
+          <div className="rounded-2xl border border-zinc-600/40 bg-zinc-900/40 px-4 py-3">
+            <div className="mb-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-sm font-bold text-white">🗓️ Operasyonel olaylar</span>
+              <span className="text-xs text-zinc-500">incident günlüğü · {opsEvents.span.count} kayıt</span>
+              {!!opsEvents.span.last24h.critical && (
+                <span className="rounded bg-red-900/50 px-2 py-0.5 text-xs font-semibold text-red-200">24s: {opsEvents.span.last24h.critical} kritik</span>
+              )}
+              {!!opsEvents.span.last24h.warn && (
+                <span className="rounded bg-amber-900/50 px-2 py-0.5 text-xs font-semibold text-amber-200">24s: {opsEvents.span.last24h.warn} uyarı</span>
+              )}
+            </div>
+            <div className="max-h-56 space-y-1 overflow-y-auto">
+              {opsEvents.events.map((e, i) => (
+                <div key={i} className="flex items-baseline gap-2 text-xs">
+                  <span className={`shrink-0 ${e.severity === "critical" ? "text-red-400" : e.severity === "warn" ? "text-amber-400" : "text-emerald-400"}`}>
+                    {e.severity === "critical" ? "⛔" : e.severity === "warn" ? "⚠" : "✓"}
+                  </span>
+                  <span className="shrink-0 font-mono text-zinc-600">{timeAgo(e.ts)}</span>
+                  <span className="shrink-0 font-semibold text-zinc-300">{e.kind}</span>
+                  {e.source && <span className="shrink-0 rounded bg-zinc-800 px-1.5 text-[10px] text-zinc-400">{e.source}</span>}
+                  <span className="truncate text-zinc-500">{e.detail}</span>
+                </div>
+              ))}
+            </div>
           </div>
         </section>
       )}

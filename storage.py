@@ -247,6 +247,19 @@ CREATE TABLE IF NOT EXISTS latency_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_latency_ts ON latency_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_latency_stage_ts ON latency_snapshots(stage, ts);
+
+CREATE TABLE IF NOT EXISTS ops_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    kind      TEXT NOT NULL,         -- feed_stale | feed_recovered | source_disabled |
+                                     -- source_recovered | latency_breach | latency_clear |
+                                     -- halt_tripped | halt_cleared
+    severity  TEXT NOT NULL,         -- info | warn | critical
+    source    TEXT,                  -- ilgili kaynak/aşama (opsiyonel)
+    detail    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ops_ts ON ops_events(ts);
+CREATE INDEX IF NOT EXISTS idx_ops_kind_ts ON ops_events(kind, ts);
 """
 
 _NCT_COLUMNS = (
@@ -711,6 +724,66 @@ class Store:
             cur = self._conn.execute(
                 "DELETE FROM latency_snapshots WHERE id NOT IN "
                 "(SELECT id FROM latency_snapshots ORDER BY id DESC LIMIT ?)",
+                (keep,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    # ── Operasyonel olay zaman çizelgesi (incident günlüğü; post-mortem) ─────
+    def add_ops_event(self, kind: str, severity: str, detail: str = "",
+                      source: str = "", ts: str | None = None) -> int:
+        """Bir operasyonel olayı (incident) kalıcı yaz. Eklenen satır id'sini döner."""
+        row = {"ts": ts or _utcnow(), "kind": kind, "severity": severity,
+               "source": source, "detail": detail[:300]}
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO ops_events (ts, kind, severity, source, detail) "
+                "VALUES (:ts, :kind, :severity, :source, :detail)", row,
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_ops_events(self, limit: int = 200, kind: str | None = None,
+                        severity: str | None = None, hours: float | None = None
+                        ) -> list[dict[str, Any]]:
+        """Operasyonel olaylar, en yeniden eskiye. kind/severity/hours ile filtrele."""
+        q = "SELECT ts, kind, severity, source, detail FROM ops_events WHERE 1=1"
+        params: list[Any] = []
+        if kind:
+            q += " AND kind = ?"
+            params.append(kind)
+        if severity:
+            q += " AND severity = ?"
+            params.append(severity)
+        if hours is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+            q += " AND ts >= ?"
+            params.append(cutoff)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def ops_event_span(self) -> dict[str, Any]:
+        """Olay arşivi kapsamı: toplam + son 24s severity sayımı (gözlemlenebilirlik)."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with self._lock:
+            total = self._conn.execute("SELECT COUNT(*) AS n FROM ops_events").fetchone()["n"]
+            rows = self._conn.execute(
+                "SELECT severity, COUNT(*) AS n FROM ops_events WHERE ts >= ? GROUP BY severity",
+                (cutoff,),
+            ).fetchall()
+        return {"count": total, "last24h": {r["severity"]: r["n"] for r in rows}}
+
+    def prune_ops_events(self, keep: int) -> int:
+        """En yeni `keep` olay dışındakileri sil (sınırsız büyümeyi önler). keep<=0 → no-op."""
+        if keep <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM ops_events WHERE id NOT IN "
+                "(SELECT id FROM ops_events ORDER BY id DESC LIMIT ?)",
                 (keep,),
             )
             self._conn.commit()

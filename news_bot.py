@@ -2633,6 +2633,20 @@ def _closed_trades(limit: int) -> list[dict[str, Any]]:
     return trader.closed_trades(limit)
 
 
+@app.get("/montecarlo")
+def montecarlo_report(runs: int = 2000, ruin_pct: float = 50.0,
+                      limit: int = 1000, seed: int | None = None) -> dict[str, Any]:
+    """Monte Carlo risk simülasyonu: kapanan işlemleri yeniden örnekleyip sonuç DAĞILIMI
+    + iflas riski çıkarır. Gerçekleşen P&L tek örnek yoldur; bu, farklı işlem sırasıyla
+    drawdown'ın ne kadar kötü olabileceğini (p95/en kötü) ve sermayenin %`ruin_pct` altına
+    düşme olasılığını (`risk_of_ruin`) gösterir. Ağsız, hızlı (saf compute). Sermaye tabanı
+    `account_equity_usdt` ayarından. `reliable`=yeterli örnek (az ise gürültülü)."""
+    import montecarlo as mc
+    pnls = [c["pnl"] for c in _closed_trades(limit) if c.get("pnl") is not None]
+    return mc.monte_carlo(pnls, runs=runs, account_equity=trader.S.account_equity_usdt,
+                          ruin_pct=ruin_pct, seed=seed)
+
+
 @app.get("/trades/closed")
 def trades_closed(limit: int = 200) -> dict[str, Any]:
     """Kapanan işlemler (kalıcı defter, en yeniden eskiye)."""

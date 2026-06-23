@@ -3139,6 +3139,27 @@ def apply_settings_preset(name: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class ImportHistoryBody(BaseModel):
+    rows: list[dict[str, Any]]
+    source: str = "imported"
+    min_impact: int = 0
+
+
+@app.post("/import-history", dependencies=[Depends(require_token)])
+def post_import_history(body: ImportHistoryBody) -> dict[str, Any]:
+    """Tarihsel haber satırlarını KENDİ kural-puanlayıcımızla puanlayıp sinyal arşivine yaz.
+
+    `rows`: esnek sütunlu haber kayıtları (başlık + zaman zorunlu; coin/source opsiyonel).
+    Geçmiş haberi canlı sistemle aynı şekilde puanlar → backtest bizim stratejimizi yansıtır.
+    Sonra /alpha · /ablation · /backtest · /montecarlo · /tuning/pretrade bu geçmişte çalışır.
+    (CLI: `python import_history.py dosya.csv`)."""
+    import import_history as ih
+    try:
+        return ih.import_rows(body.rows, default_source=body.source, min_impact=body.min_impact)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/trade", dependencies=[Depends(require_token)])
 def post_trade(body: TradeRequest) -> dict[str, Any]:
     symbol = body.symbol or (f"{body.coin.upper()}USDT" if body.coin else None)

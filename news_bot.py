@@ -3085,6 +3085,18 @@ def _preflight_verdict(checks: list[dict[str, Any]]) -> dict[str, Any]:
     return {"verdict": verdict, "counts": counts}
 
 
+@app.get("/complexity")
+def complexity() -> dict[str, Any]:
+    """Karmaşıklık/overfitting denetimi: aktif opt-in katmanlar kanıt tabanıyla uyumlu mu.
+
+    `/ablation` (mekanik gateler) + `/brain-attribution` (beyin katmanları) GERÇEK sonuçla
+    edge ölçer; bu ondan ÖNCE gelir — "elimdeki veri bu katmanı açmaya yeter mi?". Her aktif
+    katman: structural / data-ready / premature (veri yetersizken açık). 'premature' =
+    erken karmaşıklık → veri birikene dek kapat. Yalın taban için `POST /settings/preset/lean`."""
+    n = int(trader.get_performance().get("total_trades", 0))
+    return trader.complexity_audit(n)
+
+
 @app.get("/preflight")
 def preflight(probe: bool = False) -> dict[str, Any]:
     """Canlıya geçiş operasyonel ön-uçuş: sistem gerçek parayı riske atacak şekilde

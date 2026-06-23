@@ -328,6 +328,15 @@ def update_news_settings(patch: dict[str, Any]) -> dict[str, Any]:
 def fetch_rss(name: str, url: str) -> list[NewsItem]:
     items: list[NewsItem] = []
     d = feedparser.parse(url)
+    # feedparser HTTP hatasında (403/500) istisna ATMAZ — boş feed döner. Kaynak sağlık
+    # makinesinin kalıcı-bozuk feed'i yakalayabilmesi için gerçek hatayı yüzeye çıkar:
+    status = getattr(d, "status", None)
+    if isinstance(status, int) and status >= 400:
+        raise RuntimeError(f"RSS HTTP {status}")
+    # Geçerli XML olmayan yanıt (örn. blok/hata sayfası) + hiç entry yok → erişim hatası say.
+    # (Geçerli feed'in benign bozo'su [encoding vb.] entry içerir → bu dala girmez.)
+    if not d.entries and getattr(d, "bozo", False) and getattr(d, "bozo_exception", None) is not None:
+        raise RuntimeError(f"RSS erişim/ayrıştırma hatası: {d.bozo_exception}")
     for e in d.entries[:40]:
         title = (getattr(e, "title", "") or "").strip()
         link = (getattr(e, "link", "") or "").strip()

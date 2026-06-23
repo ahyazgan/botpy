@@ -99,6 +99,35 @@ def test_fetch_all_disables_failing_feed(fetch_env, monkeypatch):
     assert any("DEVRE DIŞI" in m for m in fetch_env)
 
 
+class _FakeFeed:
+    def __init__(self, status=200, entries=None, bozo=0, bozo_exc=None):
+        self.status = status
+        self.entries = entries or []
+        self.bozo = bozo
+        self.bozo_exception = bozo_exc
+
+
+def test_fetch_rss_raises_on_http_error(monkeypatch):
+    # feedparser 403'te istisna atmaz → fetch_rss yüzeye çıkarmalı (kaynak sağlık yakalasın)
+    monkeypatch.setattr(nb.feedparser, "parse", lambda url: _FakeFeed(status=403))
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        nb.fetch_rss("Blocked", "u")
+
+
+def test_fetch_rss_raises_on_bozo_no_entries(monkeypatch):
+    # Geçerli XML olmayan yanıt (blok/hata sayfası) + entry yok → erişim hatası
+    monkeypatch.setattr(nb.feedparser, "parse",
+                        lambda url: _FakeFeed(status=200, bozo=1, bozo_exc=ValueError("not xml")))
+    with pytest.raises(RuntimeError, match="ayrıştırma"):
+        nb.fetch_rss("Junk", "u")
+
+
+def test_fetch_rss_empty_feed_is_not_error(monkeypatch):
+    # 200 + 0 entry (yeni haber yok) → başarı, boş liste (hata DEĞİL)
+    monkeypatch.setattr(nb.feedparser, "parse", lambda url: _FakeFeed(status=200, entries=[]))
+    assert nb.fetch_rss("Quiet", "u") == []
+
+
 def test_fetch_all_skips_disabled(fetch_env, monkeypatch):
     calls: list[str] = []
 

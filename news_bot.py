@@ -41,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
+import latency
 import storage
 import trader
 from netutil import get_json, get_stats
@@ -188,6 +189,8 @@ class NewsItem:
     atr_pct: float | None = None    # son mumların ortalama gerçek aralığı (%) — ATR çıkış için
     confirmed: bool = False         # haber + fiyat hareketi uyumlu mu
     price_note: str = ""            # teyit açıklaması
+    # gecikme ölçümü — alım anı (monotonic, serialize edilmez); boru hattı süreleri için
+    recv_monotonic: float = field(default_factory=time.monotonic, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1379,6 +1382,19 @@ def _parse_time(s: str | None) -> datetime | None:
         return None
 
 
+def _ingest_ms(item: NewsItem) -> float | None:
+    """Kaynak yayını → bot alımı gecikmesi (ms). published bilinmiyorsa None.
+
+    TreeNews/RSS yayın zamanı ile bizim alım (fetched_at) zamanımız arasındaki fark:
+    kaynak + ağ gecikmesini ölçer. Saat kayması negatif verirse tracker yok sayar.
+    """
+    pub = _parse_time(item.published)
+    recv = _parse_time(item.fetched_at)
+    if pub is None or recv is None:
+        return None
+    return (recv - pub).total_seconds() * 1000.0
+
+
 def _too_old(item: NewsItem) -> bool:
     t = _parse_time(item.published) or _parse_time(item.fetched_at)
     if t is None:
@@ -1497,6 +1513,10 @@ def process_items(
     if not new_items:
         return 0, 0
 
+    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası)
+    for it in new_items:
+        latency.record("ingest", _ingest_ms(it))
+
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
 
@@ -1523,8 +1543,10 @@ def process_items(
 
     # Faz 2 — Claude ile rafine et (nihai skor); hata olursa kural skoru geçerli kalır
     if USE_CLAUDE:
+        _t_score = time.monotonic()
         try:
             score_with_claude(new_items)
+            latency.record("score", (time.monotonic() - _t_score) * 1000.0)
         except Exception as e:
             log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
 
@@ -1535,7 +1557,10 @@ def process_items(
     # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
     alerts = [it for it in new_items if it.impact >= threshold]
     _metrics["alerts_total"] += len(alerts)
-    _confirm_alerts(session, alerts)   # paralel fiyat teyidi (çoklu alert'te hız)
+    if alerts:
+        _t_confirm = time.monotonic()
+        _confirm_alerts(session, alerts)   # paralel fiyat teyidi (çoklu alert'te hız)
+        latency.record("confirm", (time.monotonic() - _t_confirm) * 1000.0)
 
     if allow_notify:
         for it in alerts:
@@ -1543,8 +1568,13 @@ def process_items(
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
             _log_shadow_decision(it)    # A/B: aday ayar bu sinyalde ne karar verirdi (sanal)
+            _t_order = time.monotonic()
             pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
             if pos:
+                # Gecikme: karar→emir + uçtan uca alım→emir (manşet aksiyon gecikmesi)
+                _now_mono = time.monotonic()
+                latency.record("order", (_now_mono - _t_order) * 1000.0)
+                latency.record("pipeline", (_now_mono - it.recv_monotonic) * 1000.0)
                 _metrics["trades_opened_total"] += 1
                 log.info("OTO İŞLEM AÇILDI | %s %s | %s", pos["side"], pos["symbol"], pos["mode"])
                 notify_remote(_fmt_trade_msg(pos, opened=True))
@@ -2036,7 +2066,11 @@ _METRIC_META = {
 
 
 def _render_metrics(values: dict[str, int | float]) -> str:
-    """Prometheus exposition formatı (saf)."""
+    """Prometheus exposition formatı (saf).
+
+    Kayıtlı metrikler `_METRIC_META`'dan; dinamik `botpy_latency_*` gauge'leri
+    (aşama × istatistik kombinasyonu) jenerik olarak yayınlanır.
+    """
     lines = []
     for name, (mtype, help_text) in _METRIC_META.items():
         if name not in values:
@@ -2044,6 +2078,11 @@ def _render_metrics(values: dict[str, int | float]) -> str:
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} {mtype}")
         lines.append(f"{name} {values[name]}")
+    for name in sorted(values):
+        if name.startswith("botpy_latency_"):
+            lines.append(f"# HELP {name} Boru hattı gecikme metriği (ms)")
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name} {values[name]}")
     return "\n".join(lines) + "\n"
 
 
@@ -2078,7 +2117,19 @@ def metrics() -> PlainTextResponse:
     net = get_stats()
     values["botpy_rate_limited_total"] = net["rate_limited"]
     values["botpy_http_retries_total"] = net["retries"]
+    values.update(latency.get_metrics())   # boru hattı gecikme gauge'leri (p50/p95/max/count)
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/latency")
+def latency_report() -> dict[str, Any]:
+    """Boru hattı gecikme özeti (ms) — haber-trade'in gerçek edge'i.
+
+    Aşamalar: ingest (kaynak→bot), score (Claude), confirm (fiyat teyidi),
+    order (karar→emir), pipeline (alım→emir uçtan uca). Her aşama için
+    count/avg/p50/p95/max/last. Salt gözlem; örnekler kayan pencerede tutulur.
+    """
+    return {"stages": latency.summary()}
 
 
 @app.get("/health")

@@ -597,6 +597,7 @@ export default function App() {
   const [shadowEvalRunning, setShadowEvalRunning] = useState(false);
   const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [complexity, setComplexity] = useState<Complexity | null>(null);
+  const [cost, setCost] = useState<{ totals: { calls: number; est_cost_usd: number }; projected_daily_usd: number } | null>(null);
   const [golive, setGolive] = useState<GoLive | null>(null);
   const [srcHealth, setSrcHealth] = useState<SourcesHealth | null>(null);
   const [brainBt, setBrainBt] = useState<BrainBacktest | null>(null);
@@ -631,7 +632,7 @@ export default function App() {
   const load = useCallback(async () => {
     setErr(null);
     try {
-      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes, cxRes] = await Promise.all([
+      const [nRes, sRes, pRes, perfRes, sigRes, nsRes, riskRes, healthRes, closedRes, sumRes, tuningRes, bsRes, rdRes, shRes, glRes, srcRes, baRes, latRes, latHistRes, evRes, cxRes, costRes] = await Promise.all([
         fetch(`${API_BASE}/news?limit=200`),
         fetch(`${API_BASE}/settings`),
         fetch(`${API_BASE}/positions`),
@@ -653,6 +654,7 @@ export default function App() {
         fetch(`${API_BASE}/latency/history?stage=pipeline&hours=24`),
         fetch(`${API_BASE}/events?limit=30`),
         fetch(`${API_BASE}/complexity`),
+        fetch(`${API_BASE}/cost`),
       ]);
       if (!nRes.ok) throw new Error(`news ${nRes.status}`);
       const nData: NewsPayload = await nRes.json();
@@ -696,6 +698,7 @@ export default function App() {
       if (latHistRes.ok) setLatencyHist((await latHistRes.json()).points ?? []);
       if (evRes.ok) setOpsEvents(await evRes.json());
       if (cxRes.ok) setComplexity(await cxRes.json());
+      if (costRes.ok) setCost(await costRes.json());
       if (sigRes.ok) {
         const sig = await sigRes.json();
         setSignalSpan({ count: sig.count ?? 0, first_ts: sig.first_ts ?? null, last_ts: sig.last_ts ?? null });
@@ -2087,6 +2090,11 @@ export default function App() {
                     {complexity.n_active_layers} aktif katman · {complexity.closed_trades} işlem
                     {complexity.claude_cost.calls_per_qualifying_entry > 0 ? ` · ~${complexity.claude_cost.calls_per_qualifying_entry} Claude/aday` : ""}
                   </span>
+                  {cost && cost.totals.calls > 0 && (
+                    <span className="text-[11px] text-zinc-400" title={`${cost.totals.calls} Claude çağrısı · tahmini toplam $${cost.totals.est_cost_usd}`}>
+                      💸 ~${cost.projected_daily_usd}/gün ({cost.totals.calls} çağrı)
+                    </span>
+                  )}
                 </div>
                 {complexity.active_layers.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 text-[11px]">

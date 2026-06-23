@@ -87,6 +87,8 @@ SOURCE_COOLDOWN_SEC = float(os.environ.get("SOURCE_COOLDOWN_SEC", "300"))
 # Gecikme kalıcılığı: periyodik olarak latency özetini arşivle (restart'a dayanıklı trend).
 LATENCY_SNAPSHOT_EVERY_SEC = float(os.environ.get("LATENCY_SNAPSHOT_EVERY_SEC", "300"))
 MAX_LATENCY_SNAPSHOTS = int(os.environ.get("MAX_LATENCY_SNAPSHOTS", "10000"))
+# Operasyonel olay zaman çizelgesi: incident günlüğünde tutulacak max kayıt.
+MAX_OPS_EVENTS = int(os.environ.get("MAX_OPS_EVENTS", "5000"))
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -432,9 +434,11 @@ def _on_source_result(name: str, ok: bool, error: str = "") -> None:
         log.warning("Kaynak DEVRE DIŞI (üst üste hata): %s", name)
         notify_remote(f"⚠️ KAYNAK DEVRE DIŞI: '{name}' üst üste hata verdi, geçici "
                       f"devre dışı (cooldown). Son hata: {error[:120]}")
+        _record_event("source_disabled", "warn", f"üst üste hata: {error[:120]}", name)
     elif transition == "recovered":
         log.info("Kaynak toparlandı: %s", name)
         notify_remote(f"✅ KAYNAK TOPARLANDI: '{name}' yeniden çalışıyor.")
+        _record_event("source_recovered", "info", "cooldown sonrası yeniden çalışıyor", name)
 
 
 def fetch_all(session: requests.Session) -> list[NewsItem]:
@@ -1319,6 +1323,26 @@ def notify_remote(text: str) -> None:
         log.warning("Uzak bildirim hatası: %s", e)
 
 
+_ops_event_count = 0
+
+
+def _record_event(kind: str, severity: str, detail: str = "", source: str = "") -> None:
+    """Operasyonel olayı (incident) kalıcı zaman çizelgesine yaz. Hata akışı bozmaz.
+
+    Geçiş-temelli (durum-makinesi) çağrılır — feed kopuk/geri, kaynak devre-dışı/toparlandı,
+    gecikme SLA aşıldı/düzeldi, devre kesici tetiklendi/temizlendi. Canlı post-mortem için
+    kalıcı kayıt (`/events`). Bildirimlerle çakışmaz: bildirim anlık, bu arşivlenebilir tarih.
+    """
+    global _ops_event_count
+    try:
+        get_store().add_ops_event(kind, severity, detail, source)
+        _ops_event_count += 1
+        if _ops_event_count % 50 == 0:
+            get_store().prune_ops_events(MAX_OPS_EVENTS)
+    except Exception as e:
+        log.warning("Operasyonel olay yazılamadı (%s): %s", kind, e)
+
+
 def _fmt_summary_msg(s: dict[str, Any]) -> str:
     """Günlük işlem özetini uzak kanal için düz metne çevir."""
     sign = "+" if s["realized"] >= 0 else ""
@@ -1382,9 +1406,11 @@ def _maybe_deadman_alert(now: float | None = None) -> None:
             detail = f"son mesaj {mins} dk önce"
         notify_remote(f"⚠️ HABER AKIŞI DURDU: {detail}. Gerçek-zamanlı sinyal "
                       "alınamıyor olabilir — motoru/bağlantıyı kontrol et.")
+        _record_event("feed_stale", "warn", detail, "treenews")
     elif not stale and _ws_alert_active:
         _ws_alert_active = False
         notify_remote("✅ Haber akışı geri geldi (WS bağlı, mesaj akıyor).")
+        _record_event("feed_recovered", "info", "WS bağlı, mesaj akıyor", "treenews")
 
 
 def notify(item: NewsItem) -> None:
@@ -1795,6 +1821,32 @@ def _maybe_snapshot_latency() -> None:
         log.warning("Gecikme anlık görüntüsü yazılamadı: %s", e)
 
 
+_ops_state: dict[str, Any] = {"latency_breaches": set(), "halt_active": False}
+
+
+def _check_ops_transitions() -> None:
+    """Gecikme SLA + devre kesici DURUM GEÇİŞLERİNİ yakala → olay zaman çizelgesine yaz.
+
+    Kaynak/feed geçişleri kendi durum-makinelerinden (`_on_source_result`/deadman) yazılır;
+    bu, kalan iki ekseni (latency breach onset/clear + halt trip/clear) son-görülen duruma
+    göre kıyaslayıp YALNIZ geçişte olay üretir (sürekli tekrar değil). Monitör döngüsünden."""
+    # Gecikme SLA: yeni aşan / yeni düzelen aşamalar
+    cur = set(_latency_breaches())
+    prev = _ops_state["latency_breaches"]
+    for stage in cur - prev:
+        _record_event("latency_breach", "warn", "p95 SLA eşiğini aştı (yavaş)", stage)
+    for stage in prev - cur:
+        _record_event("latency_clear", "info", "p95 SLA içine döndü", stage)
+    _ops_state["latency_breaches"] = cur
+    # Devre kesici: tetiklendi / temizlendi
+    halt = trader.get_halt()
+    if halt["active"] and not _ops_state["halt_active"]:
+        _record_event("halt_tripped", "critical", str(halt.get("reason", "")), "")
+    elif not halt["active"] and _ops_state["halt_active"]:
+        _record_event("halt_cleared", "info", "devre kesici temizlendi", "")
+    _ops_state["halt_active"] = bool(halt["active"])
+
+
 def _persist_closed(pos: dict[str, Any]) -> None:
     """Kapanan işlemi kalıcı deftere yaz (trade_state.json 500 sınırı dışı). Hata akışı bozmaz."""
     try:
@@ -1841,6 +1893,10 @@ def _monitor_loop(stop: threading.Event) -> None:
         except Exception as e:
             log.warning("Periyodik mutabakat hatası: %s", e)
         _maybe_snapshot_latency()         # gecikme trendini kalıcı arşivle (5dk)
+        try:
+            _check_ops_transitions()      # latency-breach/halt geçişlerini olaya yaz
+        except Exception as e:
+            log.warning("Operasyonel geçiş kontrolü hatası: %s", e)
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -2332,6 +2388,24 @@ def sources_health() -> dict[str, Any]:
             "disabled": [n for n, v in snap.items() if v["disabled"]],
             "n_sources": len(snap),
             "n_disabled": sum(1 for v in snap.values() if v["disabled"])}
+
+
+@app.get("/events")
+def ops_events(limit: int = 200, kind: str | None = None,
+               severity: str | None = None, hours: float | None = None) -> dict[str, Any]:
+    """Operasyonel olay zaman çizelgesi (incident günlüğü) — canlı post-mortem için.
+
+    Kalıcı kayıt: feed kopuk/geri, kaynak devre-dışı/toparlandı, gecikme SLA aşıldı/
+    düzeldi, devre kesici tetiklendi/temizlendi (yalnız DURUM GEÇİŞLERİ, spam yok).
+    `kind`/`severity`/`hours` ile filtrele; en yeniden eskiye. Bildirimler anlık;
+    bu, geriye dönük incelenebilir tarihtir."""
+    try:
+        events = get_store().list_ops_events(limit=limit, kind=kind,
+                                              severity=severity, hours=hours)
+        span = get_store().ops_event_span()
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "events": []}
+    return {"ok": True, "events": events, "span": span}
 
 
 @app.get("/risk")

@@ -2622,6 +2622,79 @@ def auto_preview(limit: int = 20, brain: bool = False) -> dict[str, Any]:
     return {"preview": preview, "auto_trade_on": trader.S.auto_trade, "brain_used": use_brain}
 
 
+def _symbol_from_coins(coins: list[str]) -> str | None:
+    """İlk işlem-yapılabilir coin'den USDT paritesi türet (stablecoin atlanır). Saf, ağsız."""
+    for c in coins:
+        cu = str(c).upper().replace("USDT", "").replace("/", "").strip()
+        if cu and cu not in _NOT_TRADEABLE:
+            return f"{cu}USDT"
+    return None
+
+
+class SimulateRequest(BaseModel):
+    title: str
+    source: str = "simülasyon"
+    coins: list[str] | None = None
+    body: str = ""
+    use_claude: bool = False         # Claude ile rafine puanla (ağ + maliyet); vars. kural-tabanlı
+    confirmed: bool = False          # "fiyat teyit etti" varsay (canlıda teyit ağ ister)
+    rel_volume: float | None = None  # RVOL ipucu (teyitle birlikte trade kapısını aşmak için)
+    notify: bool = False             # test bildirimi de gönder (Telegram/Discord kurulumunu doğrula)
+
+
+@app.post("/simulate", dependencies=[Depends(require_token)])
+def simulate(req: SimulateRequest) -> dict[str, Any]:
+    """Test haberi: keyfi bir başlığı GERÇEK puanlama+karar yolundan geçir — YAN ETKİSİZ.
+
+    "Bu haber gelse sistem ne yapardı?" sorusunun cevabı. Başlığı kural-puanlayıcıdan
+    (isteğe bağlı Claude) geçirir → coin/impact/yön/gerekçe çıkarır, oto-işlem kararını
+    (`auto_decision`, dry-run) ve uyarı eşiğini gösterir. **Arşive yazmaz, gerçek emir
+    açmaz, _seen/_news'e eklemez, öğrenmeyi kirletmez** — tamamen güvenli deneme.
+
+    Ağsız çalışır (canlıda `confirm_with_price` Binance'ten fiyat çeker; burada
+    `confirmed`/`rel_volume` ile teyit senaryosunu elle kurabilirsin → trade kapısını
+    gör). `notify=true` ile uzak bildirim de atar (telefon alarmını test et).
+    """
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title boş olamaz")
+    now = _now_iso()
+    item = NewsItem(id=_news_id(str(req.source or "simülasyon"), "", title),
+                    source=str(req.source or "simülasyon"), title=title, url="",
+                    published=now, fetched_at=now, body=_strip_html(req.body or ""))
+    score_item(item)
+    if req.coins:   # kullanıcı coin ipucu verdiyse öne ekle (puanlayıcı kaçırmışsa)
+        for c in reversed(req.coins):
+            cu = str(c).upper().replace("USDT", "").replace("/", "").strip()
+            if cu and cu not in item.coins:
+                item.coins.insert(0, cu)
+    if req.use_claude and USE_CLAUDE:
+        try:
+            score_with_claude([item])
+        except Exception as e:
+            log.warning("Simülasyon Claude puanlama başarısız, kural skoru geçerli: %s", e)
+    if not item.symbol:                      # ağsız symbol türetimi (canlıda confirm yapar)
+        item.symbol = _symbol_from_coins(item.coins)
+    if req.confirmed:                        # teyit senaryosunu elle kur (ağsız demo)
+        item.confirmed = True
+        item.price_note = "Teyit (simüle edildi)"
+    if req.rel_volume is not None:
+        item.rel_volume = float(req.rel_volume)
+    threshold = get_news_settings()["alert_threshold"]
+    decision = trader.auto_decision(item, **_trade_context(item))
+    if req.notify:
+        notify_remote(f"🧪 TEST haberi: {title}  (impact {item.impact}/10 · {item.direction})")
+    return {
+        "item": {**item.to_dict(), "body": item.body},
+        "would_alert": item.impact >= threshold,
+        "alert_threshold": threshold,
+        "decision": {"would_trade": decision["would_trade"], "reason": decision["reason"],
+                     "side": decision["side"], "usdt": decision["usdt"]},
+        "notified": bool(req.notify),
+        "note": "Yan etkisiz: arşive yazılmaz, gerçek emir açılmaz, öğrenmeyi etkilemez.",
+    }
+
+
 def _closed_trades(limit: int) -> list[dict[str, Any]]:
     """Kalıcı arşivden kapanan işlemler; arşiv boşsa in-memory deftere düş."""
     try:

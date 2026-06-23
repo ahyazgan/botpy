@@ -552,6 +552,14 @@ function TextField({ label, value, onSave, hint }: { label: string; value: strin
   );
 }
 
+type SimResult = {
+  item: { title: string; impact: number; direction: string; coins: string[]; symbol: string | null; reason: string; confirmed: boolean };
+  would_alert: boolean;
+  alert_threshold: number;
+  decision: { would_trade: boolean; reason: string; side: string | null; usdt: number };
+  notified: boolean;
+};
+
 export default function App() {
   const [news, setNews] = useState<NewsItem[]>([]);
   const [meta, setMeta] = useState({ total_seen: 0, alert_threshold: 7, updated_at: null as string | null });
@@ -567,6 +575,9 @@ export default function App() {
   const [alphaRunning, setAlphaRunning] = useState(false);
   const [mc, setMc] = useState<MonteCarlo | null>(null);
   const [mcRunning, setMcRunning] = useState(false);
+  const [sim, setSim] = useState<SimResult | null>(null);
+  const [simTitle, setSimTitle] = useState("");
+  const [simRunning, setSimRunning] = useState(false);
   const [ablationRunning, setAblationRunning] = useState(false);
   const [signalSpan, setSignalSpan] = useState<SignalSpan>({ count: 0, first_ts: null, last_ts: null });
   const [archive, setArchive] = useState<ArchivedSignal[]>([]);
@@ -858,6 +869,25 @@ export default function App() {
       setErr(e instanceof Error ? e.message : "Monte Carlo hatası");
     } finally {
       setMcRunning(false);
+    }
+  };
+
+  const runSimulate = async () => {
+    const title = simTitle.trim();
+    if (!title) return;
+    setSimRunning(true);
+    try {
+      const r = await fetch(`${API_BASE}/simulate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      if (!r.ok) throw new Error(`simulate ${r.status}`);
+      setSim(await r.json());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Simülasyon hatası");
+    } finally {
+      setSimRunning(false);
     }
   };
 
@@ -2419,6 +2449,51 @@ export default function App() {
               {mcRunning ? "Simüle…" : "🎲 Monte Carlo risk"}
             </button>
           </div>
+        </div>
+
+        {/* Test haberi: keyfi başlığı gerçek puanlama+karar yolundan geçir (yan etkisiz) */}
+        <div className="mb-3 rounded-2xl border border-sky-500/30 bg-sky-950/20 px-4 py-3">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold uppercase tracking-wider text-sky-300/80">🧪 Test haberi</span>
+            <span className="text-xs text-zinc-500">başlık yaz → sistem nasıl okur/işlem açar mı gör (arşive yazmaz, gerçek emir açmaz)</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              value={simTitle}
+              onChange={(e) => setSimTitle(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void runSimulate(); }}
+              placeholder="örn: Binance lists new token PEPE with massive volume"
+              className="h-8 min-w-[16rem] flex-1 rounded-md border border-zinc-700 bg-zinc-800/80 px-2 text-xs text-zinc-200 outline-none focus:border-sky-500/50"
+            />
+            <button
+              type="button"
+              onClick={() => void runSimulate()}
+              disabled={simRunning || !simTitle.trim()}
+              className="rounded-md border border-sky-500/40 bg-sky-950/40 px-3 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-900/50 disabled:opacity-50"
+            >
+              {simRunning ? "Çalışıyor…" : "Çalıştır"}
+            </button>
+          </div>
+          {sim && (
+            <div className="mt-3 rounded-lg border border-white/10 bg-zinc-900/50 px-3 py-2 text-xs">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <span className={`rounded px-2 py-0.5 font-semibold ${sim.item.direction === "bullish" ? "bg-emerald-900/50 text-emerald-200" : sim.item.direction === "bearish" ? "bg-red-900/50 text-red-200" : "bg-zinc-800 text-zinc-300"}`}>
+                  güç {sim.item.impact}/10 · {sim.item.direction}
+                </span>
+                {sim.item.symbol && <span className="rounded bg-zinc-800 px-2 py-0.5 text-zinc-300">{sim.item.symbol}</span>}
+                {sim.item.coins.length > 0 && <span className="text-zinc-400">{sim.item.coins.join(", ")}</span>}
+                <span className={`rounded px-2 py-0.5 ${sim.would_alert ? "bg-amber-900/50 text-amber-200" : "bg-zinc-800 text-zinc-500"}`}>
+                  {sim.would_alert ? `⚠ uyarı (eşik ${sim.alert_threshold})` : `uyarı yok (eşik ${sim.alert_threshold})`}
+                </span>
+                <span className={`rounded px-2 py-0.5 font-semibold ${sim.decision.would_trade ? "bg-sky-900/50 text-sky-200" : "bg-zinc-800 text-zinc-500"}`}>
+                  {sim.decision.would_trade ? `işlem AÇILIR: ${sim.decision.side} $${sim.decision.usdt}` : "işlem açılmaz"}
+                </span>
+              </div>
+              {sim.item.reason && <div className="text-zinc-400">gerekçe: {sim.item.reason}</div>}
+              <div className="text-zinc-500">karar: {sim.decision.reason}</div>
+            </div>
+          )}
         </div>
 
         {/* Monte Carlo: sonuç dağılımı + iflas riski */}

@@ -354,6 +354,7 @@ type Health = {
   halt_reason?: string;
   backup_scan_interval_sec?: number;
   latency_breaches?: string[];
+  loops_stale?: string[];
 };
 
 type ClosedTrade = {
@@ -1560,6 +1561,9 @@ export default function App() {
               )}
               {!!health.latency_breaches && health.latency_breaches.length > 0 && (
                 <span className="font-semibold text-red-400" title={`Boru hattı gecikme SLA aşıldı (yavaş): ${health.latency_breaches.join(", ")} — oto-işlem durdurulabilir`}>🐢 gecikme: {health.latency_breaches.join(",")}</span>
+              )}
+              {!!health.loops_stale && health.loops_stale.length > 0 && (
+                <span className="font-bold text-red-300 animate-pulse" title={`İç döngü TAKILDI: ${health.loops_stale.join(", ")} — monitör takılırsa SL/TP tetiklenemez! Motoru yeniden başlat.`}>🛑 döngü takıldı: {health.loops_stale.join(",")}</span>
               )}
               {!!srcHealth && srcHealth.n_disabled > 0 && (
                 <span className="font-semibold text-amber-400" title={`Üst üste hata sonrası devre dışı yedek kaynak: ${srcHealth.disabled.join(", ")}`}>🔌 kaynak ×{srcHealth.n_disabled} devre dışı</span>

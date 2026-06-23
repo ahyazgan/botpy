@@ -47,6 +47,7 @@ import latency
 import sourcehealth
 import storage
 import trader
+import watchdog as watchdog_mod
 from netutil import get_json, get_stats
 from notify import Notifier
 
@@ -91,6 +92,10 @@ LATENCY_SNAPSHOT_EVERY_SEC = float(os.environ.get("LATENCY_SNAPSHOT_EVERY_SEC", 
 MAX_LATENCY_SNAPSHOTS = int(os.environ.get("MAX_LATENCY_SNAPSHOTS", "10000"))
 # Operasyonel olay zaman çizelgesi: incident günlüğünde tutulacak max kayıt.
 MAX_OPS_EVENTS = int(os.environ.get("MAX_OPS_EVENTS", "5000"))
+# Bot iç-watchdog: arka plan döngüleri bu kadar saniye heartbeat vermezse "takılı" sayılır.
+WATCHDOG_INTERVAL_SEC = float(os.environ.get("WATCHDOG_INTERVAL_SEC", "15"))
+MONITOR_STALL_SEC = float(os.environ.get("MONITOR_STALL_SEC", "60"))    # pozisyon-izleme (8s tur)
+SCAN_STALL_SEC = float(os.environ.get("SCAN_STALL_SEC", "120"))         # arka plan tarama (20s tur)
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -305,6 +310,7 @@ _metrics: dict[str, int] = {
     "failover_scans_total": 0,  # WS bayatken hızlı yedek tarama sayısı (kaynak redundansı)
     "source_disabled_total": 0, # üst üste hata sonrası devre dışı bırakılan yedek kaynak sayısı
     "price_anomaly_total": 0,   # reddedilen anormal/bozuk fiyat verisi (teyit edilemeyen)
+    "loop_stalls_total": 0,     # iç döngü (monitor/scan) takıldı tespiti (watchdog)
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -460,6 +466,10 @@ def set_rss_feeds(feeds: dict[str, str]) -> dict[str, str]:
 # Yedek kaynak sağlık kaydı (RSS feed'leri + Binance duyuruları için durum-makinesi)
 _source_health = sourcehealth.SourceHealth(SOURCE_FAIL_THRESHOLD, SOURCE_COOLDOWN_SEC)
 _BINANCE_SOURCE = "Binance duyuruları"
+
+# Bot iç döngü watchdog'u (monitor/scan canlılığı) — pozisyon-izleme ölürse SL tetiklenmez
+_watchdog = watchdog_mod.Watchdog()
+_watchdog_stale_prev: set[str] = set()
 
 
 def _on_source_result(name: str, ok: bool, error: str = "") -> None:
@@ -1829,6 +1839,7 @@ def _background_loop(stop: threading.Event) -> None:
         interval = _scan_interval()
         if interval < SCAN_INTERVAL_SEC:   # failover: WS bayat → hızlı yedek tarama
             _metrics["failover_scans_total"] += 1
+        _watchdog.beat("scan")             # canlılık: tarama turu tamamlandı
         if stop.wait(interval):
             break
 
@@ -1887,6 +1898,50 @@ def _maybe_snapshot_latency() -> None:
 
 
 _ops_state: dict[str, Any] = {"latency_breaches": set(), "halt_active": False, "drawdown_halt": False}
+
+
+_LOOP_LABELS = {"monitor": "pozisyon-izleme (SL/TP)", "scan": "haber tarama"}
+
+
+def _check_watchdog() -> None:
+    """İç döngü heartbeat'lerini denetle; YENİ takılan döngüyü LOUD bildir + olay + (monitor
+    takıldıysa) devre kesiciyi aç. Bayat 'monitor' = SL/TP tetiklenemiyor (felaket) → halt.
+
+    Durum-makinesi: yalnız geçişte (sağlıklı→takıldı / takıldı→toparlandı) uyarır (spam yok).
+    Ayrı watchdog thread'inden çağrılır — izlediği döngülerden bağımsız (onlar takılsa da çalışır).
+    """
+    global _watchdog_stale_prev
+    cur = set(_watchdog.stale())
+    for name in cur - _watchdog_stale_prev:        # yeni takılan
+        _metrics["loop_stalls_total"] += 1
+        label = _LOOP_LABELS.get(name, name)
+        log.error("WATCHDOG: '%s' döngüsü takıldı (heartbeat bayat)", name)
+        _record_event("loop_stalled", "critical", f"{label} döngüsü heartbeat vermiyor", name)
+        notify_remote(f"⛔ WATCHDOG: '{label}' döngüsü TAKILDI — "
+                      + ("SL/TP tetiklenemiyor olabilir, pozisyonları ELLE kontrol et!"
+                         if name == "monitor" else "tarama durmuş olabilir.")
+                      + " Motoru yeniden başlat.")
+        if name == "monitor" and trader.S.halt_on_monitor_stall:
+            trader.trip_halt("pozisyon-izleme döngüsü takıldı (SL korumasız)")
+    for name in _watchdog_stale_prev - cur:        # toparlandı
+        label = _LOOP_LABELS.get(name, name)
+        log.info("WATCHDOG: '%s' döngüsü toparlandı", name)
+        _record_event("loop_recovered", "info", f"{label} döngüsü yeniden canlı", name)
+        notify_remote(f"✅ WATCHDOG: '{label}' döngüsü yeniden çalışıyor.")
+    _watchdog_stale_prev = cur
+
+
+def _watchdog_loop(stop: threading.Event) -> None:
+    """İzlediği döngülerden bağımsız hafif watchdog thread'i (ağsız; takılmaz)."""
+    _watchdog.register("monitor", MONITOR_STALL_SEC)
+    _watchdog.register("scan", SCAN_STALL_SEC)
+    while not stop.is_set():
+        if stop.wait(WATCHDOG_INTERVAL_SEC):
+            break
+        try:
+            _check_watchdog()
+        except Exception as e:
+            log.warning("Watchdog kontrol hatası: %s", e)
 
 
 def _check_ops_transitions() -> None:
@@ -1973,6 +2028,7 @@ def _monitor_loop(stop: threading.Event) -> None:
             _check_ops_transitions()      # latency-breach/halt geçişlerini olaya yaz
         except Exception as e:
             log.warning("Operasyonel geçiş kontrolü hatası: %s", e)
+        _watchdog.beat("monitor")         # canlılık: pozisyon-izleme turu tamamlandı
         if stop.wait(MONITOR_INTERVAL_SEC):
             break
 
@@ -2101,6 +2157,7 @@ _stop_event = threading.Event()
 _bg_thread: threading.Thread | None = None
 _ws_thread: threading.Thread | None = None
 _mon_thread: threading.Thread | None = None
+_wd_thread: threading.Thread | None = None
 
 
 _instance_lock: Any = None   # tek-instance kilidi (handle'ı canlı tut → OS kilidi açık kalır)
@@ -2138,7 +2195,7 @@ def _acquire_singleton_lock() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _bg_thread, _ws_thread, _mon_thread
+    global _bg_thread, _ws_thread, _mon_thread, _wd_thread
     setup_logging()
     if not _acquire_singleton_lock():
         raise RuntimeError(
@@ -2167,6 +2224,8 @@ async def lifespan(app: FastAPI):
     _bg_thread.start()
     _mon_thread = threading.Thread(target=_monitor_loop, args=(_stop_event,), daemon=True)
     _mon_thread.start()
+    _wd_thread = threading.Thread(target=_watchdog_loop, args=(_stop_event,), daemon=True)
+    _wd_thread.start()
     if USE_TREENEWS:
         _ws_thread = threading.Thread(target=_tree_ws_loop, args=(_stop_event,), daemon=True)
         _ws_thread.start()
@@ -2177,7 +2236,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     _stop_event.set()
-    for th in (_bg_thread, _ws_thread, _mon_thread):
+    for th in (_bg_thread, _ws_thread, _mon_thread, _wd_thread):
         if th:
             th.join(timeout=5)
 
@@ -2300,6 +2359,8 @@ _METRIC_META = {
     "botpy_source_disabled_total": ("counter", "Üst üste hatada devre dışı bırakılan yedek kaynak"),
     "botpy_sources_disabled": ("gauge", "Şu an devre dışı yedek kaynak sayısı"),
     "botpy_price_anomaly_total": ("counter", "Reddedilen anormal/bozuk fiyat verisi"),
+    "botpy_loop_stalls_total": ("counter", "İç döngü (monitor/scan) takıldı tespiti"),
+    "botpy_loops_stale": ("gauge", "Şu an takılı iç döngü sayısı"),
     "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
     "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
@@ -2358,6 +2419,8 @@ def metrics() -> PlainTextResponse:
         "botpy_source_disabled_total": _metrics["source_disabled_total"],
         "botpy_sources_disabled": sum(1 for v in _source_health.snapshot().values() if v["disabled"]),
         "botpy_price_anomaly_total": _metrics["price_anomaly_total"],
+        "botpy_loop_stalls_total": _metrics["loop_stalls_total"],
+        "botpy_loops_stale": len(_watchdog.stale()),
         "botpy_halts_total": trader._halts,
         "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
@@ -2466,6 +2529,8 @@ def health() -> dict[str, Any]:
         "feed_stale": _ws_feed_stale(),
         "backup_scan_interval_sec": _scan_interval(),   # failover'da düşer (hızlı yedek tarama)
         "latency_breaches": _latency_breaches(),         # SLA aşan boru hattı aşamaları (yavaş)
+        "loops": _watchdog.health(),                      # iç döngü canlılığı (monitor/scan)
+        "loops_stale": _watchdog.stale(),                 # takılı döngüler (boş = sağlıklı)
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],

@@ -94,6 +94,8 @@ class Settings:
     max_drawdown_pct: float = 0.0
     account_equity_usdt: float = 10000.0
     reduce_after_losses: int = 0     # >0: son N işlem zararsa boyutu yarıla (kayıp serisi freni)
+    # Bot iç-watchdog: pozisyon-izleme döngüsü takılırsa (SL tetiklenemez) devre kesiciyi aç
+    halt_on_monitor_stall: bool = True
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
     exchange_native_stops: bool = True   # canlıda borsaya DURAN SL/TP emri koy (bot çökse de korur)
@@ -165,6 +167,7 @@ _PERSIST_KEYS = (
     "portfolio_risk", "corr_threshold", "max_portfolio_heat",
     "size_by_volume", "min_rel_volume", "rvol_scale_by_impact", "max_book_frac",
     "exchange_native_stops", "reconcile_autoclose", "auto_halt_on_anomaly",
+    "halt_on_monitor_stall",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "partial_tp_levels",
     "max_open_risk_usdt", "reduce_after_losses",

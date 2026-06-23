@@ -77,6 +77,9 @@ def require_token(x_api_token: str | None = Header(default=None)) -> None:
 
 # ── Ayarlar ──────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 20      # saniye — kaynaklar ne sıklıkta taransın
+# Failover: asıl gerçek-zamanlı kaynak (TreeNews WS) bayatlayınca RSS/Binance
+# yedeği bu HIZLI aralıkta tarar (20s yerine) → kopuk realtime'da boşluğu doldur.
+SCAN_INTERVAL_FAST_SEC = int(os.environ.get("SCAN_INTERVAL_FAST_SEC", "5"))
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
@@ -254,6 +257,7 @@ _metrics: dict[str, int] = {
     "scan_errors_total": 0,     # arka plan tarama hatası sayısı
     "reconcile_drift_total": 0, # mutabakatta bulunan hayalet pozisyon (news_bot gözlemler)
     "protect_errors_total": 0,  # borsa koruyucu stop konamadı (news_bot gözlemler)
+    "failover_scans_total": 0,  # WS bayatken hızlı yedek tarama sayısı (kaynak redundansı)
 }
 
 # TreeNews WS sağlığı (asıl gerçek-zamanlı kaynak) — gözlemlenebilirlik
@@ -1652,6 +1656,17 @@ def refresh(session: requests.Session) -> None:
             _status["updated_at"] = _now_iso()
 
 
+def _scan_interval(now: float | None = None) -> int:
+    """Yedek tarama aralığı: asıl realtime kaynak (WS) bayatsa HIZLI, yoksa normal. Saf.
+
+    TreeNews WS kopuk/sessizse RSS+Binance yedeği boşluğu doldurmak için sıklaşır
+    (kaynak redundansı). WS sağlıklıyken normal cadence — gereksiz API yükü yok.
+    """
+    if _ws_feed_stale(now):
+        return min(SCAN_INTERVAL_FAST_SEC, SCAN_INTERVAL_SEC)
+    return SCAN_INTERVAL_SEC
+
+
 def _background_loop(stop: threading.Event) -> None:
     session = requests.Session()
     session.headers.setdefault("User-Agent", "kripto-haber-bot/1.0")
@@ -1659,7 +1674,10 @@ def _background_loop(stop: threading.Event) -> None:
         refresh(session)
         _maybe_daily_digest()      # gün dönümünde dünün özetini gönder
         _maybe_deadman_alert()     # haber akışı durduysa uyar (ölü-adam anahtarı)
-        if stop.wait(SCAN_INTERVAL_SEC):
+        interval = _scan_interval()
+        if interval < SCAN_INTERVAL_SEC:   # failover: WS bayat → hızlı yedek tarama
+            _metrics["failover_scans_total"] += 1
+        if stop.wait(interval):
             break
 
 
@@ -2054,6 +2072,8 @@ _METRIC_META = {
     "botpy_order_rejects_total": ("counter", "Borsa emir red/dolmama (canlı)"),
     "botpy_reconcile_drift_total": ("counter", "Mutabakatta bulunan hayalet pozisyon"),
     "botpy_protect_errors_total": ("counter", "Borsa koruyucu stop konamadı"),
+    "botpy_failover_scans_total": ("counter", "WS bayatken hızlı yedek tarama (failover)"),
+    "botpy_backup_scan_interval_seconds": ("gauge", "Aktif yedek tarama aralığı (failover'da düşer)"),
     "botpy_halts_total": ("counter", "Operasyonel devre kesici tetiklenme"),
     "botpy_trading_halted": ("gauge", "Operasyonel durdurma aktif mi (1/0)"),
     "botpy_open_positions": ("gauge", "Açık pozisyon sayısı"),
@@ -2105,6 +2125,8 @@ def metrics() -> PlainTextResponse:
         "botpy_order_rejects_total": trader._order_rejects,
         "botpy_reconcile_drift_total": _metrics["reconcile_drift_total"],
         "botpy_protect_errors_total": _metrics["protect_errors_total"],
+        "botpy_failover_scans_total": _metrics["failover_scans_total"],
+        "botpy_backup_scan_interval_seconds": _scan_interval(),
         "botpy_halts_total": trader._halts,
         "botpy_trading_halted": 1 if trader.get_halt()["active"] else 0,
         "botpy_open_positions": len(trader._positions),
@@ -2149,6 +2171,7 @@ def health() -> dict[str, Any]:
         "ws_connected": _ws_state["connected"],
         "ws_last_msg_age_sec": _ws_last_msg_age(),
         "feed_stale": _ws_feed_stale(),
+        "backup_scan_interval_sec": _scan_interval(),   # failover'da düşer (hızlı yedek tarama)
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],

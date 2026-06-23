@@ -100,6 +100,7 @@ def flatten_metrics(summary: dict[str, dict[str, float]], prefix: str = "botpy_l
 
 
 _DEFAULT = LatencyTracker()
+_BY_SOURCE = LatencyTracker()   # kaynak-bazlı ingest kırılımı (hangi besleme yavaş)
 
 
 def record(stage: str, ms: float | None) -> None:
@@ -107,16 +108,45 @@ def record(stage: str, ms: float | None) -> None:
     _DEFAULT.record(stage, ms)
 
 
+def record_source(bucket: str, ms: float | None) -> None:
+    """Kaynak-bazlı ingest örneği (bucket: treenews/binance/rss...)."""
+    _BY_SOURCE.record(bucket, ms)
+
+
 def summary() -> dict[str, dict[str, float]]:
     """Modül-düzeyi varsayılan tracker özeti."""
     return _DEFAULT.summary()
 
 
+def source_summary() -> dict[str, dict[str, float]]:
+    """Kaynak-bazlı ingest özeti."""
+    return _BY_SOURCE.summary()
+
+
 def reset() -> None:
-    """Modül-düzeyi varsayılan tracker'ı temizle."""
+    """Modül-düzeyi varsayılan tracker'ları temizle."""
     _DEFAULT.reset()
+    _BY_SOURCE.reset()
 
 
 def get_metrics() -> dict[str, Any]:
     """Düz Prometheus gauge sözlüğü (varsayılan tracker'dan)."""
     return flatten_metrics(_DEFAULT.summary())
+
+
+def evaluate_sla(summary: dict[str, dict[str, float]],
+                 sla_ms: dict[str, float], min_samples: int = 5) -> dict[str, dict[str, Any]]:
+    """Her aşamanın p95'ini SLA eşiğiyle kıyasla. Saf.
+
+    Yalnız SLA tanımlı + yeterli örneği (`min_samples`) olan aşamalar değerlendirilir.
+    Dönen: {stage: {p95_ms, sla_ms, ok, samples}}. `ok=False` = p95 eşiği aştı (yavaş).
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for stage, limit in sla_ms.items():
+        st = summary.get(stage)
+        if not st or st.get("count", 0) < min_samples:
+            continue
+        p95 = st["p95_ms"]
+        out[stage] = {"p95_ms": p95, "sla_ms": limit, "ok": p95 <= limit,
+                      "samples": int(st["count"])}
+    return out

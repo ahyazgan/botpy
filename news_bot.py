@@ -919,6 +919,7 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
     # Çoklu-oylama: N bağımsız çağrı → çoğunluk enter + medyan conviction (gürültü azaltma).
     # vote_count=1 ise tek çağrı (eski davranış). Bağımsızlık: aynı model, ayrı API çağrıları.
     n_votes = max(1, trader.S.brain_vote_count)
+    _t_brain = time.monotonic()
     r, vote = _brain_vote(client, ENTRY_BRAIN_MODEL, ctx, n_votes)
     model_used, escalated = ENTRY_BRAIN_MODEL, False
     # İki-kademeli: kararsız bantta daha güçlü modele ikinci bakış (nihai karar onun)
@@ -945,6 +946,9 @@ def entry_brain_decision(item: NewsItem, decision: dict[str, Any], *,
     }
     if vote is not None:
         out["vote"] = vote   # şeffaflık: oy sayısı + enter-oranı + oybirliği
+    if not backtest:
+        # Beyin (Claude) çağrı gecikmesi — Tier-2'de asıl maliyet; eskalasyon/oylama dahil
+        latency.record("brain", (time.monotonic() - _t_brain) * 1000.0)
     return out
 
 
@@ -1386,6 +1390,16 @@ def _parse_time(s: str | None) -> datetime | None:
         return None
 
 
+def _source_bucket(item: NewsItem) -> str:
+    """Kaynak adını kaba bir kategoriye indir (gecikme kırılımı; kardinalite kontrolü)."""
+    s = (item.source or "").lower()
+    if s.startswith("⚡") or "tree" in s:
+        return "treenews"
+    if "binance" in s:
+        return "binance"
+    return "rss"
+
+
 def _ingest_ms(item: NewsItem) -> float | None:
     """Kaynak yayını → bot alımı gecikmesi (ms). published bilinmiyorsa None.
 
@@ -1461,7 +1475,7 @@ def _portfolio_series(item: NewsItem) -> dict[str, list[float]] | None:
 def _trade_context(item: NewsItem) -> dict[str, Any]:
     """Oto-işlem güvenlik kapıları için bağlam (akış durumu + haber yaşı + portföy serisi)."""
     return {"feed_stale": _ws_feed_stale(), "news_age_sec": _news_age_sec(item),
-            "price_series": _portfolio_series(item)}
+            "latency_slow": bool(_latency_breaches()), "price_series": _portfolio_series(item)}
 
 
 def _prune_news() -> None:
@@ -1517,9 +1531,11 @@ def process_items(
     if not new_items:
         return 0, 0
 
-    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası)
+    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı
     for it in new_items:
-        latency.record("ingest", _ingest_ms(it))
+        ms = _ingest_ms(it)
+        latency.record("ingest", ms)
+        latency.record_source(_source_bucket(it), ms)
 
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
@@ -2143,15 +2159,40 @@ def metrics() -> PlainTextResponse:
     return PlainTextResponse(_render_metrics(values), media_type="text/plain; version=0.0.4")
 
 
+# Boru hattı gecikme SLA'ları (p95 ms) — aşılırsa "yavaş" sayılır (env ile ayarlanır).
+# Haber-trade'de yavaş boru hattı = hareketin gerisinde giriş; preflight/health uyarır.
+LATENCY_SLA_MS: dict[str, float] = {
+    "ingest": float(os.environ.get("SLA_INGEST_MS", "8000")),    # kaynak→bot (besleme+ağ)
+    "score": float(os.environ.get("SLA_SCORE_MS", "6000")),      # Claude puanlama batch
+    "brain": float(os.environ.get("SLA_BRAIN_MS", "9000")),      # giriş beyni (eskalasyon/oylama)
+    "confirm": float(os.environ.get("SLA_CONFIRM_MS", "5000")),  # fiyat teyidi
+    "pipeline": float(os.environ.get("SLA_PIPELINE_MS", "12000")),  # alım→emir uçtan uca
+}
+
+
+def _latency_sla() -> dict[str, dict[str, Any]]:
+    """Aşama p95'lerini SLA'larla kıyasla (yeterli örneği olanlar)."""
+    return latency.evaluate_sla(latency.summary(), LATENCY_SLA_MS)
+
+
+def _latency_breaches() -> list[str]:
+    """SLA'yı aşan (yavaş) aşama adları."""
+    return [s for s, v in _latency_sla().items() if not v["ok"]]
+
+
 @app.get("/latency")
 def latency_report() -> dict[str, Any]:
     """Boru hattı gecikme özeti (ms) — haber-trade'in gerçek edge'i.
 
-    Aşamalar: ingest (kaynak→bot), score (Claude), confirm (fiyat teyidi),
-    order (karar→emir), pipeline (alım→emir uçtan uca). Her aşama için
-    count/avg/p50/p95/max/last. Salt gözlem; örnekler kayan pencerede tutulur.
+    Aşamalar: ingest (kaynak→bot), score (Claude puanlama), brain (giriş beyni
+    çağrısı — Tier-2'de asıl maliyet), confirm (fiyat teyidi), order (karar→emir),
+    pipeline (alım→emir uçtan uca). Her aşama count/avg/p50/p95/max/last. `by_source`:
+    kaynak-bazlı ingest kırılımı (hangi besleme yavaş). `sla`: p95'in eşiği aşıp aşmadığı.
     """
-    return {"stages": latency.summary()}
+    sla = _latency_sla()
+    return {"stages": latency.summary(), "by_source": latency.source_summary(),
+            "sla": sla, "sla_ok": all(v["ok"] for v in sla.values()),
+            "breaches": [s for s, v in sla.items() if not v["ok"]]}
 
 
 @app.get("/health")
@@ -2172,6 +2213,7 @@ def health() -> dict[str, Any]:
         "ws_last_msg_age_sec": _ws_last_msg_age(),
         "feed_stale": _ws_feed_stale(),
         "backup_scan_interval_sec": _scan_interval(),   # failover'da düşer (hızlı yedek tarama)
+        "latency_breaches": _latency_breaches(),         # SLA aşan boru hattı aşamaları (yavaş)
         "rate_limited": get_stats()["rate_limited"],
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],
@@ -2752,6 +2794,15 @@ def preflight() -> dict[str, Any]:
         add("Haber beslemesi (WS)", "ok", f"bağlı — son mesaj {_ws_last_msg_age()}s önce")
     else:
         add("Haber beslemesi (WS)", "warn", "henüz bağlanmadı (başlangıç grace)")
+
+    # Boru hattı gecikmesi: yavaşsa hareketin gerisinde gireriz (SLA p95 kontrolü)
+    breaches = _latency_breaches()
+    if breaches:
+        add("Boru hattı gecikmesi (SLA)", "critical" if trader.S.halt_trade_on_latency else "warn",
+            f"YAVAŞ — SLA aşan aşama(lar): {', '.join(breaches)}"
+            + (" (oto-işlem durdurulur)" if trader.S.halt_trade_on_latency else ""))
+    else:
+        add("Boru hattı gecikmesi (SLA)", "ok", "tüm aşamalar SLA içinde")
 
     # Uzak bildirim: masadan uzaktayken sinyal/uyarı alabilmek için
     add("Uzak bildirim (Telegram/Discord)",

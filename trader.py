@@ -58,6 +58,7 @@ class Settings:
     cooldown_sec: int = 1800
     # Güvenlik kapıları (oto-işlem)
     halt_trade_on_stale: bool = True   # haber akışı (WS) kopukken yeni oto-işlem açma
+    halt_trade_on_latency: bool = True # boru hattı gecikme SLA'sı aşıldıysa yeni oto-işlem açma
     max_news_age_sec: int = 0          # >0: haber bu kadar saniyeden eskiyse girme (hareket bitti)
     max_same_direction: int = 0        # >0: aynı yönde açık pozisyon sayısı tavanı (korelasyon riski)
     # Otomatik çıkış
@@ -144,7 +145,7 @@ _PERSIST_KEYS = (
     "tier1_skip_confirm_impact", "use_entry_brain", "brain_escalate",
     "brain_self_improve", "brain_recalibrate", "brain_recalibrate_min",
     "brain_vote_count", "cooldown_sec",
-    "halt_trade_on_stale", "max_news_age_sec", "max_same_direction",
+    "halt_trade_on_stale", "halt_trade_on_latency", "max_news_age_sec", "max_same_direction",
     "use_sl_tp", "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "use_atr_trailing", "atr_trailing_mult",
@@ -1657,6 +1658,7 @@ def _portfolio_heat(new_sym: str, new_side: str,
 
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None,
+                  latency_slow: bool = False,
                   price_series: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Bir haberin oto-işlem açıp açmayacağına dair YAN ETKİSİZ karar.
 
@@ -1668,6 +1670,7 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
 
     `feed_stale`: haber akışı (WS) kopuk mu — güvenlik durdurması için çağıran geçirir.
     `news_age_sec`: haberin yaşı (saniye) — latency kapısı için çağıran hesaplar.
+    `latency_slow`: boru hattı gecikme SLA'sı aşıldı mı — çağıran (news_bot) geçirir.
     """
     no = lambda r: {"would_trade": False, "reason": r, "side": None, "usdt": None, "news_source": ""}  # noqa: E731
     # Operasyonel devre kesici: anomali sonrası yeni oto-işlem durdurulmuş
@@ -1676,6 +1679,9 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # Güvenlik kapısı: akış kopukken kör girme (gerçek-zamanlı teyit güvenilmez)
     if S.halt_trade_on_stale and feed_stale:
         return no("haber akışı kopuk — güvenlik durdurması")
+    # Güvenlik kapısı: boru hattı yavaş (SLA aşıldı) — hareketin gerisinde gireriz
+    if S.halt_trade_on_latency and latency_slow:
+        return no("boru hattı gecikme SLA aşıldı — güvenlik durdurması")
     # Güvenlik kapısı: haber çok eskiyse hareket büyük olasılıkla bitmiştir
     if S.max_news_age_sec > 0 and news_age_sec is not None and news_age_sec > S.max_news_age_sec:
         return no(f"haber çok eski ({news_age_sec:.0f}s > {S.max_news_age_sec}s)")
@@ -1785,6 +1791,7 @@ def get_shadow_overrides() -> dict[str, Any]:
 
 def shadow_decision(item: Any, *, feed_stale: bool = False,
                     news_age_sec: float | None = None,
+                    latency_slow: bool = False,
                     price_series: dict[str, list[float]] | None = None
                     ) -> dict[str, Any] | None:
     """Aday ayarla (gölge) auto_decision'ı SANAL çalıştır — gerçek emir YOK, S kalıcı değil.
@@ -1799,7 +1806,7 @@ def shadow_decision(item: Any, *, feed_stale: bool = False,
     if not _shadow_overrides:
         return None
     live = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                         price_series=price_series)
+                         latency_slow=latency_slow, price_series=price_series)
     # S'i geçici override et — auto_decision iç kilitleri (_open_side_count vb.) aldığından
     # BURADA _lock TUTMA (yeniden-giriş = deadlock). Gölge, process_items'ten sıralı çağrılır.
     saved = {k: getattr(S, k) for k in _shadow_overrides}
@@ -1807,7 +1814,7 @@ def shadow_decision(item: Any, *, feed_stale: bool = False,
         for k, v in _shadow_overrides.items():
             setattr(S, k, v)
         shadow = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                               price_series=price_series)
+                               latency_slow=latency_slow, price_series=price_series)
     finally:
         for k, v in saved.items():
             setattr(S, k, v)
@@ -1859,12 +1866,13 @@ def _consult_brain(brain: Any, item: Any, decision: dict[str, Any]) -> dict[str,
 
 def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                      news_age_sec: float | None = None,
+                     latency_slow: bool = False,
                      brain: Any = None,
                      price_series: dict[str, list[float]] | None = None) -> dict[str, Any] | None:
     if not S.auto_trade:
         return None
     d = auto_decision(item, feed_stale=feed_stale, news_age_sec=news_age_sec,
-                      price_series=price_series)
+                      latency_slow=latency_slow, price_series=price_series)
     if not d["would_trade"]:
         return None
     usdt = d["usdt"]

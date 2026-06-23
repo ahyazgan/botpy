@@ -755,6 +755,25 @@ export default function App() {
     }
   };
 
+  const [ablationApplying, setAblationApplying] = useState(false);
+  const applyAblation = async () => {
+    setAblationApplying(true);
+    try {
+      const r = await fetch(`${API_BASE}/ablation/apply`, { method: "POST" });
+      if (!r.ok) throw new Error(`apply ${r.status}`);
+      const out = await r.json();
+      const s = await fetch(`${API_BASE}/settings`);
+      if (s.ok) setSettings(await s.json());
+      setErr(out.applied
+        ? `Ablation kalibrasyonu uygulandı: ${out.changes.map((c: { field: string; to: unknown }) => `${c.field}→${c.to}`).join(", ")}`
+        : `Ablation: ${out.reason ?? "değişiklik yapılmadı"}`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Ablation uygulama hatası");
+    } finally {
+      setAblationApplying(false);
+    }
+  };
+
   const [tuningApplying, setTuningApplying] = useState(false);
   const applyTuning = async () => {
     setTuningApplying(true);
@@ -2122,9 +2141,20 @@ export default function App() {
                   </div>
                 )}
                 {ablation.recommended_settings && Object.keys(ablation.recommended_settings).length > 0 && (
-                  <p className="mt-2 text-[11px] text-zinc-400">
-                    Önerilen ayar (ELLE uygula): <code className="text-teal-300">{JSON.stringify(ablation.recommended_settings)}</code>
-                  </p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-zinc-400">
+                      Önerilen ayar: <code className="text-teal-300">{JSON.stringify(ablation.recommended_settings)}</code>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void applyAblation()}
+                      disabled={ablationApplying}
+                      title="Öneriyi KORKULUKLARLA uygula (yalnız karar-eşiği alanları; risk/boyut/kaldıraç dokunulmaz)"
+                      className="rounded-md border border-teal-400/50 bg-teal-900/50 px-2.5 py-1 text-[11px] font-semibold text-teal-100 hover:bg-teal-800/60 disabled:opacity-50"
+                    >
+                      {ablationApplying ? "Uygulanıyor…" : "✅ Öneriyi uygula"}
+                    </button>
+                  </div>
                 )}
               </>
             )}

@@ -2787,6 +2787,48 @@ def apply_tuning(suggestion: dict[str, Any], *, min_impact_floor: int = 7) -> di
     return {"applied": bool(changes), "samples": suggestion.get("samples", 0), "changes": changes}
 
 
+_ABLATION_APPLY_KEYS = ("auto_min_impact", "auto_require_confirm",
+                        "min_rel_volume", "skip_already_priced_pct")
+
+
+def apply_ablation_recommendation(rec: dict[str, Any]) -> dict[str, Any]:
+    """Ablation aramasının `recommended_settings`'ini KORKULUKLARLA uygula.
+
+    `/ablation/search` "hangi gate kombinasyonu edge katıyor" bulur; bu fonksiyon o
+    öneriyi (yalnız güvenli KARAR-EŞİĞİ alanları, `_ABLATION_APPLY_KEYS`) kıstırarak
+    uygular — risk/boyut/kaldıraç gibi para-büyüklüğü ayarlarına ASLA dokunmaz. Açık
+    kullanıcı eylemiyle çağrılır (oto-uygulanmaz). Uygulanan değişiklikleri döner.
+
+    Korkuluklar: auto_min_impact→[7,10] · auto_require_confirm→yalnız True (teyit
+    zorunluluğunu GEVŞETMEZ) · min_rel_volume→[0,5] · skip_already_priced_pct→[0,50].
+    """
+    changes: list[dict[str, Any]] = []
+
+    def _set(field: str, new: Any) -> None:
+        old = getattr(S, field)
+        if old != new:
+            changes.append({"field": field, "from": old, "to": new})
+            setattr(S, field, new)
+
+    if "auto_min_impact" in rec:
+        _set("auto_min_impact", max(7, min(10, int(rec["auto_min_impact"]))))
+    if rec.get("auto_require_confirm") is True and not S.auto_require_confirm:
+        _set("auto_require_confirm", True)
+    if "min_rel_volume" in rec:
+        new_rv = max(0.0, min(5.0, round(float(rec["min_rel_volume"]), 2)))
+        if abs(new_rv - S.min_rel_volume) >= 0.05:
+            _set("min_rel_volume", new_rv)
+    if "skip_already_priced_pct" in rec:
+        new_sp = max(0.0, min(50.0, round(float(rec["skip_already_priced_pct"]), 1)))
+        if abs(new_sp - S.skip_already_priced_pct) >= 0.1:
+            _set("skip_already_priced_pct", new_sp)
+    if changes:
+        with _lock:
+            _save_state()
+        log.info("Ablation önerisi uygulandı: %s", changes)
+    return {"applied": bool(changes), "changes": changes}
+
+
 def suggest_from_backtest(results: list[dict[str, Any]], tier_of: Any = None) -> dict[str, Any]:
     """İşlemsiz ÖN-BİLGİ: backtest sonuçlarından (arşiv simülasyonu) aynı önerileri üret.
 

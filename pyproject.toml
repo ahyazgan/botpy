@@ -14,5 +14,5 @@ files = [
     "trader.py", "storage.py", "notify.py", "metrics.py", "news.py",
     "news_bot.py", "news_backtest.py", "risk.py", "reconcile.py",
     "strategy.py", "optimize.py", "walkforward.py", "netutil.py",
-    "latency.py", "sourcehealth.py", "costtracker.py", "watchdog.py", "montecarlo.py",
+    "latency.py", "sourcehealth.py", "costtracker.py", "watchdog.py", "montecarlo.py", "import_history.py",
 ]

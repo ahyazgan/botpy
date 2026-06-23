@@ -93,6 +93,9 @@ class Settings:
     # account_equity_usdt = drawdown %'sinin paydası (paper sermaye tabanı / canlı nominal sermaye).
     max_drawdown_pct: float = 0.0
     account_equity_usdt: float = 10000.0
+    # Kademeli drawdown de-risking: drawdown büyüdükçe pozisyonu kademeli kıs (sert
+    # kill-switch'ten önce defensif yumuşama). Referans = max_drawdown_pct (yoksa %20).
+    derisk_on_drawdown: bool = False
     reduce_after_losses: int = 0     # >0: son N işlem zararsa boyutu yarıla (kayıp serisi freni)
     # Bot iç-watchdog: pozisyon-izleme döngüsü takılırsa (SL tetiklenemez) devre kesiciyi aç
     halt_on_monitor_stall: bool = True
@@ -170,7 +173,7 @@ _PERSIST_KEYS = (
     "halt_on_monitor_stall",
     "time_stop_min", "breakeven_pct", "partial_tp_pct", "partial_tp_frac",
     "partial_tp_levels",
-    "max_open_risk_usdt", "reduce_after_losses",
+    "max_open_risk_usdt", "reduce_after_losses", "derisk_on_drawdown",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
     "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
 )
@@ -1838,6 +1841,9 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         usdt *= _liquidity_factor(getattr(item, "volume_usd", None))
     if S.reduce_after_losses > 0 and _losing_streak() >= S.reduce_after_losses:
         usdt *= 0.5
+    # Kademeli drawdown de-risking: drawdown büyüdükçe boyutu kıs (sert halt'tan önce)
+    if S.derisk_on_drawdown:
+        usdt *= _drawdown_size_factor()
     # Risk-eşitleme (vol-hedef): bu işlemin SL mesafesine göre boyutu eşitle. SL%
     # canlı yolda ATR çıkışı açıksa ATR'den, değilse sabit stop_loss_pct'ten gelir.
     if S.risk_parity and S.risk_per_trade_pct <= 0:
@@ -2076,6 +2082,21 @@ def _account_equity() -> float:
     return max(0.0, S.account_equity_usdt + realized)
 
 
+def _drawdown_size_factor() -> float:
+    """Drawdown büyüdükçe pozisyon boyutunu kademeli kıs (defensif yumuşama). [0.25, 1.0].
+
+    Referans = `max_drawdown_pct` (hard kill-switch eşiği; yoksa %20). Doğrusal: dd=0 → 1.0x,
+    dd=ref/2 → 0.5x, dd=ref → 0.25x taban. Sert durdurmadan önce kademeli geri çekilme —
+    kaybederken küçük bahis (anti-martingale). Saf okuma (lock altında snapshot)."""
+    with _lock:
+        closed = list(_closed)
+    dd = _drawdown_state(closed, S.account_equity_usdt)["drawdown_pct"]
+    if dd <= 0:
+        return 1.0
+    ref = S.max_drawdown_pct if S.max_drawdown_pct > 0 else 20.0
+    return round(max(0.25, min(1.0, 1.0 - dd / ref)), 3)
+
+
 def _risk_per_trade_base(stop_pct: float | None) -> float:
     """Yüzde-bazlı taban boyut: SL tetiklenince sermayenin `risk_per_trade_pct`'i kaybedilir.
 
@@ -2159,7 +2180,9 @@ def get_risk() -> dict[str, Any]:
         "trading_halted": bool(daily_limit > 0 and realized <= -abs(daily_limit)),
         # drawdown kill-switch: sermaye tepeden çok düştüyse yeni işlem açılmaz
         "drawdown": {**dd, "max_drawdown_pct": S.max_drawdown_pct,
-                     "account_equity_usdt": S.account_equity_usdt, "halted": dd_halt},
+                     "account_equity_usdt": S.account_equity_usdt, "halted": dd_halt,
+                     "derisk_on": S.derisk_on_drawdown,
+                     "size_factor": _drawdown_size_factor() if S.derisk_on_drawdown else 1.0},
         # Yüzde-bazlı boyutlama (açıksa): anlık sermaye + işlem başı risk %'si
         "sizing": {"risk_per_trade_pct": S.risk_per_trade_pct, "equity": round(equity_now, 2),
                    "mode": "risk_pct" if S.risk_per_trade_pct > 0 else "fixed_usdt"},

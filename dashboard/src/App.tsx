@@ -80,6 +80,8 @@ type Settings = {
   take_profit_pct: number;
   trailing_stop_pct: number;
   daily_loss_limit_usdt: number;
+  max_drawdown_pct: number;
+  account_equity_usdt: number;
   max_total_exposure_usdt: number;
   max_per_coin_usdt: number;
   order_type: "market" | "limit";
@@ -287,6 +289,7 @@ type Risk = {
   realized_today: number;
   daily_loss_limit_usdt: number;
   trading_halted: boolean;
+  drawdown?: { equity: number; peak: number; drawdown_usdt: number; drawdown_pct: number; max_drawdown_pct: number; account_equity_usdt: number; halted: boolean };
   paper_trading: boolean;
   auto_trade: boolean;
   kelly?: { ready: boolean; f_star: number; win_rate: number | null; payoff: number | null; n: number; multiplier: number; enabled: boolean };
@@ -1378,6 +1381,8 @@ export default function App() {
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-amber-400/80">Risk limitleri</p>
               <NumField label="Günlük zarar limiti USDT (0=kapalı)" value={settings.daily_loss_limit_usdt} onSave={(v) => patchSettings({ daily_loss_limit_usdt: v })} />
+              <NumField label="Drawdown kill-switch % (0=kapalı)" value={settings.max_drawdown_pct} onSave={(v) => patchSettings({ max_drawdown_pct: v })} />
+              <NumField label="Sermaye tabanı USDT (drawdown paydası)" value={settings.account_equity_usdt} onSave={(v) => patchSettings({ account_equity_usdt: v })} />
               <NumField label="Toplam maruziyet USDT" value={settings.max_total_exposure_usdt} onSave={(v) => patchSettings({ max_total_exposure_usdt: v })} />
               <NumField label="Coin başına maruziyet USDT" value={settings.max_per_coin_usdt} onSave={(v) => patchSettings({ max_per_coin_usdt: v })} />
               <NumField label="Max açık pozisyon" value={settings.max_positions} onSave={(v) => patchSettings({ max_positions: v })} />
@@ -1961,6 +1966,18 @@ export default function App() {
               {risk.trading_halted && (
                 <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200">
                   ⛔ İŞLEM DURDURULDU (günlük zarar limiti)
+                </span>
+              )}
+              {risk.drawdown?.halted && (
+                <span className="rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-1 text-xs font-bold text-red-200"
+                  title={`Sermaye tepeden %${risk.drawdown.drawdown_pct} düştü (limit %${risk.drawdown.max_drawdown_pct})`}>
+                  ⛔ DRAWDOWN KILL-SWITCH (−%{risk.drawdown.drawdown_pct})
+                </span>
+              )}
+              {risk.drawdown && risk.drawdown.max_drawdown_pct > 0 && !risk.drawdown.halted && risk.drawdown.drawdown_pct > 0 && (
+                <span className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-1 text-xs font-semibold text-amber-200"
+                  title={`Tepe ${risk.drawdown.peak} · equity ${risk.drawdown.equity} · limit %${risk.drawdown.max_drawdown_pct}`}>
+                  📉 Drawdown −%{risk.drawdown.drawdown_pct} / −%{risk.drawdown.max_drawdown_pct}
                 </span>
               )}
               {risk.regime?.active && (

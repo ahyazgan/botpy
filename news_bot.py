@@ -1855,7 +1855,7 @@ def _maybe_snapshot_latency() -> None:
         log.warning("Gecikme anlık görüntüsü yazılamadı: %s", e)
 
 
-_ops_state: dict[str, Any] = {"latency_breaches": set(), "halt_active": False}
+_ops_state: dict[str, Any] = {"latency_breaches": set(), "halt_active": False, "drawdown_halt": False}
 
 
 def _check_ops_transitions() -> None:
@@ -1879,6 +1879,17 @@ def _check_ops_transitions() -> None:
     elif not halt["active"] and _ops_state["halt_active"]:
         _record_event("halt_cleared", "info", "devre kesici temizlendi", "")
     _ops_state["halt_active"] = bool(halt["active"])
+    # Drawdown kill-switch: tepe-dip düşüş limitini geçti / toparlandı (money-path → uzak uyarı)
+    dd = trader.get_risk().get("drawdown", {})
+    dd_halt = bool(dd.get("halted"))
+    if dd_halt and not _ops_state["drawdown_halt"]:
+        msg = (f"sermaye tepeden %{dd.get('drawdown_pct')} düştü (limit %{dd.get('max_drawdown_pct')})")
+        _record_event("drawdown_halt", "critical", msg, "")
+        notify_remote(f"⛔ DRAWDOWN KILL-SWITCH: {msg} — yeni işlem durduruldu.")
+    elif not dd_halt and _ops_state["drawdown_halt"]:
+        _record_event("drawdown_recovered", "info", "drawdown limit altına döndü", "")
+        notify_remote("✅ Drawdown limiti altına döndü — işlem yeniden açık.")
+    _ops_state["drawdown_halt"] = dd_halt
 
 
 def _persist_closed(pos: dict[str, Any]) -> None:

@@ -85,6 +85,10 @@ class Settings:
     max_total_exposure_usdt: float = 2000.0  # toplam açık pozisyon USDT tavanı (0=kapalı)
     max_per_coin_usdt: float = 500.0       # tek coin için açık pozisyon tavanı (0=kapalı)
     max_open_risk_usdt: float = 0.0  # >0: açık pozisyonların SL'de toplam riski bu USDT'yi geçemez
+    # Drawdown kill-switch: sermaye tepe-noktadan bu % düşerse yeni işlem DURUR (0=kapalı).
+    # account_equity_usdt = drawdown %'sinin paydası (paper sermaye tabanı / canlı nominal sermaye).
+    max_drawdown_pct: float = 0.0
+    account_equity_usdt: float = 10000.0
     reduce_after_losses: int = 0     # >0: son N işlem zararsa boyutu yarıla (kayıp serisi freni)
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
@@ -150,6 +154,7 @@ _PERSIST_KEYS = (
     "use_atr_exits", "atr_sl_mult", "atr_tp_mult",
     "use_atr_trailing", "atr_trailing_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
+    "max_drawdown_pct", "account_equity_usdt",
     "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "size_by_kelly", "kelly_fraction", "kelly_min_trades",
     "risk_parity", "target_risk_usdt",
@@ -848,6 +853,13 @@ def _check_risk(symbol: str, usdt: float) -> None:
     _reset_daily_if_needed()
     if S.daily_loss_limit_usdt > 0 and _daily["realized"] <= -abs(S.daily_loss_limit_usdt):
         raise RuntimeError(f"Günlük zarar limiti aşıldı ({_daily['realized']:.2f} USDT) — bugün işlem durduruldu")
+    # Drawdown kill-switch: sermaye tepe-noktadan çok düştüyse yeni işlemi durdur
+    if S.max_drawdown_pct > 0:
+        dd = _drawdown_state(_closed, S.account_equity_usdt)
+        if dd["drawdown_pct"] >= S.max_drawdown_pct:
+            raise RuntimeError(
+                f"Drawdown kill-switch: sermaye tepeden %{dd['drawdown_pct']:.1f} düştü "
+                f"(limit %{S.max_drawdown_pct:.1f}) — işlem durduruldu")
     total, per_coin = _exposure()
     if S.max_total_exposure_usdt > 0 and total + usdt > S.max_total_exposure_usdt:
         raise RuntimeError(f"Toplam maruziyet tavanı ({S.max_total_exposure_usdt:.0f} USDT) aşılır")
@@ -2022,6 +2034,28 @@ def _max_drawdown(equity: list[dict[str, Any]]) -> float:
     return round(mdd, 2)
 
 
+def _drawdown_state(closed: list[dict[str, Any]], account_base: float) -> dict[str, Any]:
+    """Anlık tepe-dip drawdown durumu (kill-switch için). Saf.
+
+    equity_t = account_base + kümülatif realized; peak = en yüksek equity; drawdown =
+    peak'ten anlık düşüş. `drawdown_pct` = düşüş / peak × 100 (>=0). Boş/zarar yoksa 0.
+    """
+    base = max(1e-9, account_base)
+    cum = 0.0
+    peak = base
+    equity = base
+    for c in closed:
+        if c.get("pnl") is None:
+            continue
+        cum += c["pnl"]
+        equity = base + cum
+        peak = max(peak, equity)
+    dd_usdt = max(0.0, peak - equity)
+    return {"equity": round(equity, 2), "peak": round(peak, 2),
+            "drawdown_usdt": round(dd_usdt, 2),
+            "drawdown_pct": round(dd_usdt / peak * 100, 2)}
+
+
 def _profit_factor(scored: list[dict[str, Any]]) -> float | None:
     """Brüt kâr / brüt zarar. Zarar yoksa None (tanımsız). Saf fonksiyon."""
     gross_win = sum(c["pnl"] for c in scored if c["pnl"] > 0)
@@ -2076,6 +2110,8 @@ def get_risk() -> dict[str, Any]:
     daily_limit = S.daily_loss_limit_usdt
     with _lock:
         kelly = _kelly_fraction(list(_closed))
+        dd = _drawdown_state(_closed, S.account_equity_usdt)
+    dd_halt = bool(S.max_drawdown_pct > 0 and dd["drawdown_pct"] >= S.max_drawdown_pct)
     return {
         "open_positions": n_open,
         "max_positions": S.max_positions,
@@ -2087,6 +2123,9 @@ def get_risk() -> dict[str, Any]:
         "daily_loss_limit_usdt": daily_limit,
         # kill-switch: günlük zarar limiti aşıldıysa bugün yeni işlem açılmaz
         "trading_halted": bool(daily_limit > 0 and realized <= -abs(daily_limit)),
+        # drawdown kill-switch: sermaye tepeden çok düştüyse yeni işlem açılmaz
+        "drawdown": {**dd, "max_drawdown_pct": S.max_drawdown_pct,
+                     "account_equity_usdt": S.account_equity_usdt, "halted": dd_halt},
         "paper_trading": S.paper_trading,
         "auto_trade": S.auto_trade,
         # Kelly boyut bağlamı (şeffaflık): edge + uygulanan çarpan
@@ -2151,6 +2190,9 @@ def preflight() -> list[dict[str, Any]]:
         f"{S.max_total_exposure_usdt:g} USDT" if S.max_total_exposure_usdt > 0 else "0 = sınırsız")
     add("Coin maruziyet tavanı", "ok" if S.max_per_coin_usdt > 0 else "warn",
         f"{S.max_per_coin_usdt:g} USDT" if S.max_per_coin_usdt > 0 else "0 = sınırsız")
+    add("Drawdown kill-switch", "ok" if S.max_drawdown_pct > 0 else "warn",
+        f"%{S.max_drawdown_pct:g} (sermaye tabanı {S.account_equity_usdt:g} USDT)"
+        if S.max_drawdown_pct > 0 else "kapalı — tepe-dip düşüşte durdurma yok")
 
     # Kaldıraç aklı (futures)
     if S.market == "futures" and S.leverage > 10:

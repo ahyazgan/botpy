@@ -63,7 +63,8 @@ def test_record_event_writes(monkeypatch, store):
 @pytest.fixture()
 def ops_env(monkeypatch, store):
     monkeypatch.setattr(nb, "get_store", lambda: store)
-    monkeypatch.setattr(nb, "_ops_state", {"latency_breaches": set(), "halt_active": False})
+    monkeypatch.setattr(nb, "_ops_state",
+                        {"latency_breaches": set(), "halt_active": False, "drawdown_halt": False})
     yield store
 
 

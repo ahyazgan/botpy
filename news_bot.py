@@ -1659,6 +1659,24 @@ def _confirm_alerts(session: requests.Session, alerts: list[NewsItem]) -> None:
         list(ex.map(lambda it: _confirm_one(session, it), alerts))
 
 
+# İzleme listesi: favori coinlerde uyarı eşiği bu kadar düşürülür (taban 3'e kıstırılır).
+WATCH_IMPACT_BONUS = int(os.environ.get("WATCH_IMPACT_BONUS", "2"))
+
+
+def _alert_threshold_for(item: NewsItem, base: int) -> int:
+    """Bu haber izleme-listesi coini içeriyorsa eşiği düşür (favoriyi kaçırma). Saf."""
+    watch = trader.watch_coins_set()
+    if not watch:
+        return base
+    coins = {str(c).upper().replace("/", "").strip() for c in item.coins}
+    if item.symbol:
+        b = item.symbol.upper()
+        coins.add(b[:-4] if b.endswith("USDT") else b)
+    if coins & watch:
+        return max(3, base - WATCH_IMPACT_BONUS)
+    return base
+
+
 def process_items(
     session: requests.Session,
     candidates: list[NewsItem],
@@ -1703,7 +1721,7 @@ def process_items(
     notified: set[str] = set()
     if allow_notify and USE_CLAUDE:
         for it in new_items:
-            if it.impact >= threshold:
+            if it.impact >= _alert_threshold_for(it, threshold):
                 notify(it)
                 notified.add(it.id)
 
@@ -1721,7 +1739,7 @@ def process_items(
     _apply_fusion(new_items)
 
     # Nihai güçlü haberler: teyit + arşiv + oto-işlem (para yolu nihai skorda)
-    alerts = [it for it in new_items if it.impact >= threshold]
+    alerts = [it for it in new_items if it.impact >= _alert_threshold_for(it, threshold)]
     _metrics["alerts_total"] += len(alerts)
     if alerts:
         _t_confirm = time.monotonic()

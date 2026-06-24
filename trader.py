@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -130,6 +131,9 @@ class Settings:
     use_learned_vetoes: bool = False # koşullu öğrenme: anlamlı-negatif segmentte (kaynak×rvol vb.) girme
     regime_adapt: bool = False       # rejim BOZULMASINDA eşiği geçici sıkılaştır; toparlanınca geri al
     max_funding_rate_pct: float = 0.0  # >0 (futures): yön funding'e ters & maliyet bu %'yi geçerse girme
+    # Coin tercihleri (kullanıcı kontrolü — öğrenme değil, aşırı-uydurma riski yok)
+    blocked_coins: str = ""          # virgülle ayrık: bu coinlerde ASLA oto-işlem açma (kara liste)
+    watch_coins: str = ""            # virgülle ayrık: bu coinlerde uyarı eşiği düşürülür (favori/izleme)
 
 
 S = Settings()
@@ -176,7 +180,42 @@ _PERSIST_KEYS = (
     "max_open_risk_usdt", "reduce_after_losses", "derisk_on_drawdown",
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
     "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
+    "blocked_coins", "watch_coins",
 )
+
+
+def _coin_set(raw: str) -> set[str]:
+    """Virgül/boşlukla ayrık coin listesini normalle: BÜYÜK harf, USDT/parite eki atılır."""
+    out: set[str] = set()
+    for tok in re.split(r"[,\s]+", str(raw or "")):
+        c = tok.upper().replace("/", "").strip()
+        if c.endswith("USDT"):
+            c = c[:-4]
+        if c:
+            out.add(c)
+    return out
+
+
+def blocked_coins_set() -> set[str]:
+    """Oto-işlemde tamamen yasaklı coinler (kara liste). Saf."""
+    return _coin_set(S.blocked_coins)
+
+
+def watch_coins_set() -> set[str]:
+    """Uyarı eşiği düşürülecek favori/izleme coinleri. Saf."""
+    return _coin_set(S.watch_coins)
+
+
+def _item_coins(item: Any) -> set[str]:
+    """Haberin coinlerini normalle (symbol tabanı dahil) — kara/izleme listesi eşleştirmesi için."""
+    coins = {str(c).upper().replace("/", "").strip() for c in getattr(item, "coins", []) or []}
+    sym = getattr(item, "symbol", None)
+    if sym:
+        base = str(sym).upper()
+        if base.endswith("USDT"):
+            base = base[:-4]
+        coins.add(base)
+    return {c for c in coins if c}
 
 
 def _now() -> str:
@@ -1770,6 +1809,12 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # Güvenlik kapısı: haber çok eskiyse hareket büyük olasılıkla bitmiştir
     if S.max_news_age_sec > 0 and news_age_sec is not None and news_age_sec > S.max_news_age_sec:
         return no(f"haber çok eski ({news_age_sec:.0f}s > {S.max_news_age_sec}s)")
+    # Kara liste: kullanıcının "asla dokunma" dediği coinler (mutlak kural, güçten bağımsız)
+    blocked = blocked_coins_set()
+    if blocked:
+        blocked_hit = _item_coins(item) & blocked
+        if blocked_hit:
+            return no(f"kara listede ({', '.join(sorted(blocked_hit))})")
     if item.impact < S.auto_min_impact:
         return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
     # Tier-1 "net" haber (hack/ETF/büyük listeleme vb. — yüksek güç): teyit beklemeden

@@ -121,6 +121,8 @@ type Settings = {
   max_news_age_sec: number;
   max_same_direction: number;
   max_funding_rate_pct: number;
+  blocked_coins: string;
+  watch_coins: string;
   use_atr_exits: boolean;
   use_atr_trailing: boolean;
   atr_trailing_mult: number;
@@ -1540,6 +1542,8 @@ export default function App() {
               <NumField label="Max haber yaşı sn (0=kapalı)" value={settings.max_news_age_sec} onSave={(v) => patchSettings({ max_news_age_sec: v })} />
               <NumField label="Aynı yönde max pozisyon (0=kapalı)" value={settings.max_same_direction} onSave={(v) => patchSettings({ max_same_direction: v })} />
               <NumField label="Max funding % futures (0=kapalı)" value={settings.max_funding_rate_pct} onSave={(v) => patchSettings({ max_funding_rate_pct: v })} />
+              <TextField label="🚫 Kara liste (asla işlem)" value={settings.blocked_coins} hint="virgülle: DOGE, SHIB — bu coinlerde oto-işlem ASLA açılmaz" onSave={(v) => patchSettings({ blocked_coins: v })} />
+              <TextField label="⭐ İzleme listesi (eşik düşür)" value={settings.watch_coins} hint="virgülle: BTC, ETH — favori coinlerde uyarı eşiği 2 puan düşürülür (kaçırma)" onSave={(v) => patchSettings({ watch_coins: v })} />
               <button
                 type="button"
                 onClick={() => void patchSettings({ auto_halt_on_anomaly: !settings.auto_halt_on_anomaly })}

@@ -4,6 +4,8 @@ Gerçek zamanlı kripto haberlerini yakalayıp **puanlayan**, Binance fiyatıyla
 
 > ⚠️ **Güvenlik önce:** Varsayılan **paper (simülasyon)** modundadır — gerçek emir göndermez. Canlıya geçmeden risk limitlerini gözden geçirin.
 
+> 📖 **Adım adım kurulum/çalıştırma rehberi (Türkçe, başlangıç dostu):** [`KULLANIM.md`](./KULLANIM.md) — Docker'dan Telegram bildirimine, veri biriktirmeye ve canlıya geçişe kadar.
+
 ## Hızlı başlangıç
 
 ```bash

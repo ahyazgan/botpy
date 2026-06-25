@@ -305,6 +305,11 @@ def has_live_keys() -> bool:
     return bool(os.environ.get("BINANCE_API_KEY") and os.environ.get("BINANCE_SECRET"))
 
 
+def _testnet_enabled() -> bool:
+    """BINANCE_TESTNET env'i true/1/yes ise Binance testnet (demo borsa) kullanılır."""
+    return os.environ.get("BINANCE_TESTNET", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_price(symbol: str) -> float | None:
     data = get_json(f"{BINANCE_API}/ticker/price", params={"symbol": symbol}, timeout=10)
     try:
@@ -514,6 +519,12 @@ def _get_exchange() -> Any:
         ex = ccxt.binance({"apiKey": key, "secret": sec, "enableRateLimit": True})
         if S.market == "futures":
             ex.options["defaultType"] = "future"
+        # Testnet/sandbox: gerçek API ile Binance DEMO borsasına bağlan (sahte para,
+        # gerçek emir/orderbook/slippage). BINANCE_TESTNET=true ise etkin. Anahtarlar
+        # canlıdan AYRI alınır: spot=testnet.binance.vision, futures=testnet.binancefuture.com
+        if _testnet_enabled():
+            ex.set_sandbox_mode(True)
+            log.warning("⚠️ Binance TESTNET modu — sahte para, gerçek emir akışı")
         _exchange = ex
     return _exchange
 

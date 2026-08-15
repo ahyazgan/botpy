@@ -2348,26 +2348,80 @@ def _stream_diff(snapshot: list[dict[str, Any]], seen: set[str]) -> list[dict[st
     return list(reversed(fresh))   # snapshot en-yeni-başta; istemciye en-eski-önce
 
 
+def _sse_event(name: str, payload: Any) -> str:
+    """Adlandırılmış SSE olayı serileştir (saf)."""
+    return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+def _stream_status() -> dict[str, Any]:
+    """SSE `status` olayı için hafif canlı durum — halt banner'ı + akış-sağlığı
+    rozetleri 15s polling'i beklemeden panele düşsün. Ağsız (kilit + bellek)."""
+    halt = trader.get_halt()
+    with _cache_lock:
+        st = dict(_status)
+    return {
+        "trading_halted": bool(halt.get("active")),
+        "halt_reason": halt.get("reason") or "",
+        "ws_connected": bool(_ws_state["connected"]),
+        "feed_stale": _ws_feed_stale(),
+        "alert_threshold": st["alert_threshold"],
+        "total_seen": st["total_seen"],
+    }
+
+
 @app.get("/stream")
-async def stream() -> StreamingResponse:
-    """Yeni güçlü haberleri SSE ile push'la (15s polling yerine gerçek zamanlıya yakın)."""
+async def stream(cycles: int = 0) -> StreamingResponse:
+    """Gerçek zamanlı SSE akışı: haber (adsız olay) + `positions` + `status`.
+
+    Haberler diff ile push'lanır; pozisyonlar/durum yalnız DEĞİŞİNCE gönderilir
+    (açılış/kapanış ~2s'de, P&L monitör fiyat tazeledikçe ~8s'de düşer). İstemci
+    ilk turda pozisyon+durum snapshot'ını koşulsuz alır. `cycles`>0 = o kadar
+    turdan sonra kapat (test/curl teşhisi için; 0 = sınırsız)."""
     async def gen() -> Any:
         seen: set[str] = set()
         primed = False
+        last_pos = ""
+        last_status = ""
+        remaining = cycles
         while True:
             with _cache_lock:
                 snapshot = [n.to_dict() for n in _news[:50]]
+            sent = False
             if not primed:
                 seen = {n["id"] for n in snapshot}
                 primed = True
                 yield ": bağlandı\n\n"
+                sent = True
             else:
-                fresh = _stream_diff(snapshot, seen)
-                for n in fresh:
+                for n in _stream_diff(snapshot, seen):
                     seen.add(n["id"])
                     yield f"data: {json.dumps(n, ensure_ascii=False)}\n\n"
-                if not fresh:
-                    yield ": ping\n\n"   # bağlantıyı canlı tut
+                    sent = True
+            try:
+                positions, total_pnl = trader.get_positions()   # ağsız (fiyat önbelleği)
+                pos_payload = {"positions": positions, "total_pnl": total_pnl}
+                pos_json = json.dumps(pos_payload, ensure_ascii=False, sort_keys=True, default=str)
+                if pos_json != last_pos:
+                    last_pos = pos_json
+                    yield _sse_event("positions", pos_payload)
+                    sent = True
+            except Exception:
+                pass   # pozisyon okunamadı — akışı düşürme, sonraki turda dene
+            try:
+                status = _stream_status()
+                status_json = json.dumps(status, ensure_ascii=False, sort_keys=True)
+                if status_json != last_status:
+                    last_status = status_json
+                    yield _sse_event("status", status)
+                    sent = True
+            except Exception:
+                pass
+            if not sent:
+                yield ": ping\n\n"   # bağlantıyı canlı tut
+            if cycles > 0:
+                remaining -= 1
+                if remaining <= 0:
+                    return
             await asyncio.sleep(STREAM_INTERVAL_SEC)
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

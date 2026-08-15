@@ -130,6 +130,7 @@ type Settings = {
   atr_sl_mult: number;
   atr_tp_mult: number;
   has_live_keys: boolean;
+  testnet: boolean;
   open_exposure_usdt: number;
   realized_today: number;
 };
@@ -1266,6 +1267,14 @@ export default function App() {
             >
               {live ? "🔴 CANLI (gerçek para)" : "🟢 PAPER (simülasyon)"}
             </button>
+            {settings.testnet && (
+              <span
+                className="rounded-lg border border-amber-500/40 bg-amber-950/40 px-2 py-1 text-xs font-bold text-amber-300"
+                title="BINANCE_TESTNET aktif — canlı modda emirler Binance DEMO borsasına gider (sahte para, gerçek emir akışı). Gerçek canlıya geçmeden env'den kaldır."
+              >
+                🧪 TESTNET
+              </span>
+            )}
             <button
               type="button"
               onClick={() => void patchSettings({ auto_trade: !settings.auto_trade })}
@@ -1709,7 +1718,10 @@ export default function App() {
           <span className="flex items-center gap-1.5" title="Bağlantı durumu: yeşil = yapılandırılmış">
             <ConnDot ok={health?.scorer === "claude"} label="Claude" offLabel="kural" />
             <ConnDot ok={!!newsSettings?.remote_channels_available} label="Telegram/Discord" offLabel="uzak yok" />
-            <ConnDot ok={!!settings?.has_live_keys} label="Binance canlı" offLabel="paper" />
+            <ConnDot ok={!!settings?.has_live_keys} label={settings?.testnet ? "Binance testnet" : "Binance canlı"} offLabel="paper" />
+            {settings?.testnet && (
+              <span className="font-semibold text-amber-400" title="BINANCE_TESTNET aktif — emirler demo borsaya gider (sahte para)">🧪</span>
+            )}
           </span>
         </div>
 

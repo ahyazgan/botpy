@@ -305,7 +305,7 @@ def has_live_keys() -> bool:
     return bool(os.environ.get("BINANCE_API_KEY") and os.environ.get("BINANCE_SECRET"))
 
 
-def _testnet_enabled() -> bool:
+def testnet_enabled() -> bool:
     """BINANCE_TESTNET env'i true/1/yes ise Binance testnet (demo borsa) kullanılır."""
     return os.environ.get("BINANCE_TESTNET", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -522,7 +522,7 @@ def _get_exchange() -> Any:
         # Testnet/sandbox: gerçek API ile Binance DEMO borsasına bağlan (sahte para,
         # gerçek emir/orderbook/slippage). BINANCE_TESTNET=true ise etkin. Anahtarlar
         # canlıdan AYRI alınır: spot=testnet.binance.vision, futures=testnet.binancefuture.com
-        if _testnet_enabled():
+        if testnet_enabled():
             ex.set_sandbox_mode(True)
             log.warning("⚠️ Binance TESTNET modu — sahte para, gerçek emir akışı")
         _exchange = ex
@@ -2270,8 +2270,18 @@ def preflight() -> list[dict[str, Any]]:
         checks.append({"check": name, "status": status, "detail": detail})
 
     live = not S.paper_trading
+    testnet = testnet_enabled()
     add("İşlem modu", "info",
-        "CANLI — gerçek emir" if live else "PAPER — simülasyon (gerçek emir yok)")
+        ("CANLI + TESTNET — emirler Binance DEMO borsasına gider (sahte para)"
+         if testnet else "CANLI — gerçek emir")
+        if live else "PAPER — simülasyon (gerçek emir yok)")
+
+    # Testnet farkındalığı: demo borsada gerçek para RİSKE ATILMAZ ama kullanıcı
+    # canlıda olduğunu sanabilir — GERÇEK canlıya geçmeden env'den kaldırılmalı
+    if testnet:
+        add("Binance testnet", "warn",
+            "BINANCE_TESTNET aktif — tüm emirler demo borsaya; gerçek canlıya "
+            "geçmeden önce env'den kaldır")
 
     # Canlı API anahtarları (canlıda kritik; paper'da uyarı/bilgi)
     if has_live_keys():
@@ -2472,7 +2482,7 @@ def connectivity_probe() -> dict[str, Any]:
         add("API izinleri", "warn",
             f"okunamadı ({e}) — MANUEL doğrula: çekim KAPALI + IP whitelist")
 
-    return {"ok": ok, "skipped": False, "checks": checks}
+    return {"ok": ok, "skipped": False, "testnet": testnet_enabled(), "checks": checks}
 
 
 def daily_summary(date: str | None = None) -> dict[str, Any]:
@@ -3106,6 +3116,7 @@ def get_settings() -> dict[str, Any]:
     total, _ = _exposure()
     return {k: getattr(S, k) for k in _PERSIST_KEYS} | {
         "has_live_keys": has_live_keys(),
+        "testnet": testnet_enabled(),
         "open_exposure_usdt": round(total, 2),
         "realized_today": _daily.get("realized", 0.0),
     }

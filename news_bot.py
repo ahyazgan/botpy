@@ -2618,6 +2618,7 @@ def health() -> dict[str, Any]:
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],
         "halt_reason": trader.get_halt()["reason"],
+        "testnet": trader.testnet_enabled(),
     }
 
 

@@ -232,6 +232,8 @@ class NewsItem:
     mismatch: bool = False          # başlık↔gövde çelişkisi (clickbait/şişirilmiş başlık)
     source_count: int = 1           # aynı olayı bildiren farklı kaynak sayısı (çapraz-doğrulama)
     confirming_sources: list[str] = field(default_factory=list)  # teyit eden kaynaklar
+    contested: int = 0              # aynı coinde TERS yönlü haber sayısı (füzyon çelişkisi)
+    impact_pre_fusion: int | None = None  # füzyon bonusundan ÖNCEKİ ham skor (Tier-1 bunu okur)
     # fiyat teyidi (Binance)
     symbol: str | None = None       # işlem yapılacak parite (örn. BTCUSDT)
     price_24h_pct: float | None = None
@@ -267,6 +269,13 @@ class NewsItem:
             "atr_pct": self.atr_pct,
             "confirmed": self.confirmed,
             "price_note": self.price_note,
+            # Füzyon + clickbait bayrakları: arşiv (ablasyon girdisi) ve panel
+            # rozetleri (⚠ clickbait / ✓N kaynak) bunları buradan okur
+            "mismatch": self.mismatch,
+            "source_count": self.source_count,
+            "confirming_sources": self.confirming_sources,
+            "contested": self.contested,
+            "impact_pre_fusion": self.impact_pre_fusion,
         }
 
 
@@ -898,6 +907,55 @@ FUSE_WINDOW_MIN = 20          # bu pencerede (dk) aynı olay sayılır
 FUSE_MAX_IMPACT_BONUS = 2     # çok-kaynak teyidi impact'i en fazla bu kadar artırır (cap'li)
 
 
+FUSE_MIN_TOPIC_OVERLAP = 0.34   # başlıklar bu oranda örtüşmezse "aynı olay" sayılmaz
+
+# Konu anahtarından atılan genel dolgu. Olay kelimeleri (hack/listing/etf) ve borsa
+# adları KORUNUR — ayırt edici olan onlar. Sayılar da korunur ($600m ≠ $2m).
+_TOPIC_STOP = frozenset("""
+the a an and or of to in on for with by at as from its it this that will has have
+was were been are is be new now after over into more than but not you your we our
+says said report reports breaking update updates just amid ahead per via about
+crypto cryptocurrency token tokens coin coins price prices market markets trading
+usd usdt user users today week month year
+""".split())
+_TOPIC_WORD = re.compile(r"[a-z0-9$%]+")
+
+
+def _fuse_coin(item: NewsItem) -> str | None:
+    """Füzyon eşleştirme anahtarı: sembol tabanı (BTCUSDT→BTC) veya ilk coin. Saf.
+
+    Ham sembol kullanılırsa teyit edilmiş (BTCUSDT) ve edilmemiş (BTC) aynı haber
+    hiç eşleşmez — mekanizma meşru teyitleri kaçırırdı.
+    """
+    if item.symbol:
+        return item.symbol[:-4] if item.symbol.upper().endswith("USDT") else item.symbol
+    return item.coins[0] if item.coins else None
+
+
+def _topic_key(title: str, coins: list[str] | None = None) -> set[str]:
+    """Başlığın konu parmak izi (saf). Coin adları ATILIR — eşleştirmede coin zaten
+    ayrı koşul; kalan kelimeler olayın KENDİSİNİ ayırt etmeli."""
+    drop = {c.lower() for c in (coins or [])}
+    out: set[str] = set()
+    for w in _TOPIC_WORD.findall((title or "").lower()):
+        if w in _TOPIC_STOP or w in drop:
+            continue
+        if len(w) < 3 and not w.isdigit():
+            continue
+        out.add(w)
+    return out
+
+
+def _same_event(a: set[str], b: set[str],
+                min_overlap: float = FUSE_MIN_TOPIC_OVERLAP) -> bool:
+    """İki başlık aynı olayı mı anlatıyor (saf). Örtüşme küçük kümeye oranlanır —
+    başlık uzunlukları çok farklı olabilir. Konu çıkarılamazsa fail-open (eski
+    davranış): teyidi tamamen kaybetmektense gevşek eşleşmek yeğdir."""
+    if not a or not b:
+        return True
+    return len(a & b) / min(len(a), len(b)) >= min_overlap
+
+
 def _fuse_event(item: NewsItem, snapshot: list[NewsItem]) -> dict[str, Any]:
     """Bu haberi aynı olayı bildiren DİĞER KAYNAKLARLA çapraz-doğrula (saf, ağsız).
 
@@ -907,29 +965,38 @@ def _fuse_event(item: NewsItem, snapshot: list[NewsItem]) -> dict[str, Any]:
     FUSE_MAX_IMPACT_BONUS) — her ek bağımsız kaynak +1, cap'li. Aynı kaynağın tekrarı
     (echo) sayılmaz; nötr yön katkı yapmaz.
     """
-    coin = item.symbol or (item.coins[0] if item.coins else None)
+    coin = _fuse_coin(item)
     base_src = (item.source or "").lower().strip()
     if not coin or item.direction == "neutral":
-        return {"source_count": 1, "confirming_sources": [], "impact_bonus": 0}
+        return {"source_count": 1, "confirming_sources": [], "impact_bonus": 0,
+                "contested": 0}
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=FUSE_WINDOW_MIN)
+    topic = _topic_key(item.title, item.coins)
     confirming: set[str] = set()
+    contested = 0
     for n in snapshot:
-        if n.id == item.id or n.direction != item.direction:
+        if n.id == item.id or n.direction == "neutral":
             continue
-        n_coin = n.symbol or (n.coins[0] if n.coins else None)
-        if n_coin != coin:
-            continue
-        nsrc = (n.source or "").lower().strip()
-        if not nsrc or nsrc == base_src:   # echo/aynı kaynak → güven katmaz
+        if _fuse_coin(n) != coin:
             continue
         t = _parse_time(n.published) or _parse_time(n.fetched_at)
         if t is None or t < cutoff:
             continue
+        if not _same_event(topic, _topic_key(n.title, n.coins)):
+            continue                        # aynı coin ama BAŞKA olay → teyit değil
+        if n.direction != item.direction:
+            contested += 1                  # aynı olayda TERS yön → çelişki
+            continue
+        nsrc = (n.source or "").lower().strip()
+        if not nsrc or nsrc == base_src:    # echo/aynı kaynak → güven katmaz
+            continue
         confirming.add(n.source)
     source_count = 1 + len(confirming)
-    bonus = min(len(confirming), FUSE_MAX_IMPACT_BONUS)
+    # Çelişkili olayda çapraz-teyit bonusu YOK: kaynaklar aynı olayda anlaşamıyorsa
+    # "çok kaynak = daha emin" çıkarımı geçersizdir.
+    bonus = 0 if contested else min(len(confirming), FUSE_MAX_IMPACT_BONUS)
     return {"source_count": source_count, "confirming_sources": sorted(confirming),
-            "impact_bonus": bonus}
+            "impact_bonus": bonus, "contested": contested}
 
 
 def _apply_fusion(items: list[NewsItem]) -> None:
@@ -947,6 +1014,10 @@ def _apply_fusion(items: list[NewsItem]) -> None:
         f = _fuse_event(it, snapshot)
         it.source_count = f["source_count"]
         it.confirming_sources = f["confirming_sources"]
+        it.contested = f["contested"]
+        # Ham skoru MUTLAKA sakla: Tier-1 teyitsiz refleks girişi bunu okur, yoksa
+        # aynı haberin 3 outlet'te kopyalanması sistemin en agresif kapısını açar.
+        it.impact_pre_fusion = it.impact
         if f["impact_bonus"] > 0 and it.impact < 10:
             it.impact = min(10, it.impact + f["impact_bonus"])
             extra = f"{f['source_count']} kaynak teyidi"
@@ -2348,26 +2419,80 @@ def _stream_diff(snapshot: list[dict[str, Any]], seen: set[str]) -> list[dict[st
     return list(reversed(fresh))   # snapshot en-yeni-başta; istemciye en-eski-önce
 
 
+def _sse_event(name: str, payload: Any) -> str:
+    """Adlandırılmış SSE olayı serileştir (saf)."""
+    return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+def _stream_status() -> dict[str, Any]:
+    """SSE `status` olayı için hafif canlı durum — halt banner'ı + akış-sağlığı
+    rozetleri 15s polling'i beklemeden panele düşsün. Ağsız (kilit + bellek)."""
+    halt = trader.get_halt()
+    with _cache_lock:
+        st = dict(_status)
+    return {
+        "trading_halted": bool(halt.get("active")),
+        "halt_reason": halt.get("reason") or "",
+        "ws_connected": bool(_ws_state["connected"]),
+        "feed_stale": _ws_feed_stale(),
+        "alert_threshold": st["alert_threshold"],
+        "total_seen": st["total_seen"],
+    }
+
+
 @app.get("/stream")
-async def stream() -> StreamingResponse:
-    """Yeni güçlü haberleri SSE ile push'la (15s polling yerine gerçek zamanlıya yakın)."""
+async def stream(cycles: int = 0) -> StreamingResponse:
+    """Gerçek zamanlı SSE akışı: haber (adsız olay) + `positions` + `status`.
+
+    Haberler diff ile push'lanır; pozisyonlar/durum yalnız DEĞİŞİNCE gönderilir
+    (açılış/kapanış ~2s'de, P&L monitör fiyat tazeledikçe ~8s'de düşer). İstemci
+    ilk turda pozisyon+durum snapshot'ını koşulsuz alır. `cycles`>0 = o kadar
+    turdan sonra kapat (test/curl teşhisi için; 0 = sınırsız)."""
     async def gen() -> Any:
         seen: set[str] = set()
         primed = False
+        last_pos = ""
+        last_status = ""
+        remaining = cycles
         while True:
             with _cache_lock:
                 snapshot = [n.to_dict() for n in _news[:50]]
+            sent = False
             if not primed:
                 seen = {n["id"] for n in snapshot}
                 primed = True
                 yield ": bağlandı\n\n"
+                sent = True
             else:
-                fresh = _stream_diff(snapshot, seen)
-                for n in fresh:
+                for n in _stream_diff(snapshot, seen):
                     seen.add(n["id"])
                     yield f"data: {json.dumps(n, ensure_ascii=False)}\n\n"
-                if not fresh:
-                    yield ": ping\n\n"   # bağlantıyı canlı tut
+                    sent = True
+            try:
+                positions, total_pnl = trader.get_positions()   # ağsız (fiyat önbelleği)
+                pos_payload = {"positions": positions, "total_pnl": total_pnl}
+                pos_json = json.dumps(pos_payload, ensure_ascii=False, sort_keys=True, default=str)
+                if pos_json != last_pos:
+                    last_pos = pos_json
+                    yield _sse_event("positions", pos_payload)
+                    sent = True
+            except Exception:
+                pass   # pozisyon okunamadı — akışı düşürme, sonraki turda dene
+            try:
+                status = _stream_status()
+                status_json = json.dumps(status, ensure_ascii=False, sort_keys=True)
+                if status_json != last_status:
+                    last_status = status_json
+                    yield _sse_event("status", status)
+                    sent = True
+            except Exception:
+                pass
+            if not sent:
+                yield ": ping\n\n"   # bağlantıyı canlı tut
+            if cycles > 0:
+                remaining -= 1
+                if remaining <= 0:
+                    return
             await asyncio.sleep(STREAM_INTERVAL_SEC)
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -2564,6 +2689,7 @@ def health() -> dict[str, Any]:
         "signals_archived": archived,
         "trading_halted": trader.get_halt()["active"],
         "halt_reason": trader.get_halt()["reason"],
+        "testnet": trader.testnet_enabled(),
     }
 
 
@@ -3187,6 +3313,7 @@ class SettingsPatch(BaseModel):
     exchange_native_stops: bool | None = None
     reconcile_autoclose: bool | None = None
     auto_halt_on_anomaly: bool | None = None
+    taker_fee_pct: float | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_volume: bool | None = None

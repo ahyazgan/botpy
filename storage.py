@@ -9,11 +9,14 @@ arka plan thread'i ile API thread'leri aynı bağlantıyı paylaşır).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.environ.get("BOTPY_DB", "botpy.db")
 
@@ -141,9 +144,20 @@ CREATE TABLE IF NOT EXISTS news_signals (
     symbol        TEXT,
     price_24h_pct REAL,
     price_15m_pct REAL,
+    price_60m_pct REAL,
     volume_usd    REAL,
-    confirmed     INTEGER,               -- 0/1
-    price_note    TEXT
+    -- ÜÇ DURUMLU: NULL = teyit hiç denenmedi (fiyat verisi yok / import), 0 = denendi
+    -- teyit olmadı, 1 = teyitli. 0/1'e düzleştirmek "denenmedi"yi "başarısız" sayıp
+    -- ablasyonda 'fiyat teyidi şart' sonucunu yapay olarak güçlendirir.
+    confirmed     INTEGER,
+    price_note    TEXT,
+    rel_volume    REAL,                  -- RVOL — ablasyon hacim kapısının girdisi
+    atr_pct       REAL,                  -- oynaklık — ATR tabanlı eşik/çıkış analizi
+    mismatch      INTEGER,               -- başlık↔gövde çelişkisi (clickbait)
+    source_count  INTEGER,               -- çapraz-kaynak teyidi (füzyon)
+    confirming_sources TEXT,             -- JSON list
+    contested     INTEGER,               -- aynı olayda ters yönlü haber sayısı
+    impact_pre_fusion INTEGER            -- füzyon bonusu öncesi ham skor
 );
 
 CREATE INDEX IF NOT EXISTS idx_signal_ts ON news_signals(ts);
@@ -179,8 +193,10 @@ CREATE TABLE IF NOT EXISTS news_closed_trades (
     usdt        REAL,
     entry_price REAL,
     close_price REAL,
-    pnl         REAL,
-    pnl_pct     REAL,
+    pnl         REAL,                  -- NET (komisyon düşülmüş)
+    pnl_pct     REAL,                  -- NET %
+    gross_pnl   REAL,                  -- komisyon öncesi brüt (şeffaflık)
+    fees_usdt   REAL,                  -- gidiş-dönüş komisyon (USDT)
     close_reason TEXT,
     source      TEXT,
     news_source TEXT,
@@ -264,9 +280,19 @@ CREATE INDEX IF NOT EXISTS idx_ops_kind_ts ON ops_events(kind, ts);
 
 _NCT_COLUMNS = (
     "trade_id", "closed_at", "opened_at", "symbol", "side", "mode", "usdt",
-    "entry_price", "close_price", "pnl", "pnl_pct", "close_reason",
-    "source", "news_source", "impact",
+    "entry_price", "close_price", "pnl", "pnl_pct", "gross_pnl", "fees_usdt",
+    "close_reason", "source", "news_source", "impact",
 )
+
+# Şema evrimi: mevcut DB'lere sonradan eklenen kolonlar. {tablo: [(kolon, sql_tip)]}
+# ALTER TABLE ADD COLUMN idempotent DEĞİL — _migrate PRAGMA ile var olanı atlar.
+_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "news_closed_trades": [("gross_pnl", "REAL"), ("fees_usdt", "REAL")],
+    "news_signals": [("price_60m_pct", "REAL"), ("rel_volume", "REAL"),
+                     ("atr_pct", "REAL"), ("mismatch", "INTEGER"),
+                     ("source_count", "INTEGER"), ("confirming_sources", "TEXT"),
+                     ("contested", "INTEGER"), ("impact_pre_fusion", "INTEGER")],
+}
 
 _BACKTEST_COLUMNS = (
     "ts", "mode", "sl", "tp", "fee", "usdt", "hours", "min_impact",
@@ -288,7 +314,9 @@ _CLOSED_COLUMNS = (
 _SIGNAL_COLUMNS = (
     "id", "ts", "source", "title", "url", "published", "fetched_at", "coins",
     "impact", "direction", "reason", "scorer", "symbol", "price_24h_pct",
-    "price_15m_pct", "volume_usd", "confirmed", "price_note",
+    "price_15m_pct", "price_60m_pct", "volume_usd", "confirmed", "price_note",
+    "rel_volume", "atr_pct", "mismatch", "source_count", "confirming_sources",
+    "contested", "impact_pre_fusion",
 )
 _BRAIN_COLUMNS = (
     "ts", "news_id", "source", "title", "symbol", "side", "impact", "direction",
@@ -308,7 +336,30 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Eski DB'lere sonradan eklenen kolonları aç (kilit ÇAĞIRANDA tutulur).
+
+        `CREATE TABLE IF NOT EXISTS` var olan tabloyu güncellemez; bu yüzden yeni
+        kolon eklendiğinde eski dosyalar onsuz kalır ve okuma tarafı sessizce None
+        görür. PRAGMA table_info ile mevcut kolonları öğrenip eksikleri ekler —
+        veri kaybı yok, tekrar çalıştırmak zararsız.
+        """
+        for table, columns in _MIGRATIONS.items():
+            try:
+                have = {r["name"] for r in
+                        self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            except sqlite3.Error:
+                continue          # tablo yok (eski/kısmi şema) — CREATE zaten kuracak
+            if not have:
+                continue
+            for col, coltype in columns:
+                if col in have:
+                    continue
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                log.info("DB migrasyon: %s.%s eklendi", table, col)
 
     def close(self) -> None:
         with self._lock:
@@ -580,8 +631,19 @@ class Store:
             "symbol": item.get("symbol"),
             "price_24h_pct": item.get("price_24h_pct"),
             "price_15m_pct": item.get("price_15m_pct"),
+            "price_60m_pct": item.get("price_60m_pct"),
             "volume_usd": item.get("volume_usd"),
-            "confirmed": 1 if item.get("confirmed") else 0,
+            # Üç durumlu: fiyat verisi hiç alınamadıysa teyit DENENMEMİŞTİR (NULL)
+            "confirmed": (1 if item.get("confirmed") else 0)
+                         if item.get("price_24h_pct") is not None else None,
+            "rel_volume": item.get("rel_volume"),
+            "atr_pct": item.get("atr_pct"),
+            "mismatch": 1 if item.get("mismatch") else 0,
+            "source_count": int(item.get("source_count") or 1),
+            "confirming_sources": json.dumps(
+                item.get("confirming_sources") or [], ensure_ascii=False),
+            "contested": int(item.get("contested") or 0),
+            "impact_pre_fusion": item.get("impact_pre_fusion"),
             "price_note": item.get("price_note", ""),
         }
         cols = ", ".join(_SIGNAL_COLUMNS)
@@ -600,7 +662,15 @@ class Store:
             d["coins"] = json.loads(d["coins"]) if d.get("coins") else []
         except (ValueError, TypeError):
             d["coins"] = []
-        d["confirmed"] = bool(d.get("confirmed"))
+        # None'ı KORU — "teyit denenmedi" ile "teyit başarısız" farklı şeyler
+        # (ablasyon `is not None` ile veri-var mı diye bakıyor)
+        d["confirmed"] = None if d.get("confirmed") is None else bool(d["confirmed"])
+        d["mismatch"] = bool(d.get("mismatch"))
+        try:
+            d["confirming_sources"] = (json.loads(d["confirming_sources"])
+                                       if d.get("confirming_sources") else [])
+        except (ValueError, TypeError):
+            d["confirming_sources"] = []
         return d
 
     def list_signals(
@@ -846,6 +916,8 @@ class Store:
             "close_price": trade.get("close_price"),
             "pnl": trade.get("pnl"),
             "pnl_pct": trade.get("pnl_pct"),
+            "gross_pnl": trade.get("gross_pnl"),
+            "fees_usdt": trade.get("fees_usdt"),
             "close_reason": trade.get("close_reason"),
             "source": trade.get("source"),
             "news_source": trade.get("news_source"),

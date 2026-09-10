@@ -155,7 +155,9 @@ CREATE TABLE IF NOT EXISTS news_signals (
     atr_pct       REAL,                  -- oynaklık — ATR tabanlı eşik/çıkış analizi
     mismatch      INTEGER,               -- başlık↔gövde çelişkisi (clickbait)
     source_count  INTEGER,               -- çapraz-kaynak teyidi (füzyon)
-    confirming_sources TEXT              -- JSON list
+    confirming_sources TEXT,             -- JSON list
+    contested     INTEGER,               -- aynı olayda ters yönlü haber sayısı
+    impact_pre_fusion INTEGER            -- füzyon bonusu öncesi ham skor
 );
 
 CREATE INDEX IF NOT EXISTS idx_signal_ts ON news_signals(ts);
@@ -288,7 +290,8 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "news_closed_trades": [("gross_pnl", "REAL"), ("fees_usdt", "REAL")],
     "news_signals": [("price_60m_pct", "REAL"), ("rel_volume", "REAL"),
                      ("atr_pct", "REAL"), ("mismatch", "INTEGER"),
-                     ("source_count", "INTEGER"), ("confirming_sources", "TEXT")],
+                     ("source_count", "INTEGER"), ("confirming_sources", "TEXT"),
+                     ("contested", "INTEGER"), ("impact_pre_fusion", "INTEGER")],
 }
 
 _BACKTEST_COLUMNS = (
@@ -313,6 +316,7 @@ _SIGNAL_COLUMNS = (
     "impact", "direction", "reason", "scorer", "symbol", "price_24h_pct",
     "price_15m_pct", "price_60m_pct", "volume_usd", "confirmed", "price_note",
     "rel_volume", "atr_pct", "mismatch", "source_count", "confirming_sources",
+    "contested", "impact_pre_fusion",
 )
 _BRAIN_COLUMNS = (
     "ts", "news_id", "source", "title", "symbol", "side", "impact", "direction",
@@ -638,6 +642,8 @@ class Store:
             "source_count": int(item.get("source_count") or 1),
             "confirming_sources": json.dumps(
                 item.get("confirming_sources") or [], ensure_ascii=False),
+            "contested": int(item.get("contested") or 0),
+            "impact_pre_fusion": item.get("impact_pre_fusion"),
             "price_note": item.get("price_note", ""),
         }
         cols = ", ".join(_SIGNAL_COLUMNS)

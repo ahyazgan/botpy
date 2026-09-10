@@ -39,6 +39,8 @@ type NewsItem = {
   scorer: string;
   mismatch?: boolean;
   source_count?: number;
+  contested?: number;
+  impact_pre_fusion?: number | null;
   confirming_sources?: string[];
   symbol: string | null;
   price_24h_pct: number | null;
@@ -1888,6 +1890,17 @@ export default function App() {
                         <span className="rounded-md border border-sky-600/40 bg-sky-950/40 px-1.5 py-0.5 font-semibold text-sky-300"
                           title={`Çok-kaynak teyidi: ${n.confirming_sources?.join(", ") ?? ""} aynı olayı bildirdi. İmpact artırıldı.`}>
                           ✓{n.source_count} kaynak
+                        </span>
+                      )}
+                      {!!n.contested && n.contested > 0 && (
+                        <span className="rounded-md border border-amber-600/40 bg-amber-950/40 px-1.5 py-0.5 font-semibold text-amber-300"
+                          title="Kaynaklar aynı olayda ANLAŞMIYOR (ters yönlü haber var). Çapraz-teyit bonusu verilmedi.">
+                          ⚔ {n.contested} çelişki
+                        </span>
+                      )}
+                      {n.impact_pre_fusion != null && n.impact_pre_fusion < n.impact && (
+                        <span className="text-zinc-500" title={`Ham güç ${n.impact_pre_fusion}, çapraz-kaynak teyidiyle ${n.impact}. Teyitsiz refleks giriş HAM skoru okur.`}>
+                          (ham {n.impact_pre_fusion})
                         </span>
                       )}
                       <span className="text-zinc-700">·</span>

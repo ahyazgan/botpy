@@ -1661,7 +1661,12 @@ def monitor_positions() -> list[dict[str, Any]]:
 # ── Otomatik işlem ───────────────────────────────────────────────────────
 def _can_auto_trade(symbol: str) -> bool:
     with _lock:
-        if time.monotonic() - _last_trade.get(symbol, 0.0) < S.cooldown_sec:
+        # None sentinel ŞART: time.monotonic() Linux'ta boot'tan beri geçen süredir.
+        # Varsayılanı 0.0 yapmak, hiç işlem görmemiş sembolü "monotonic < cooldown"
+        # olduğu sürece cooldown'da sayar → yeni boot edilmiş makinede (Docker 7/24
+        # dağıtımı) bot ilk cooldown_sec boyunca SESSİZCE hiç işlem açmaz.
+        last = _last_trade.get(symbol)
+        if last is not None and time.monotonic() - last < S.cooldown_sec:
             return False
         if len(_positions) >= S.max_positions:
             return False
@@ -1852,6 +1857,15 @@ def _portfolio_heat(new_sym: str, new_side: str,
     return {"heat": heat, "factor": factor, "correlated": correlated, "n_open": len(opens)}
 
 
+def _raw_impact(item: Any) -> int:
+    """Füzyon bonusundan ÖNCEKİ ham güç. Saf, alan-bağımsız.
+
+    Alan yoksa (eski kayıtlar, füzyon kapalı) mevcut impact'e düşer — geriye uyumlu.
+    """
+    raw = getattr(item, "impact_pre_fusion", None)
+    return int(raw) if raw is not None else int(getattr(item, "impact", 0) or 0)
+
+
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None,
                   latency_slow: bool = False,
@@ -1891,7 +1905,11 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         return no(f"güç {item.impact} < eşik {S.auto_min_impact}")
     # Tier-1 "net" haber (hack/ETF/büyük listeleme vb. — yüksek güç): teyit beklemeden
     # refleksle gir; hareket başlamadan önde ol. Diğer her şey (Tier-2) teyit bekler.
-    tier1 = S.tier1_skip_confirm_impact > 0 and item.impact >= S.tier1_skip_confirm_impact
+    # KORKULUK: refleks yetkisi HAM skora bakar (çapraz-kaynak füzyon bonusu hariç).
+    # Aynı haberin N outlet'te kopyalanması bağımsız kanıt DEĞİLDİR; bonusun teyitsiz
+    # giriş kapısını açmasına izin verilirse sistemin en agresif yolu taklit edilmesi
+    # en kolay sinyalle tetiklenir. Bonus yine eşik/boyut tarafında geçerli.
+    tier1 = S.tier1_skip_confirm_impact > 0 and _raw_impact(item) >= S.tier1_skip_confirm_impact
     if S.auto_require_confirm and not tier1 and not getattr(item, "confirmed", False):
         return no("fiyat teyidi yok")
     symbol = getattr(item, "symbol", None)

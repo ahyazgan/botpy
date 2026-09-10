@@ -129,6 +129,7 @@ type Settings = {
   partial_tp_levels: string;
   atr_sl_mult: number;
   atr_tp_mult: number;
+  taker_fee_pct: number;
   has_live_keys: boolean;
   testnet: boolean;
   open_exposure_usdt: number;
@@ -389,6 +390,8 @@ type StreamStatus = {
 };
 
 type ClosedTrade = {
+  gross_pnl?: number | null;
+  fees_usdt?: number | null;
   closed_at: string | null;
   symbol: string;
   side: string;
@@ -1557,6 +1560,7 @@ export default function App() {
               >
                 🔄 Hayalet pozisyon oto-kapat: {settings.reconcile_autoclose ? "AÇIK" : "kapalı (uyar)"}
               </button>
+              <NumField label="Komisyon % (tek bacak — P&L NET tutulur)" value={settings.taker_fee_pct} onSave={(v) => patchSettings({ taker_fee_pct: v })} />
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
@@ -3387,7 +3391,10 @@ export default function App() {
                         <td className="px-4 py-3 text-xs text-zinc-400">{t.close_reason ?? "—"}</td>
                         <td className="px-4 py-3 tabular-nums">
                           {t.pnl === null ? <span className="text-zinc-500">—</span> : (
-                            <span className={t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>
+                            <span className={t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}
+                              title={t.fees_usdt != null && t.gross_pnl != null
+                                ? `NET P&L. Brüt ${t.gross_pnl} USDT − komisyon ${t.fees_usdt} USDT (gidiş-dönüş)`
+                                : "NET P&L (komisyon düşülmüş)"}>
                               {t.pnl >= 0 ? "+" : ""}{t.pnl} USDT
                               {t.pnl_pct !== null && <span className="ml-1 text-xs opacity-70">({t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct}%)</span>}
                             </span>

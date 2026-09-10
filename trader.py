@@ -102,6 +102,10 @@ class Settings:
     halt_on_monitor_stall: bool = True
     # Emir kalitesi
     order_type: str = "market"       # "market" | "limit"
+    # Borsa komisyonu (TEK bacak, %). Gerçekleşen P&L bundan NET hesaplanır — defterin
+    # backtest ile aynı birimde olması için (news_backtest zaten net hesaplıyor).
+    # Binance spot/futures taker varsayılanı ~%0.1; canlıda borsadan okunur.
+    taker_fee_pct: float = 0.1
     exchange_native_stops: bool = True   # canlıda borsaya DURAN SL/TP emri koy (bot çökse de korur)
     reconcile_autoclose: bool = False    # açılış mutabakatında borsada olmayan hayalet pozisyonu kapat
     auto_halt_on_anomaly: bool = True    # anomalide (emir-hata serisi/protect-error) yeni oto-işlemi durdur
@@ -168,7 +172,7 @@ _PERSIST_KEYS = (
     "use_atr_trailing", "atr_trailing_mult",
     "daily_loss_limit_usdt", "max_total_exposure_usdt", "max_per_coin_usdt",
     "max_drawdown_pct", "account_equity_usdt",
-    "order_type", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
+    "order_type", "taker_fee_pct", "slippage_guard_pct", "min_orderbook_usd", "size_by_impact",
     "size_by_kelly", "kelly_fraction", "kelly_min_trades",
     "risk_parity", "target_risk_usdt",
     "portfolio_risk", "corr_threshold", "max_portfolio_heat",
@@ -537,6 +541,56 @@ def _pnl(pos: dict[str, Any], cur: float | None) -> tuple[float | None, float | 
         diff = -diff
     lev = pos.get("leverage", 1) or 1
     return round(pos["usdt"] * diff * lev, 2), round(diff * lev * 100, 2)
+
+
+def _notional(usdt: float, leverage: int | None) -> float:
+    """Borsa nominali = marj × kaldıraç. Komisyon marjdan DEĞİL bundan alınır —
+    10x'te marja oranlamak maliyeti 10 kat eksik ölçer."""
+    return float(usdt) * (leverage or 1)
+
+
+def _roundtrip_fee(usdt: float, leverage: int | None, fee_pct: float | None) -> float:
+    """Bir dilimin gidiş-dönüş komisyonu (USDT). Saf.
+
+    İki bacak (giriş + çıkış) sayılır. Kısmi kapanışta dilim başına çağrıldığı
+    için toplam çift sayılmaz: her dilim yalnız KENDİ giriş+çıkış payını öder.
+    """
+    rate = S.taker_fee_pct if fee_pct is None else fee_pct
+    if rate <= 0:
+        return 0.0
+    return round(_notional(usdt, leverage) * rate / 100 * 2, 4)
+
+
+def _net_of_fees(pos: dict[str, Any], pnl: float | None, pct: float | None,
+                 usdt: float) -> tuple[float | None, float | None, float]:
+    """Brüt P&L'i komisyondan arındır. (net_pnl, net_pct, fees) döner. Saf.
+
+    `pct` marja oranlı yüzde olduğu için komisyon da marja oranlanarak düşülür.
+    Komisyon oranı pozisyonda saklanan (açılış anındaki) orandan okunur — ayar
+    sonradan değişse bile açık pozisyonun muhasebesi kaymaz.
+    """
+    fees = _roundtrip_fee(usdt, pos.get("leverage", 1), pos.get("fee_pct"))
+    if pnl is None:
+        return None, pct, fees
+    net = round(pnl - fees, 2)
+    net_pct = pct if pct is None or usdt <= 0 else round(pct - fees / usdt * 100, 2)
+    return net, net_pct, fees
+
+
+def _entry_fee_pct() -> float:
+    """Açılışta pozisyona mühürlenecek komisyon oranı. Canlıda borsanın gerçek
+    taker oranı varsa onu kullan (ek ağ çağrısı yok — market tablosu önbellekte)."""
+    if not S.paper_trading and has_live_keys():
+        try:
+            # YALNIZ yüklü önbelleği oku — ex.market() markets yüklü değilse
+            # load_markets() ağ çağrısı tetikler ve burası emir sıcak yolu.
+            markets = getattr(_get_exchange(), "markets", None) or {}
+            taker = (markets.get(_ccxt_symbol("BTCUSDT")) or {}).get("taker")
+            if taker:
+                return round(float(taker) * 100, 4)   # hesap-geneli kademe (sembolden bağımsız)
+        except Exception:
+            pass
+    return S.taker_fee_pct
 
 
 # ── Risk kontrolleri ─────────────────────────────────────────────────────
@@ -1187,6 +1241,9 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "news_source": news_source,
         "impact": impact,
         "rel_volume": rel_volume,   # öğrenme: hacim (RVOL) dilimine göre beklenti
+        # Komisyon oranı AÇILIŞTA mühürlenir: ayar sonradan değişse de bu pozisyonun
+        # muhasebesi kaymaz (canlıda borsanın gerçek taker oranı).
+        "fee_pct": _entry_fee_pct(),
         "reason": reason,
         # ATR%: SL/TP veya trailing ATR-uyarlamalıysa sakla (çıkış motoru okur)
         "atr_pct": round(atr_pct, 3) if ((S.use_atr_exits or S.use_atr_trailing) and atr_pct) else None,
@@ -1264,11 +1321,14 @@ def close_position(pid: str, reason: str = "manuel", exchange_close: bool = True
         except Exception as e:
             log.warning("Canlı kapatma hatası (%s): %s", pos["symbol"], e)
 
-    pnl, pct = _pnl(pos, cur)
+    gross, gross_pct = _pnl(pos, cur)
+    pnl, pct, fees = _net_of_fees(pos, gross, gross_pct, pos["usdt"])
     pos["closed_at"] = _now()
     pos["close_price"] = cur
-    pos["pnl"] = pnl
+    pos["pnl"] = pnl              # NET (komisyon düşülmüş) — tüm türev metrikler bunu okur
     pos["pnl_pct"] = pct
+    pos["gross_pnl"] = gross      # şeffaflık: komisyon öncesi
+    pos["fees_usdt"] = fees
     pos["close_reason"] = reason
     # MFE/MAE (segment SL/TP öğrenme): haber yönünde en iyi/en kötü % hareket
     entry = pos.get("entry_price") or 0.0
@@ -1287,8 +1347,8 @@ def close_position(pid: str, reason: str = "manuel", exchange_close: bool = True
         if pnl is not None:
             _daily["realized"] = round(_daily["realized"] + pnl, 2)
         _save_state()
-    log.info("%s KAPAT | %s %s | P&L=%s USDT | sebep=%s",
-             pos["mode"].upper(), pos["side"], pos["symbol"], pnl, reason)
+    log.info("%s KAPAT | %s %s | net P&L=%s USDT (brüt=%s, komisyon=%s) | sebep=%s",
+             pos["mode"].upper(), pos["side"], pos["symbol"], pnl, gross, fees, reason)
     return pos
 
 
@@ -1479,10 +1539,11 @@ def _partial_close(p: dict[str, Any], frac: float, reason: str, cur: float) -> d
         except Exception as e:
             log.warning("Kısmi kapatma hatası (%s): %s", p["symbol"], e)
             return None
-    pnl, pct = _pnl({**p, "usdt": close_usdt}, cur)
+    gross, gross_pct = _pnl({**p, "usdt": close_usdt}, cur)
+    pnl, pct, fees = _net_of_fees(p, gross, gross_pct, close_usdt)
     rec = dict(p)
     rec.update(usdt=close_usdt, amount=close_amt, closed_at=_now(), close_price=cur,
-               pnl=pnl, pnl_pct=pct, close_reason=reason)
+               pnl=pnl, pnl_pct=pct, gross_pnl=gross, fees_usdt=fees, close_reason=reason)
     p["usdt"] = round(p["usdt"] - close_usdt, 2)
     p["amount"] = round(p["amount"] - close_amt, 8)
     p["partial_done"] = True
@@ -2319,6 +2380,16 @@ def preflight() -> list[dict[str, Any]]:
     add("Drawdown kill-switch", "ok" if S.max_drawdown_pct > 0 else "warn",
         f"%{S.max_drawdown_pct:g} (sermaye tabanı {S.account_equity_usdt:g} USDT)"
         if S.max_drawdown_pct > 0 else "kapalı — tepe-dip düşüşte durdurma yok")
+    # İşlem maliyeti: 0 = defter komisyon-kör → tüm edge metrikleri (profit-factor,
+    # readiness, Kelly, Monte Carlo) sistematik iyimser okur
+    if S.taker_fee_pct > 0:
+        rt = S.taker_fee_pct * 2
+        add("İşlem maliyeti", "ok" if rt <= 0.5 else "warn",
+            f"tek bacak %{S.taker_fee_pct:g} → gidiş-dönüş %{rt:g} (P&L NET tutuluyor)")
+    else:
+        add("İşlem maliyeti", "critical" if live else "warn",
+            "komisyon %0 — defter BRÜT, kâr metrikleri gerçekte olduğundan iyi görünür")
+
     add("Pozisyon boyutlama", "info",
         f"yüzde-bazlı: işlem başı sermayenin %{S.risk_per_trade_pct:g} riski (sermaye {_account_equity():g} USDT)"
         if S.risk_per_trade_pct > 0 else f"sabit: {S.trade_usdt:g} USDT/işlem")
@@ -3136,6 +3207,8 @@ def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
         for k in _PERSIST_KEYS:
             if k in patch and patch[k] is not None and k not in ("paper_trading", "auto_trade"):
                 setattr(S, k, patch[k])
+        # Komisyon negatif olamaz (sahte kâr üretir); tek bacak %1 makul tavan
+        S.taker_fee_pct = max(0.0, min(1.0, float(S.taker_fee_pct)))
         if "paper_trading" in patch and patch["paper_trading"] is not None:
             S.paper_trading = bool(patch["paper_trading"])
         if "auto_trade" in patch and patch["auto_trade"] is not None:

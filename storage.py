@@ -9,11 +9,14 @@ arka plan thread'i ile API thread'leri aynı bağlantıyı paylaşır).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.environ.get("BOTPY_DB", "botpy.db")
 
@@ -179,8 +182,10 @@ CREATE TABLE IF NOT EXISTS news_closed_trades (
     usdt        REAL,
     entry_price REAL,
     close_price REAL,
-    pnl         REAL,
-    pnl_pct     REAL,
+    pnl         REAL,                  -- NET (komisyon düşülmüş)
+    pnl_pct     REAL,                  -- NET %
+    gross_pnl   REAL,                  -- komisyon öncesi brüt (şeffaflık)
+    fees_usdt   REAL,                  -- gidiş-dönüş komisyon (USDT)
     close_reason TEXT,
     source      TEXT,
     news_source TEXT,
@@ -264,9 +269,15 @@ CREATE INDEX IF NOT EXISTS idx_ops_kind_ts ON ops_events(kind, ts);
 
 _NCT_COLUMNS = (
     "trade_id", "closed_at", "opened_at", "symbol", "side", "mode", "usdt",
-    "entry_price", "close_price", "pnl", "pnl_pct", "close_reason",
-    "source", "news_source", "impact",
+    "entry_price", "close_price", "pnl", "pnl_pct", "gross_pnl", "fees_usdt",
+    "close_reason", "source", "news_source", "impact",
 )
+
+# Şema evrimi: mevcut DB'lere sonradan eklenen kolonlar. {tablo: [(kolon, sql_tip)]}
+# ALTER TABLE ADD COLUMN idempotent DEĞİL — _migrate PRAGMA ile var olanı atlar.
+_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "news_closed_trades": [("gross_pnl", "REAL"), ("fees_usdt", "REAL")],
+}
 
 _BACKTEST_COLUMNS = (
     "ts", "mode", "sl", "tp", "fee", "usdt", "hours", "min_impact",
@@ -308,7 +319,30 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Eski DB'lere sonradan eklenen kolonları aç (kilit ÇAĞIRANDA tutulur).
+
+        `CREATE TABLE IF NOT EXISTS` var olan tabloyu güncellemez; bu yüzden yeni
+        kolon eklendiğinde eski dosyalar onsuz kalır ve okuma tarafı sessizce None
+        görür. PRAGMA table_info ile mevcut kolonları öğrenip eksikleri ekler —
+        veri kaybı yok, tekrar çalıştırmak zararsız.
+        """
+        for table, columns in _MIGRATIONS.items():
+            try:
+                have = {r["name"] for r in
+                        self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            except sqlite3.Error:
+                continue          # tablo yok (eski/kısmi şema) — CREATE zaten kuracak
+            if not have:
+                continue
+            for col, coltype in columns:
+                if col in have:
+                    continue
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                log.info("DB migrasyon: %s.%s eklendi", table, col)
 
     def close(self) -> None:
         with self._lock:
@@ -846,6 +880,8 @@ class Store:
             "close_price": trade.get("close_price"),
             "pnl": trade.get("pnl"),
             "pnl_pct": trade.get("pnl_pct"),
+            "gross_pnl": trade.get("gross_pnl"),
+            "fees_usdt": trade.get("fees_usdt"),
             "close_reason": trade.get("close_reason"),
             "source": trade.get("source"),
             "news_source": trade.get("news_source"),

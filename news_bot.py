@@ -3242,6 +3242,7 @@ class SettingsPatch(BaseModel):
     exchange_native_stops: bool | None = None
     reconcile_autoclose: bool | None = None
     auto_halt_on_anomaly: bool | None = None
+    taker_fee_pct: float | None = None
     slippage_guard_pct: float | None = None
     min_orderbook_usd: float | None = None
     size_by_volume: bool | None = None

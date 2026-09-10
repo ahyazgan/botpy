@@ -267,6 +267,11 @@ class NewsItem:
             "atr_pct": self.atr_pct,
             "confirmed": self.confirmed,
             "price_note": self.price_note,
+            # Füzyon + clickbait bayrakları: arşiv (ablasyon girdisi) ve panel
+            # rozetleri (⚠ clickbait / ✓N kaynak) bunları buradan okur
+            "mismatch": self.mismatch,
+            "source_count": self.source_count,
+            "confirming_sources": self.confirming_sources,
         }
 
 

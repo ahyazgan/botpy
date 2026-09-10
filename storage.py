@@ -144,9 +144,18 @@ CREATE TABLE IF NOT EXISTS news_signals (
     symbol        TEXT,
     price_24h_pct REAL,
     price_15m_pct REAL,
+    price_60m_pct REAL,
     volume_usd    REAL,
-    confirmed     INTEGER,               -- 0/1
-    price_note    TEXT
+    -- ÜÇ DURUMLU: NULL = teyit hiç denenmedi (fiyat verisi yok / import), 0 = denendi
+    -- teyit olmadı, 1 = teyitli. 0/1'e düzleştirmek "denenmedi"yi "başarısız" sayıp
+    -- ablasyonda 'fiyat teyidi şart' sonucunu yapay olarak güçlendirir.
+    confirmed     INTEGER,
+    price_note    TEXT,
+    rel_volume    REAL,                  -- RVOL — ablasyon hacim kapısının girdisi
+    atr_pct       REAL,                  -- oynaklık — ATR tabanlı eşik/çıkış analizi
+    mismatch      INTEGER,               -- başlık↔gövde çelişkisi (clickbait)
+    source_count  INTEGER,               -- çapraz-kaynak teyidi (füzyon)
+    confirming_sources TEXT              -- JSON list
 );
 
 CREATE INDEX IF NOT EXISTS idx_signal_ts ON news_signals(ts);
@@ -277,6 +286,9 @@ _NCT_COLUMNS = (
 # ALTER TABLE ADD COLUMN idempotent DEĞİL — _migrate PRAGMA ile var olanı atlar.
 _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "news_closed_trades": [("gross_pnl", "REAL"), ("fees_usdt", "REAL")],
+    "news_signals": [("price_60m_pct", "REAL"), ("rel_volume", "REAL"),
+                     ("atr_pct", "REAL"), ("mismatch", "INTEGER"),
+                     ("source_count", "INTEGER"), ("confirming_sources", "TEXT")],
 }
 
 _BACKTEST_COLUMNS = (
@@ -299,7 +311,8 @@ _CLOSED_COLUMNS = (
 _SIGNAL_COLUMNS = (
     "id", "ts", "source", "title", "url", "published", "fetched_at", "coins",
     "impact", "direction", "reason", "scorer", "symbol", "price_24h_pct",
-    "price_15m_pct", "volume_usd", "confirmed", "price_note",
+    "price_15m_pct", "price_60m_pct", "volume_usd", "confirmed", "price_note",
+    "rel_volume", "atr_pct", "mismatch", "source_count", "confirming_sources",
 )
 _BRAIN_COLUMNS = (
     "ts", "news_id", "source", "title", "symbol", "side", "impact", "direction",
@@ -614,8 +627,17 @@ class Store:
             "symbol": item.get("symbol"),
             "price_24h_pct": item.get("price_24h_pct"),
             "price_15m_pct": item.get("price_15m_pct"),
+            "price_60m_pct": item.get("price_60m_pct"),
             "volume_usd": item.get("volume_usd"),
-            "confirmed": 1 if item.get("confirmed") else 0,
+            # Üç durumlu: fiyat verisi hiç alınamadıysa teyit DENENMEMİŞTİR (NULL)
+            "confirmed": (1 if item.get("confirmed") else 0)
+                         if item.get("price_24h_pct") is not None else None,
+            "rel_volume": item.get("rel_volume"),
+            "atr_pct": item.get("atr_pct"),
+            "mismatch": 1 if item.get("mismatch") else 0,
+            "source_count": int(item.get("source_count") or 1),
+            "confirming_sources": json.dumps(
+                item.get("confirming_sources") or [], ensure_ascii=False),
             "price_note": item.get("price_note", ""),
         }
         cols = ", ".join(_SIGNAL_COLUMNS)
@@ -634,7 +656,15 @@ class Store:
             d["coins"] = json.loads(d["coins"]) if d.get("coins") else []
         except (ValueError, TypeError):
             d["coins"] = []
-        d["confirmed"] = bool(d.get("confirmed"))
+        # None'ı KORU — "teyit denenmedi" ile "teyit başarısız" farklı şeyler
+        # (ablasyon `is not None` ile veri-var mı diye bakıyor)
+        d["confirmed"] = None if d.get("confirmed") is None else bool(d["confirmed"])
+        d["mismatch"] = bool(d.get("mismatch"))
+        try:
+            d["confirming_sources"] = (json.loads(d["confirming_sources"])
+                                       if d.get("confirming_sources") else [])
+        except (ValueError, TypeError):
+            d["confirming_sources"] = []
         return d
 
     def list_signals(

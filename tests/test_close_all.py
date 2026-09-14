@@ -16,9 +16,15 @@ def _pos(pid, symbol="FOOUSDT", entry=100.0, usdt=100.0):
             "amount": round(usdt / entry, 6), "leverage": 1}
 
 
+# Beklenen net: 2 pozisyon × 100 USDT × +%10 = +20 brüt; her biri gidiş-dönüş
+# %0.2 komisyon öder (100 × %0.1 × 2 bacak = 0.2) → 20 − 0.4 = 19.6 NET.
+_NET_TOTAL = 19.6
+
+
 @pytest.fixture()
 def env(monkeypatch):
     monkeypatch.setattr(trader, "_save_state", lambda: None)
+    monkeypatch.setattr(trader.S, "taker_fee_pct", 0.1)
     monkeypatch.setattr(trader, "get_price", lambda s: 110.0)   # +%10
     monkeypatch.setattr(trader, "_positions", [_pos("p1"), _pos("p2", "BARUSDT")])
     monkeypatch.setattr(trader, "_closed", [])
@@ -30,7 +36,8 @@ def test_close_all_closes_every_position(env):
     rep = trader.close_all()
     assert rep["count"] == 2 and rep["failed"] == 0
     assert {c["symbol"] for c in rep["closed"]} == {"FOOUSDT", "BARUSDT"}
-    assert rep["total_pnl"] == pytest.approx(20.0)   # her biri +10
+    assert rep["total_pnl"] == pytest.approx(_NET_TOTAL)   # NET (komisyon düşülmüş)
+    assert sum(c["gross_pnl"] for c in rep["closed"]) == pytest.approx(20.0)  # brüt şeffaf
     assert trader._positions == []                    # hepsi kapandı
 
 
@@ -63,7 +70,7 @@ def test_close_all_endpoint(env, monkeypatch, tmp_path):
     monkeypatch.setattr(nb, "notify_remote", lambda m: notes.append(m))
     c = TestClient(nb.app)
     rep = c.post("/positions/close-all").json()
-    assert rep["count"] == 2 and rep["total_pnl"] == pytest.approx(20.0)
+    assert rep["count"] == 2 and rep["total_pnl"] == pytest.approx(_NET_TOTAL)
     assert s.count_closed_news_trades() == 2          # arşive yazıldı
     assert notes and "TÜMÜ KAPATILDI" in notes[0]     # uzak bildirim
     s.close()

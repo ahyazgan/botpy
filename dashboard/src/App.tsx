@@ -39,6 +39,8 @@ type NewsItem = {
   scorer: string;
   mismatch?: boolean;
   source_count?: number;
+  contested?: number;
+  impact_pre_fusion?: number | null;
   confirming_sources?: string[];
   symbol: string | null;
   price_24h_pct: number | null;
@@ -129,7 +131,9 @@ type Settings = {
   partial_tp_levels: string;
   atr_sl_mult: number;
   atr_tp_mult: number;
+  taker_fee_pct: number;
   has_live_keys: boolean;
+  testnet: boolean;
   open_exposure_usdt: number;
   realized_today: number;
 };
@@ -377,7 +381,19 @@ type Health = {
   loops_stale?: string[];
 };
 
+// SSE `status` olayı — /health'in hafif, gerçek zamanlı alt kümesi
+type StreamStatus = {
+  trading_halted: boolean;
+  halt_reason: string;
+  ws_connected: boolean;
+  feed_stale: boolean;
+  alert_threshold: number;
+  total_seen: number;
+};
+
 type ClosedTrade = {
+  gross_pnl?: number | null;
+  fees_usdt?: number | null;
   closed_at: string | null;
   symbol: string;
   side: string;
@@ -611,6 +627,9 @@ export default function App() {
     typeof localStorage !== "undefined" && localStorage.getItem("notifyBrowser") === "1");
   const notifiedRef = useRef<Set<string>>(new Set());
   const notifyPrimedRef = useRef(false);
+  const alertThresholdRef = useRef(7);              // SSE işleyicisi güncel eşiği ref'ten okur (stale closure önleme)
+  const posIdsRef = useRef<string | null>(null);    // açılış/kapanış tespiti (P&L değişimi değil)
+  const [sseLive, setSseLive] = useState(false);    // SSE bağlı mı — footer rozeti
   const [expandedNews, setExpandedNews] = useState<string | null>(null);
   const [showTradeBar, setShowTradeBar] = useState(false);   // mobilde ayar çubuğu drawer'ı
   const [lightTheme, setLightTheme] = useState(() =>
@@ -669,6 +688,21 @@ export default function App() {
     }
   };
 
+  // Tarayıcı bildirimi: hem 15s polling hem SSE yolundan çağrılır (SSE ile ~2s'de düşer)
+  const maybeNotifyStrong = useCallback((items: NewsItem[], threshold: number) => {
+    if (!notifyPrimedRef.current) return;   // ilk yük tohumlanmadan bildirme (spam önleme)
+    const fresh = items.filter((n) => n.impact >= threshold && !notifiedRef.current.has(n.id));
+    fresh.forEach((n) => notifiedRef.current.add(n.id));
+    const enabled = localStorage.getItem("notifyBrowser") === "1";
+    if (fresh.length > 0 && enabled && "Notification" in window && Notification.permission === "granted") {
+      const top = fresh[0];
+      new Notification(`⚡ Güç ${top.impact}/10 · ${top.coins.join(", ") || "Genel"}`, {
+        body: top.title.slice(0, 140),
+      });
+      beep();
+    }
+  }, []);
+
   const load = useCallback(async () => {
     setErr(null);
     try {
@@ -701,24 +735,15 @@ export default function App() {
       const nData: NewsPayload = await nRes.json();
       setNews(nData.news);
       setMeta({ total_seen: nData.total_seen, alert_threshold: nData.alert_threshold, updated_at: nData.updated_at });
+      alertThresholdRef.current = nData.alert_threshold;
       // Tarayıcı bildirimi: panel açıkken gelen YENİ güçlü sinyalleri haber ver
-      {
-        const strong = nData.news.filter((n) => n.impact >= nData.alert_threshold);
-        if (!notifyPrimedRef.current) {
-          strong.forEach((n) => notifiedRef.current.add(n.id));   // ilk yük: tohumla, bildirme
-          notifyPrimedRef.current = true;
-        } else {
-          const fresh = strong.filter((n) => !notifiedRef.current.has(n.id));
-          fresh.forEach((n) => notifiedRef.current.add(n.id));
-          const enabled = localStorage.getItem("notifyBrowser") === "1";
-          if (fresh.length > 0 && enabled && "Notification" in window && Notification.permission === "granted") {
-            const top = fresh[0];
-            new Notification(`⚡ Güç ${top.impact}/10 · ${top.coins.join(", ") || "Genel"}`, {
-              body: top.title.slice(0, 140),
-            });
-            beep();
-          }
-        }
+      if (!notifyPrimedRef.current) {
+        // İlk yük: tohumla, bildirme (spam önleme)
+        nData.news.filter((n) => n.impact >= nData.alert_threshold)
+          .forEach((n) => notifiedRef.current.add(n.id));
+        notifyPrimedRef.current = true;
+      } else {
+        maybeNotifyStrong(nData.news, nData.alert_threshold);
       }
       if (nData.error) setErr(nData.error);
       if (sRes.ok) setSettings(await sRes.json());
@@ -756,7 +781,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [maybeNotifyStrong]);
 
   const clearHalt = async () => {
     try {
@@ -790,20 +815,54 @@ export default function App() {
     localStorage.setItem("theme", lightTheme ? "light" : "dark");
   }, [lightTheme]);
 
-  // Gerçek zamanlıya yakın haber akışı (SSE). 15s poll diğer verileri (pozisyon/
-  // ayar/performans) tazeler; haberler buradan ~2s'de gelir. EventSource oto-reconnect.
+  // Gerçek zamanlı akış (SSE): haber (adsız olay) + pozisyon/P&L (`positions`) +
+  // halt/akış-sağlığı (`status`) ~2s'de düşer; 15s poll analitik verileri tazeler
+  // ve SSE kopuksa yedek görevi görür. EventSource oto-reconnect.
   useEffect(() => {
     const es = new EventSource(`${API_BASE}/stream`);
+    es.onopen = () => setSseLive(true);
+    es.onerror = () => setSseLive(false);
     es.onmessage = (e) => {
       try {
         const item = JSON.parse(e.data) as NewsItem;
         setNews((prev) => (prev.some((n) => n.id === item.id) ? prev : [item, ...prev].slice(0, 200)));
+        maybeNotifyStrong([item], alertThresholdRef.current);
       } catch {
         /* bozuk olay — yoksay */
       }
     };
+    es.addEventListener("positions", (e) => {
+      try {
+        const d = JSON.parse((e as MessageEvent).data) as { positions: Position[]; total_pnl: number };
+        setPositions(d.positions);
+        setTotalPnl(d.total_pnl);
+        const ids = d.positions.map((p) => p.id).sort().join(",");
+        // Açılış/kapanış anında türev verileri (performans/işlem günlüğü/risk) hemen tazele;
+        // salt P&L oynaması (aynı id kümesi) load tetiklemez.
+        if (posIdsRef.current !== null && posIdsRef.current !== ids) void load();
+        posIdsRef.current = ids;
+      } catch {
+        /* bozuk olay — yoksay */
+      }
+    });
+    es.addEventListener("status", (e) => {
+      try {
+        const s = JSON.parse((e as MessageEvent).data) as StreamStatus;
+        alertThresholdRef.current = s.alert_threshold;
+        setMeta((prev) => ({ ...prev, total_seen: s.total_seen, alert_threshold: s.alert_threshold }));
+        setHealth((prev) => prev ? {
+          ...prev,
+          ws_connected: s.ws_connected,
+          feed_stale: s.feed_stale,
+          trading_halted: s.trading_halted,
+          halt_reason: s.halt_reason,
+        } : prev);
+      } catch {
+        /* bozuk olay — yoksay */
+      }
+    });
     return () => es.close();
-  }, []);
+  }, [load, maybeNotifyStrong]);
 
   const patchSettings = async (patch: Partial<Settings>) => {
     try {
@@ -1213,6 +1272,14 @@ export default function App() {
             >
               {live ? "🔴 CANLI (gerçek para)" : "🟢 PAPER (simülasyon)"}
             </button>
+            {settings.testnet && (
+              <span
+                className="rounded-lg border border-amber-500/40 bg-amber-950/40 px-2 py-1 text-xs font-bold text-amber-300"
+                title="BINANCE_TESTNET aktif — canlı modda emirler Binance DEMO borsasına gider (sahte para, gerçek emir akışı). Gerçek canlıya geçmeden env'den kaldır."
+              >
+                🧪 TESTNET
+              </span>
+            )}
             <button
               type="button"
               onClick={() => void patchSettings({ auto_trade: !settings.auto_trade })}
@@ -1495,6 +1562,7 @@ export default function App() {
               >
                 🔄 Hayalet pozisyon oto-kapat: {settings.reconcile_autoclose ? "AÇIK" : "kapalı (uyar)"}
               </button>
+              <NumField label="Komisyon % (tek bacak — P&L NET tutulur)" value={settings.taker_fee_pct} onSave={(v) => patchSettings({ taker_fee_pct: v })} />
               <NumField label="Slippage koruması % (0=kapalı)" value={settings.slippage_guard_pct} onSave={(v) => patchSettings({ slippage_guard_pct: v })} />
               <NumField label="Min. orderbook likidite USDT" value={settings.min_orderbook_usd} onSave={(v) => patchSettings({ min_orderbook_usd: v })} />
               <NumField label="Oto min. güç (1-10)" value={settings.auto_min_impact} onSave={(v) => patchSettings({ auto_min_impact: v })} />
@@ -1617,6 +1685,10 @@ export default function App() {
           {health && (
             <>
               <span className="text-zinc-700">|</span>
+              <span title="Gerçek zamanlı akış (SSE): haber/pozisyon/durum anlık push — kopuksa 15s polling devrede">
+                <span className={sseLive ? "text-emerald-400" : "text-zinc-500"}>●</span>{" "}
+                {sseLive ? "canlı akış" : "polling"}
+              </span>
               <span title="Motor sağlığı / uptime / puanlayıcı / kaynak">
                 <span className={health.ok ? "text-emerald-400" : "text-red-400"}>●</span>{" "}
                 {fmtUptime(health.uptime_sec)} · {health.scorer === "claude" ? "Claude" : "kural"}
@@ -1652,7 +1724,10 @@ export default function App() {
           <span className="flex items-center gap-1.5" title="Bağlantı durumu: yeşil = yapılandırılmış">
             <ConnDot ok={health?.scorer === "claude"} label="Claude" offLabel="kural" />
             <ConnDot ok={!!newsSettings?.remote_channels_available} label="Telegram/Discord" offLabel="uzak yok" />
-            <ConnDot ok={!!settings?.has_live_keys} label="Binance canlı" offLabel="paper" />
+            <ConnDot ok={!!settings?.has_live_keys} label={settings?.testnet ? "Binance testnet" : "Binance canlı"} offLabel="paper" />
+            {settings?.testnet && (
+              <span className="font-semibold text-amber-400" title="BINANCE_TESTNET aktif — emirler demo borsaya gider (sahte para)">🧪</span>
+            )}
           </span>
         </div>
 
@@ -1815,6 +1890,17 @@ export default function App() {
                         <span className="rounded-md border border-sky-600/40 bg-sky-950/40 px-1.5 py-0.5 font-semibold text-sky-300"
                           title={`Çok-kaynak teyidi: ${n.confirming_sources?.join(", ") ?? ""} aynı olayı bildirdi. İmpact artırıldı.`}>
                           ✓{n.source_count} kaynak
+                        </span>
+                      )}
+                      {!!n.contested && n.contested > 0 && (
+                        <span className="rounded-md border border-amber-600/40 bg-amber-950/40 px-1.5 py-0.5 font-semibold text-amber-300"
+                          title="Kaynaklar aynı olayda ANLAŞMIYOR (ters yönlü haber var). Çapraz-teyit bonusu verilmedi.">
+                          ⚔ {n.contested} çelişki
+                        </span>
+                      )}
+                      {n.impact_pre_fusion != null && n.impact_pre_fusion < n.impact && (
+                        <span className="text-zinc-500" title={`Ham güç ${n.impact_pre_fusion}, çapraz-kaynak teyidiyle ${n.impact}. Teyitsiz refleks giriş HAM skoru okur.`}>
+                          (ham {n.impact_pre_fusion})
                         </span>
                       )}
                       <span className="text-zinc-700">·</span>
@@ -3318,7 +3404,10 @@ export default function App() {
                         <td className="px-4 py-3 text-xs text-zinc-400">{t.close_reason ?? "—"}</td>
                         <td className="px-4 py-3 tabular-nums">
                           {t.pnl === null ? <span className="text-zinc-500">—</span> : (
-                            <span className={t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}>
+                            <span className={t.pnl >= 0 ? "text-emerald-400" : "text-red-400"}
+                              title={t.fees_usdt != null && t.gross_pnl != null
+                                ? `NET P&L. Brüt ${t.gross_pnl} USDT − komisyon ${t.fees_usdt} USDT (gidiş-dönüş)`
+                                : "NET P&L (komisyon düşülmüş)"}>
                               {t.pnl >= 0 ? "+" : ""}{t.pnl} USDT
                               {t.pnl_pct !== null && <span className="ml-1 text-xs opacity-70">({t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct}%)</span>}
                             </span>

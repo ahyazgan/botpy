@@ -170,6 +170,23 @@ geçer. Acele etme — sistem sana hazır olduğunu kendisi söyleyecek.
 > ⚠️ **Buraya ancak adım 6'da Durum kartı "UMUT VERİCİ" dedikten sonra gel.**
 > Önce simülasyonda kanıtlanmamış bir stratejiyle gerçek para riske atma.
 
+### 7.0 Ara adım: önce testnet'te dene (önerilir)
+
+Paper mod emirleri simüle eder; **testnet** ise emirleri Binance'in sahte-paralı
+DEMO borsasına gerçekten gönderir — gerçek emir akışı, orderbook ve slippage'ı
+sıfır riskle görürsün. Canlıya geçmeden önce iyi bir ara doğrulama katmanı:
+
+1. Testnet anahtarı al (canlıdan AYRI): spot için
+   [testnet.binance.vision](https://testnet.binance.vision), futures için
+   [testnet.binancefuture.com](https://testnet.binancefuture.com).
+2. `.env`'e ekle: `BINANCE_API_KEY`/`BINANCE_SECRET` (testnet anahtarları) +
+   `BINANCE_TESTNET=true`.
+3. Panelden `paper_trading`'i kapat — mod butonunun yanında **🧪 TESTNET** rozeti
+   görünmeli (footer'da da 🧪). `/preflight` "Binance testnet" uyarısıyla hatırlatır.
+4. Birkaç gün testnet'te emirlerin gerçekten açılıp SL/TP'nin tetiklendiğini izle.
+5. Gerçek canlıya geçerken: `BINANCE_TESTNET` satırını kaldır + anahtarları
+   GERÇEK canlı anahtarlarla değiştir (aşağıdaki adımlar).
+
 1. **Binance API anahtarı oluştur** (Binance → Hesap → API Yönetimi):
    - ⚠️ **"Para Çekme (Withdrawal)" iznini KAPALI bırak!** Sadece "Spot/Futures
      İşlem" izni yeterli. Anahtar çalınsa bile paran çekilemez.

@@ -145,6 +145,34 @@ def test_stream_diff_pure():
     assert nb._stream_diff([], set()) == []
 
 
+def test_sse_event_pure():
+    out = nb._sse_event("status", {"a": 1, "tr": "ığüş"})
+    assert out.startswith("event: status\ndata: ")
+    assert out.endswith("\n\n")
+    assert '"ığüş"' in out   # ensure_ascii=False — Türkçe karakter ham kalır
+
+
+def test_stream_status_shape(client, monkeypatch):
+    monkeypatch.setitem(nb._ws_state, "connected", True)
+    s = nb._stream_status()
+    assert set(s) == {"trading_halted", "halt_reason", "ws_connected",
+                      "feed_stale", "alert_threshold", "total_seen"}
+    assert s["ws_connected"] is True
+    assert isinstance(s["trading_halted"], bool)
+    assert isinstance(s["alert_threshold"], int)
+
+
+def test_stream_pushes_positions_and_status(client):
+    # İlk turda pozisyon + durum snapshot'ı koşulsuz gelmeli (istemci beklemeden başlar).
+    # cycles=1: tek tur sonrası kapanır — TestClient sonsuz SSE'yi kapatamaz (takılır).
+    r = client.get("/stream?cycles=1")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    buf = r.text
+    assert "event: positions" in buf and '"total_pnl"' in buf
+    assert "event: status" in buf and '"trading_halted"' in buf
+
+
 def test_ws_last_msg_age_pure(monkeypatch):
     monkeypatch.setitem(nb._ws_state, "last_msg_at", None)
     assert nb._ws_last_msg_age() is None

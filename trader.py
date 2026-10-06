@@ -18,6 +18,7 @@ bir API anahtarı oluşturmalıdır.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -138,14 +139,22 @@ class Settings:
     # Coin tercihleri (kullanıcı kontrolü — öğrenme değil, aşırı-uydurma riski yok)
     blocked_coins: str = ""          # virgülle ayrık: bu coinlerde ASLA oto-işlem açma (kara liste)
     watch_coins: str = ""            # virgülle ayrık: bu coinlerde uyarı eşiği düşürülür (favori/izleme)
-    # Delist senaryosu (opt-in): resmi Binance "Will Delist" duyurusunda short. Geçmiş veride
-    # (2023-2026, n=35) ölçülen tek anlamlı edge. Teyit/chase/RVOL/beyin atlanır (backtest
-    # bunlarsız yapıldı); çıkış kendi SL/TP/süresiyle, global trailing/breakeven/kısmi TP'siz.
-    # Short gerektirir → market=futures olmadan işlem açmaz.
+    # Olay senaryoları (opt-in, paper doğrulaması bekliyor): resmi Binance duyurusunda short.
+    # Teyit/chase/RVOL/beyin atlanır (backtest bunlarsız yapıldı); çıkış kendi SL/TP/süresiyle,
+    # global trailing/breakeven/kısmi TP'siz; çok coinli duyuruda bütçe coinlere bölünür.
+    # Short gerektirir → market=futures olmadan işlem açmaz. TP 0 = kâr-al yok.
+    # Delist (2023-2026, 17 dalga): spot fiyatta güçlü ama VADELİ fiyatla anlamlı DEĞİL —
+    # sıkışmalar dar SL'i patlatıyor; 20/30/1 gün vadelide en iyisi (anlamsız, +%4.8).
     delist_playbook: bool = False
-    delist_sl_pct: float = 8.0
-    delist_tp_pct: float = 20.0
-    delist_hold_min: int = 240
+    delist_sl_pct: float = 20.0
+    delist_tp_pct: float = 30.0
+    delist_hold_min: int = 1440
+    # Monitoring Tag eklenmesi (23 dalga): vadeli fiyatla, dalga-bazlı tek anlamlı ayar
+    # SL8/TP yok/7 gün (+%4.6 ±4.1); etki yıllar içinde zayıflıyor (2024 +5.2 → 2026 +0.6).
+    monitoring_playbook: bool = False
+    monitoring_sl_pct: float = 8.0
+    monitoring_tp_pct: float = 0.0
+    monitoring_hold_min: int = 10080
 
 
 S = Settings()
@@ -194,6 +203,7 @@ _PERSIST_KEYS = (
     "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
     "blocked_coins", "watch_coins",
     "delist_playbook", "delist_sl_pct", "delist_tp_pct", "delist_hold_min",
+    "monitoring_playbook", "monitoring_sl_pct", "monitoring_tp_pct", "monitoring_hold_min",
 )
 
 
@@ -1917,17 +1927,73 @@ _DELIST_RE = re.compile(r"\bWill Delist\b", re.I)
 _DELIST_EXCLUDE_RE = re.compile(r"\b(futures|margin|options|alpha|loans?|perpetual)\b", re.I)
 
 
-def is_delist_signal(item: Any) -> bool:
-    """Resmi Binance spot token delist duyurusu mu (delist senaryosunun tetikleyicisi). Saf.
+_MONITORING_ADD_RE = re.compile(r"monitoring tag.*\b(include|add)|\badd\w*\b.*monitoring tag", re.I)
+_PLAYBOOK_REASON = {"delist": "delist-senaryosu", "monitoring": "monitoring-senaryosu"}
+_BASKET_MAX = 8                       # tek duyuruda en fazla bu kadar coin'e bölünür
+_BASKET_SKIP = {"USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB"}
 
-    Geçmiş testteki kümeyle aynı tanım: kaynak Binance (poll ya da TreeNews 'Binance EN'),
-    başlıkta 'Will Delist', ürün-özel delist değil, yön bearish.
+
+def playbook_kind(item: Any) -> str | None:
+    """Resmi Binance olay duyurusu türü: 'delist' / 'monitoring' / None. Saf.
+
+    Geçmiş testteki kümelerle aynı tanım: kaynak Binance (poll ya da TreeNews 'Binance EN'),
+    yön bearish; delist = 'Will Delist' (ürün-özel delist değil), monitoring = Monitoring
+    Tag EKLENMESİ (kaldırılması değil).
     """
+    if ("binance" not in (getattr(item, "source", "") or "").lower()
+            or getattr(item, "direction", "") != "bearish"):
+        return None
     title = getattr(item, "title", "") or ""
-    return ("binance" in (getattr(item, "source", "") or "").lower()
-            and getattr(item, "direction", "") == "bearish"
-            and bool(_DELIST_RE.search(title))
-            and not _DELIST_EXCLUDE_RE.search(title))
+    if _DELIST_RE.search(title) and not _DELIST_EXCLUDE_RE.search(title):
+        return "delist"
+    if _MONITORING_ADD_RE.search(title):
+        return "monitoring"
+    return None
+
+
+def is_delist_signal(item: Any) -> bool:
+    """Resmi Binance spot token delist duyurusu mu (delist senaryosunun tetikleyicisi). Saf."""
+    return playbook_kind(item) == "delist"
+
+
+def _playbook_enabled(kind: str | None) -> bool:
+    return (kind == "delist" and S.delist_playbook) or (kind == "monitoring" and S.monitoring_playbook)
+
+
+def basket_items(item: Any) -> list[Any]:
+    """Senaryo duyurusu çok coin içeriyorsa coin başına kopya (bütçe bölünmüş); yoksa [item].
+
+    Aynı duyurudaki coinler birlikte hareket eder → tek bahis: toplam boyut tek işlemle
+    aynı kalır, coinlere `basket_frac` ile bölünür. Vadelide parite listesi biliniyorsa
+    listede olmayanlar baştan elenir (bütçe onlara harcanmasın).
+    """
+    if not _playbook_enabled(playbook_kind(item)):
+        return [item]
+    coins: list[str] = []
+    for c in getattr(item, "coins", None) or []:
+        cu = str(c).upper().replace("/", "").strip()
+        cu = cu[:-4] if cu.endswith("USDT") else cu
+        if cu and cu not in _BASKET_SKIP and cu not in coins:
+            coins.append(cu)
+    symbols = [f"{c}USDT" for c in coins]
+    if S.market == "futures":
+        fut = _futures_symbols()
+        if fut is not None:
+            symbols = [s for s in symbols if s in fut]
+    symbols = symbols[:_BASKET_MAX]
+    if len(symbols) <= 1:
+        if symbols and symbols[0] != getattr(item, "symbol", None):
+            sub = copy.copy(item)
+            sub.symbol = symbols[0]
+            return [sub]
+        return [item]
+    out = []
+    for sym in symbols:
+        sub = copy.copy(item)
+        sub.symbol = sym
+        sub.basket_frac = 1.0 / len(symbols)
+        out.append(sub)
+    return out
 
 
 def auto_decision(item: Any, *, feed_stale: bool = False,
@@ -1974,9 +2040,10 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # giriş kapısını açmasına izin verilirse sistemin en agresif yolu taklit edilmesi
     # en kolay sinyalle tetiklenir. Bonus yine eşik/boyut tarafında geçerli.
     tier1 = S.tier1_skip_confirm_impact > 0 and _raw_impact(item) >= S.tier1_skip_confirm_impact
-    # Delist senaryosu: resmi duyuruda hareket anında başlar → teyit/chase/RVOL beklenmez
-    # (geçmiş edge bu kapılar OLMADAN ölçüldü). Güç eşiği, kara liste, limitler geçerli.
-    playbook = S.delist_playbook and is_delist_signal(item)
+    # Olay senaryosu (delist/monitoring): resmi duyuruda teyit/chase/RVOL beklenmez (geçmiş
+    # edge bu kapılar OLMADAN ölçüldü). Güç eşiği, kara liste, limitler geçerli.
+    pb_kind = playbook_kind(item)
+    playbook = _playbook_enabled(pb_kind)
     if S.auto_require_confirm and not tier1 and not playbook and not getattr(item, "confirmed", False):
         return no("fiyat teyidi yok")
     symbol = getattr(item, "symbol", None)
@@ -2060,7 +2127,10 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     if S.portfolio_risk and price_series:
         heat_info = _portfolio_heat(symbol, side, price_series)
         usdt *= heat_info["factor"]
-    reason = "delist-senaryosu" if playbook else ("tier1-refleks" if tier1 else "uygun")
+    # Sepet: çok coinli senaryo duyurusunda toplam boyut coinlere bölünür (tek bahis)
+    usdt *= float(getattr(item, "basket_frac", 1.0) or 1.0)
+    reason = (_PLAYBOOK_REASON[pb_kind] if playbook and pb_kind
+              else ("tier1-refleks" if tier1 else "uygun"))
     out = {"would_trade": True, "reason": reason,
            "side": side, "usdt": round(usdt, 2), "news_source": news_source}
     if heat_info is not None:
@@ -2183,8 +2253,14 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
     hold_min: int | None = None
     # Giriş beyni: mekanik kapıları geçen Tier-2 (refleks olmayan) adayda son yargı.
     # enter=False → veto; conviction → boyut; sl_tightness/hold_minutes → çıkış. Refleks atlanır.
-    playbook = d["reason"] == "delist-senaryosu"
-    if brain is not None and S.use_entry_brain and d["reason"] not in ("tier1-refleks", "delist-senaryosu"):
+    pb_kind = next((k for k, r in _PLAYBOOK_REASON.items() if r == d["reason"]), None)
+    pb_exit = None
+    if pb_kind == "delist":
+        pb_exit = (S.delist_sl_pct, S.delist_tp_pct, S.delist_hold_min)
+    elif pb_kind == "monitoring":
+        pb_exit = (S.monitoring_sl_pct, S.monitoring_tp_pct, S.monitoring_hold_min)
+    if (brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks"
+            and pb_kind is None):
         verdict = _consult_brain(brain, item, d)
         if verdict is not None:
             if not verdict.get("enter", True):
@@ -2219,11 +2295,11 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                           reason=getattr(item, "reason", ""),
                           atr_pct=getattr(item, "atr_pct", None),
                           sl_mult=sl_mult,
-                          time_stop_min=S.delist_hold_min if playbook else hold_min,
+                          time_stop_min=pb_exit[2] if pb_exit else hold_min,
                           rel_volume=getattr(item, "rel_volume", None),
-                          sl_pct_override=S.delist_sl_pct if playbook else None,
-                          tp_pct_override=S.delist_tp_pct if playbook else None,
-                          playbook="delist" if playbook else "")
+                          sl_pct_override=pb_exit[0] if pb_exit else None,
+                          tp_pct_override=pb_exit[1] if pb_exit else None,
+                          playbook=pb_kind or "")
     except OrderError as e:
         log.warning("Oto-işlem emri başarısız (%s): %s", item.symbol, e)
         _note_order_result(False)   # üst üste hata → devre kesici

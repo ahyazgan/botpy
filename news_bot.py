@@ -195,8 +195,9 @@ RSS_FEEDS: dict[str, str] = {
 # Binance yeni listeleme duyuruları (catalogId=48) — en yüksek etkili sinyal
 BINANCE_ANN_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query"
 BINANCE_ANN_BASE = "https://www.binance.com/en/support/announcement/"
-# 48 = yeni listeleme, 161 = delisting (geçmiş veride tek anlamlı edge: delist → short)
-BINANCE_ANN_CATALOGS = (48, 161)
+# 48 = yeni listeleme, 161 = delisting, 49 = "Latest News" (Monitoring Tag duyuruları burada).
+# Not: bu CMS ucu ~120 sn önbellekli; asıl hızlı kaynak TreeNews 'Binance EN' — bu yedek.
+BINANCE_ANN_CATALOGS = (48, 161, 49)
 
 # TreeNews WebSocket — GERÇEK ZAMANLI haber (borsa duyuruları + Twitter + haber siteleri).
 # Ücretsiz, auth gerekmez. RSS'in 20sn gecikmesi yerine saniyeler içinde haber.
@@ -582,9 +583,12 @@ def detect_coins(text: str) -> list[str]:
 _BINANCE_PAREN = re.compile(r"\(([A-Z0-9]{2,10})\)")
 _BINANCE_PAIR = re.compile(r"\b([A-Z0-9]{2,10})(?:USDT|USDC|USD|FDUSD|BTC|TRY|AED)\b")
 _BINANCE_STOP = {"USD", "USDT", "USDC", "FDUSD", "TRY", "AED", "BTC", "ETH", "SPOT"}
-# Çoklu delist: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20" (parantezsiz liste)
+# Parantezsiz ticker listeleri: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20",
+# "... Extend the Monitoring Tag to Include AVA, GNS, SCR & TOWNS on 2026-09-04"
 _BINANCE_DELIST_LIST = re.compile(
-    r"\bDelist\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
+    r"\b(?:Delist|Include)\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
+# Monitoring Tag EKLENMESİ (kaldırılması değil) — geçmişte short yönlü edge (bkz. trader.playbook_kind)
+_BINANCE_MONITORING_ADD = re.compile(r"monitoring tag.*\b(include|add)|\badd\w*\b.*monitoring tag", re.I)
 
 
 def extract_binance_tickers(title: str) -> list[str]:
@@ -600,6 +604,11 @@ def extract_binance_tickers(title: str) -> list[str]:
             if m and m not in _BINANCE_STOP:
                 found.append(m)
     return list(dict.fromkeys(found))
+
+
+def _is_binance_official(source: str) -> bool:
+    """Resmi Binance duyurusu mu: CMS poll ('Binance') veya TreeNews ('⚡Binance EN' vb.)."""
+    return (source or "").lstrip("⚡").strip().lower().startswith("binance")
 
 
 def score_item(item: NewsItem) -> None:
@@ -619,17 +628,21 @@ def score_item(item: NewsItem) -> None:
                 best_dir = direction
 
     # Binance yeni listeleme duyurusu = otomatik güçlü olumlu sinyal
-    if item.source == "Binance":
+    if _is_binance_official(item.source):
         tickers = extract_binance_tickers(text)
         if tickers:
             item.coins = list(dict.fromkeys(item.coins + tickers))
-        if re.search(r"\b(list|launch|add)\w*", text, re.I):
+        if _BINANCE_MONITORING_ADD.search(text):
+            best_impact = max(best_impact, 8)
+            best_dir = "bearish"
+            reasons.append("Binance monitoring tag")
+        elif re.search(r"\b(list|launch|add)\w*", text, re.I):
             best_impact = max(best_impact, 8)
             best_dir = "bullish"
             reasons.append("Binance listeleme")
 
     # Belirli bir coin yoksa ve haber jenerikse etkiyi biraz düşür
-    if not item.coins and best_impact > 0 and item.source != "Binance":
+    if not item.coins and best_impact > 0 and not _is_binance_official(item.source):
         best_impact = max(1, best_impact - 2)
 
     item.impact = best_impact
@@ -1854,9 +1867,13 @@ def process_items(
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
             _log_shadow_decision(it)    # A/B: aday ayar bu sinyalde ne karar verirdi (sanal)
-            _t_order = time.monotonic()
-            pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
-            if pos:
+            # Senaryo duyurusu çok coin içerebilir (delist/monitoring dalgası) → bölünmüş sepet;
+            # diğer haberlerde tek eleman (it'nin kendisi).
+            for sub in trader.basket_items(it):
+                _t_order = time.monotonic()
+                pos = trader.maybe_auto_trade(sub, **_trade_context(sub), brain=_brain_for_trade)
+                if not pos:
+                    continue
                 # Gecikme: karar→emir + uçtan uca alım→emir (manşet aksiyon gecikmesi)
                 _now_mono = time.monotonic()
                 latency.record("order", (_now_mono - _t_order) * 1000.0)
@@ -3413,6 +3430,10 @@ class SettingsPatch(BaseModel):
     delist_sl_pct: float | None = None
     delist_tp_pct: float | None = None
     delist_hold_min: int | None = None
+    monitoring_playbook: bool | None = None
+    monitoring_sl_pct: float | None = None
+    monitoring_tp_pct: float | None = None
+    monitoring_hold_min: int | None = None
 
 
 @app.get("/settings")

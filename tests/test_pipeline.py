@@ -246,3 +246,18 @@ def test_ingest_sla_ignores_rss_and_priming(pipeline):
     assert latency.summary()["ingest"]["count"] == 1      # yalnız canlı TreeNews
     assert latency.source_summary()["rss"]["count"] == 1  # RSS kırılımda görünür
     latency.reset()
+
+
+def test_basket_opens_each_sub_item(coin_pipeline, monkeypatch):
+    scores, _, _, _, _ = coin_pipeline
+    traded: list[str] = []
+
+    def basket(it):
+        a, b = NewsItem(**{**it.__dict__}), NewsItem(**{**it.__dict__})
+        a.symbol, b.symbol = "AAAUSDT", "BBBUSDT"
+        return [a, b]
+    monkeypatch.setattr(nb.trader, "basket_items", basket)
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it, **kw: (traded.append(it.symbol), None)[1])
+    scores["a"] = 9
+    nb.process_items(None, [_item("a")], allow_notify=True)
+    assert traded == ["AAAUSDT", "BBBUSDT"]

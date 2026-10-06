@@ -24,3 +24,20 @@ def test_multi_delist_scores_bearish_with_coins():
     nb.score_item(it)
     assert it.direction == "bearish" and it.impact >= 8
     assert it.coins[:2] == ["ANT", "MULTI"]
+
+
+@pytest.mark.parametrize("source", ["Binance", "⚡Binance EN"])
+def test_monitoring_tag_scored_bearish_with_coins(source):
+    it = nb.NewsItem(id="x", source=source,
+                     title="Binance Will Extend the Monitoring Tag to Include AVA, GNS, SCR & TOWNS on 2026-09-04",
+                     url="", published="2026-09-04T08:00:00+00:00", fetched_at="2026-09-04T08:00:00+00:00")
+    nb.score_item(it)
+    assert it.direction == "bearish" and it.impact >= 8
+    assert {"AVA", "GNS", "SCR", "TOWNS"} <= set(it.coins)
+
+
+def test_treenews_binance_delist_gets_coins():
+    it = nb.NewsItem(id="x", source="⚡Binance EN", title="Binance Will Delist ICX, SCRT, STORJ on 2026-09-03",
+                     url="", published="2026-08-27T08:00:00+00:00", fetched_at="2026-08-27T08:00:00+00:00")
+    nb.score_item(it)
+    assert it.direction == "bearish" and it.coins[:3] == ["ICX", "SCRT", "STORJ"]

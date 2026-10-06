@@ -48,6 +48,9 @@ def gates(monkeypatch):
         "size_by_volume": False, "risk_parity": False, "reduce_after_losses": 0,
         "derisk_on_drawdown": False, "portfolio_risk": False, "risk_per_trade_pct": 0.0,
         "blocked_coins": "", "delist_playbook": True,
+        "delist_sl_pct": 8.0, "delist_tp_pct": 20.0, "delist_hold_min": 240,
+        "monitoring_playbook": True, "monitoring_sl_pct": 8.0, "monitoring_tp_pct": 0.0,
+        "monitoring_hold_min": 10080,
     }.items():
         monkeypatch.setattr(trader.S, k, v)
 
@@ -125,3 +128,57 @@ def test_futures_gate_blocks_unlisted_symbol(gates, monkeypatch):
     assert trader.auto_decision(_Item())["reason"] == "vadeli piyasada parite yok"
     monkeypatch.setattr(trader, "_futures_symbols", lambda: {"ANTUSDT"})
     assert trader.auto_decision(_Item())["would_trade"] is True
+
+
+# ── Monitoring Tag senaryosu + çok coinli sepet ──────────────────────────────
+_MON = "Binance Will Extend the Monitoring Tag to Include AVA, GNS, SCR & TOWNS on 2026-09-04"
+
+
+@pytest.mark.parametrize("title,expected", [
+    (_MON, "monitoring"),
+    ("Binance Will Add the Monitoring Tag to FOO (FOO)", "monitoring"),
+    ("Binance Will Remove the Monitoring Tag for FOO", None),      # kaldırma ≠ ekleme
+    ("Binance Will Delist ANT, MULTI on 2024-02-20", "delist"),
+])
+def test_playbook_kind(title, expected):
+    assert trader.playbook_kind(_Item(title=title)) == expected
+
+
+def test_monitoring_decision_and_exits(book):
+    it = _Item(title=_MON, symbol="AVAUSDT")
+    it.coins = ["AVA"]
+    d = trader.auto_decision(it)
+    assert d["reason"] == "monitoring-senaryosu" and d["side"] == "short"
+    pos = trader.maybe_auto_trade(it)
+    assert pos["playbook"] == "monitoring"
+    assert pos["sl_price"] == pytest.approx(108.0) and pos["tp_price"] is None   # TP 0 = yok
+    assert pos["time_stop_min"] == 10080
+
+
+def test_monitoring_off_falls_back_to_normal_gates(gates, monkeypatch):
+    monkeypatch.setattr(trader.S, "monitoring_playbook", False)
+    assert trader.auto_decision(_Item(title=_MON))["reason"] == "fiyat teyidi yok"
+
+
+def test_basket_splits_budget_across_coins(book, monkeypatch):
+    it = _Item(title=_MON, symbol="AVAUSDT")
+    it.coins = ["AVA", "GNS", "SCR", "TOWNS", "USDT"]
+    subs = trader.basket_items(it)
+    assert [s.symbol for s in subs] == ["AVAUSDT", "GNSUSDT", "SCRUSDT", "TOWNSUSDT"]
+    assert all(s.basket_frac == pytest.approx(0.25) for s in subs)
+    assert trader.auto_decision(subs[0])["usdt"] == pytest.approx(25.0)   # 100 / 4
+    assert it.symbol == "AVAUSDT" and not hasattr(it, "basket_frac")       # orijinal değişmez
+
+
+def test_basket_filters_unlisted_futures(book, monkeypatch):
+    monkeypatch.setattr(trader, "_futures_symbols", lambda: {"GNSUSDT", "TOWNSUSDT"})
+    it = _Item(title=_MON, symbol="AVAUSDT")
+    it.coins = ["AVA", "GNS", "SCR", "TOWNS"]
+    assert [s.symbol for s in trader.basket_items(it)] == ["GNSUSDT", "TOWNSUSDT"]
+
+
+def test_basket_passthrough_when_not_playbook(book, monkeypatch):
+    monkeypatch.setattr(trader.S, "monitoring_playbook", False)
+    it = _Item(title=_MON)
+    it.coins = ["AVA", "GNS"]
+    assert trader.basket_items(it) == [it]

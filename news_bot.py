@@ -607,8 +607,9 @@ def extract_binance_tickers(title: str) -> list[str]:
 
 
 def _is_binance_official(source: str) -> bool:
-    """Resmi Binance duyurusu mu: CMS poll ('Binance') veya TreeNews ('⚡Binance EN' vb.)."""
-    return (source or "").lstrip("⚡").strip().lower().startswith("binance")
+    """Resmi Binance duyurusu mu: CMS poll ('Binance') veya TreeNews ('⚡Binance EN' vb.).
+    Baştaki harf-dışı önek (⚡, kodlama bozulmuş '?') yok sayılır."""
+    return re.sub(r"^[^A-Za-z]+", "", source or "").lower().startswith("binance")
 
 
 def score_item(item: NewsItem) -> None:

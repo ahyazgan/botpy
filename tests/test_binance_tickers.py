@@ -26,7 +26,7 @@ def test_multi_delist_scores_bearish_with_coins():
     assert it.coins[:2] == ["ANT", "MULTI"]
 
 
-@pytest.mark.parametrize("source", ["Binance", "⚡Binance EN"])
+@pytest.mark.parametrize("source", ["Binance", "⚡Binance EN", "?Binance EN"])
 def test_monitoring_tag_scored_bearish_with_coins(source):
     it = nb.NewsItem(id="x", source=source,
                      title="Binance Will Extend the Monitoring Tag to Include AVA, GNS, SCR & TOWNS on 2026-09-04",

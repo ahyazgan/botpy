@@ -18,6 +18,7 @@ bir API anahtarı oluşturmalıdır.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -138,6 +139,22 @@ class Settings:
     # Coin tercihleri (kullanıcı kontrolü — öğrenme değil, aşırı-uydurma riski yok)
     blocked_coins: str = ""          # virgülle ayrık: bu coinlerde ASLA oto-işlem açma (kara liste)
     watch_coins: str = ""            # virgülle ayrık: bu coinlerde uyarı eşiği düşürülür (favori/izleme)
+    # Olay senaryoları (opt-in, paper doğrulaması bekliyor): resmi Binance duyurusunda short.
+    # Teyit/chase/RVOL/beyin atlanır (backtest bunlarsız yapıldı); çıkış kendi SL/TP/süresiyle,
+    # global trailing/breakeven/kısmi TP'siz; çok coinli duyuruda bütçe coinlere bölünür.
+    # Short gerektirir → market=futures olmadan işlem açmaz. TP 0 = kâr-al yok.
+    # Delist (2023-2026, 17 dalga): spot fiyatta güçlü ama VADELİ fiyatla anlamlı DEĞİL —
+    # sıkışmalar dar SL'i patlatıyor; 20/30/1 gün vadelide en iyisi (anlamsız, +%4.8).
+    delist_playbook: bool = False
+    delist_sl_pct: float = 20.0
+    delist_tp_pct: float = 30.0
+    delist_hold_min: int = 1440
+    # Monitoring Tag eklenmesi (23 dalga): vadeli fiyatla, dalga-bazlı tek anlamlı ayar
+    # SL8/TP yok/7 gün (+%4.6 ±4.1); etki yıllar içinde zayıflıyor (2024 +5.2 → 2026 +0.6).
+    monitoring_playbook: bool = False
+    monitoring_sl_pct: float = 8.0
+    monitoring_tp_pct: float = 0.0
+    monitoring_hold_min: int = 10080
 
 
 S = Settings()
@@ -185,6 +202,8 @@ _PERSIST_KEYS = (
     "suppress_losing_sources", "min_source_samples", "skip_already_priced_pct",
     "max_funding_rate_pct", "auto_tune", "use_learned_vetoes", "regime_adapt",
     "blocked_coins", "watch_coins",
+    "delist_playbook", "delist_sl_pct", "delist_tp_pct", "delist_hold_min",
+    "monitoring_playbook", "monitoring_sl_pct", "monitoring_tp_pct", "monitoring_hold_min",
 )
 
 
@@ -385,6 +404,30 @@ def get_funding_rate(symbol: str) -> float | None:
         return float(data["lastFundingRate"]) * 100 if data else None
     except (KeyError, TypeError, ValueError):
         return None
+
+
+_FUTURES_TTL = 3600.0
+_futures_cache: dict[str, Any] = {"ts": 0.0, "symbols": None}
+
+
+def _futures_symbols() -> set[str] | None:
+    """Binance USDⓈ-M'de İŞLEMDE olan semboller (1 saat önbellek). Alınamazsa None.
+
+    Paper futures fiyatı spot'tan okur → vadelide olmayan coine 'short' açılabilirdi
+    (gerçekte imkânsız, paper sonucu şişer). Bu liste o kapıyı besler.
+    """
+    now = time.time()
+    if _futures_cache["symbols"] is not None and now - _futures_cache["ts"] < _FUTURES_TTL:
+        return set(_futures_cache["symbols"])
+    data = get_json(f"{BINANCE_FAPI}/exchangeInfo", timeout=15)
+    if not isinstance(data, dict):
+        return None
+    try:
+        syms = {s["symbol"] for s in data["symbols"] if s.get("status") == "TRADING"}
+    except (KeyError, TypeError):
+        return None
+    _futures_cache.update(ts=now, symbols=syms)
+    return set(syms)
 
 
 def _premium_index(symbol: str) -> dict[str, float] | None:
@@ -1124,7 +1167,10 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
                 news_source: str = "", impact: int | None = None,
                 atr_pct: float | None = None, sl_mult: float = 1.0,
                 time_stop_min: int | None = None,
-                rel_volume: float | None = None) -> dict[str, Any]:
+                rel_volume: float | None = None,
+                sl_pct_override: float | None = None,
+                tp_pct_override: float | None = None,
+                playbook: str = "") -> dict[str, Any]:
     side = side.lower()
     is_long = side in ("long", "buy")
     if S.market == "spot" and not is_long:
@@ -1198,6 +1244,11 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
     # Giriş beyni çıkış önerisi: SL sıkılığı (tight/normal/wide → sl_mult)
     if sl_mult != 1.0 and sl_pct > 0:
         sl_pct = max(0.5, min(15.0, sl_pct * sl_mult))
+    # Senaryo (playbook) kendi çıkışını getirir: global/ATR/beyin SL-TP'sini geçersiz kılar
+    if sl_pct_override is not None:
+        sl_pct = float(sl_pct_override)
+    if tp_pct_override is not None:
+        tp_pct = float(tp_pct_override)
     # Tasfiye-farkında SL (futures): SL tasfiye fiyatının ötesindeyse önce tasfiye olunur,
     # SL hiç çalışmaz. Kaldıraç-ima tasfiye mesafesinin (~100/kaldıraç%) güvenli içine kıstır.
     if S.market == "futures" and S.leverage > 1 and sl_pct > 0:
@@ -1233,7 +1284,9 @@ def place_trade(symbol: str, side: str, usdt: float | None = None,
         "leverage": S.leverage if S.market == "futures" else 1,
         "sl_price": sl_price,
         "tp_price": tp_price,
-        "trailing_pct": S.trailing_stop_pct,
+        "trailing_pct": 0.0 if playbook else S.trailing_stop_pct,
+        # Senaryo pozisyonu: global trailing/breakeven/kısmi TP UYGULANMAZ (test edilen çıkış)
+        "playbook": playbook or None,
         "high_water": price,
         "peak": price, "trough": price,   # MFE/MAE izleme (segment SL/TP öğrenme)
         "opened_at": _now(),
@@ -1514,6 +1567,8 @@ def _effective_trailing_pct(p: dict[str, Any]) -> float:
     Oynak coinde (ATR yüksek) trailing geniş → trend tutulur; sakin coinde dar → erken
     kilitlenir. ATR yoksa sabit yüzdeye düşülür (eksik veri ceza değil).
     """
+    if p.get("playbook"):   # senaryo pozisyonu kendi çıkışını kullanır
+        return 0.0
     if S.use_atr_trailing:
         atr = p.get("atr_pct")
         if atr and atr > 0:
@@ -1605,7 +1660,8 @@ def monitor_positions() -> list[dict[str, Any]]:
                     changed = True
 
         # 2) Breakeven: +X% kârda SL'i girişe çek (kârı koru)
-        if S.breakeven_pct > 0 and not p.get("breakeven_done") and gain >= S.breakeven_pct:
+        if (S.breakeven_pct > 0 and not p.get("playbook") and not p.get("breakeven_done")
+                and gain >= S.breakeven_pct):
             be = round(entry, 8)
             if (is_long and (p.get("sl_price") is None or be > p["sl_price"])) or \
                (not is_long and (p.get("sl_price") is None or be < p["sl_price"])):
@@ -1619,7 +1675,7 @@ def monitor_positions() -> list[dict[str, Any]]:
 
         # 3) Kısmi TP (scale-out): çok-kademeli — her eşik ayrı tetiklenir (bir kez).
         #    partial_levels_done = tetiklenmiş eşiklerin listesi (restart'a dayanıklı).
-        levels = _tp_levels()
+        levels = [] if p.get("playbook") else _tp_levels()
         if levels:
             done = p.get("partial_levels_done") or []
             for pct, frac in levels:
@@ -1866,6 +1922,80 @@ def _raw_impact(item: Any) -> int:
     return int(raw) if raw is not None else int(getattr(item, "impact", 0) or 0)
 
 
+_DELIST_RE = re.compile(r"\bWill Delist\b", re.I)
+# Ürün-özel delist (vadeli/marjin/opsiyon/Alpha/kredi) spot token delist'i DEĞİLDİR
+_DELIST_EXCLUDE_RE = re.compile(r"\b(futures|margin|options|alpha|loans?|perpetual)\b", re.I)
+
+
+_MONITORING_ADD_RE = re.compile(r"monitoring tag.*\b(include|add)|\badd\w*\b.*monitoring tag", re.I)
+_PLAYBOOK_REASON = {"delist": "delist-senaryosu", "monitoring": "monitoring-senaryosu"}
+_BASKET_MAX = 8                       # tek duyuruda en fazla bu kadar coin'e bölünür
+_BASKET_SKIP = {"USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB"}
+
+
+def playbook_kind(item: Any) -> str | None:
+    """Resmi Binance olay duyurusu türü: 'delist' / 'monitoring' / None. Saf.
+
+    Geçmiş testteki kümelerle aynı tanım: kaynak Binance (poll ya da TreeNews 'Binance EN'),
+    yön bearish; delist = 'Will Delist' (ürün-özel delist değil), monitoring = Monitoring
+    Tag EKLENMESİ (kaldırılması değil).
+    """
+    if ("binance" not in (getattr(item, "source", "") or "").lower()
+            or getattr(item, "direction", "") != "bearish"):
+        return None
+    title = getattr(item, "title", "") or ""
+    if _DELIST_RE.search(title) and not _DELIST_EXCLUDE_RE.search(title):
+        return "delist"
+    if _MONITORING_ADD_RE.search(title):
+        return "monitoring"
+    return None
+
+
+def is_delist_signal(item: Any) -> bool:
+    """Resmi Binance spot token delist duyurusu mu (delist senaryosunun tetikleyicisi). Saf."""
+    return playbook_kind(item) == "delist"
+
+
+def _playbook_enabled(kind: str | None) -> bool:
+    return (kind == "delist" and S.delist_playbook) or (kind == "monitoring" and S.monitoring_playbook)
+
+
+def basket_items(item: Any) -> list[Any]:
+    """Senaryo duyurusu çok coin içeriyorsa coin başına kopya (bütçe bölünmüş); yoksa [item].
+
+    Aynı duyurudaki coinler birlikte hareket eder → tek bahis: toplam boyut tek işlemle
+    aynı kalır, coinlere `basket_frac` ile bölünür. Vadelide parite listesi biliniyorsa
+    listede olmayanlar baştan elenir (bütçe onlara harcanmasın).
+    """
+    if not _playbook_enabled(playbook_kind(item)):
+        return [item]
+    coins: list[str] = []
+    for c in getattr(item, "coins", None) or []:
+        cu = str(c).upper().replace("/", "").strip()
+        cu = cu[:-4] if cu.endswith("USDT") else cu
+        if cu and cu not in _BASKET_SKIP and cu not in coins:
+            coins.append(cu)
+    symbols = [f"{c}USDT" for c in coins]
+    if S.market == "futures":
+        fut = _futures_symbols()
+        if fut is not None:
+            symbols = [s for s in symbols if s in fut]
+    symbols = symbols[:_BASKET_MAX]
+    if len(symbols) <= 1:
+        if symbols and symbols[0] != getattr(item, "symbol", None):
+            sub = copy.copy(item)
+            sub.symbol = symbols[0]
+            return [sub]
+        return [item]
+    out = []
+    for sym in symbols:
+        sub = copy.copy(item)
+        sub.symbol = sym
+        sub.basket_frac = 1.0 / len(symbols)
+        out.append(sub)
+    return out
+
+
 def auto_decision(item: Any, *, feed_stale: bool = False,
                   news_age_sec: float | None = None,
                   latency_slow: bool = False,
@@ -1910,7 +2040,11 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # giriş kapısını açmasına izin verilirse sistemin en agresif yolu taklit edilmesi
     # en kolay sinyalle tetiklenir. Bonus yine eşik/boyut tarafında geçerli.
     tier1 = S.tier1_skip_confirm_impact > 0 and _raw_impact(item) >= S.tier1_skip_confirm_impact
-    if S.auto_require_confirm and not tier1 and not getattr(item, "confirmed", False):
+    # Olay senaryosu (delist/monitoring): resmi duyuruda teyit/chase/RVOL beklenmez (geçmiş
+    # edge bu kapılar OLMADAN ölçüldü). Güç eşiği, kara liste, limitler geçerli.
+    pb_kind = playbook_kind(item)
+    playbook = _playbook_enabled(pb_kind)
+    if S.auto_require_confirm and not tier1 and not playbook and not getattr(item, "confirmed", False):
         return no("fiyat teyidi yok")
     symbol = getattr(item, "symbol", None)
     if not symbol:
@@ -1923,12 +2057,16 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         return no("yön nötr")
     if S.market == "spot" and side == "short":
         return no("spot'ta short yok")
+    if S.market == "futures":
+        fut = _futures_symbols()   # liste alınamazsa engelleme (diğer veri kapıları gibi)
+        if fut is not None and symbol not in fut:
+            return no("vadeli piyasada parite yok")
     if not _can_auto_trade(symbol):
         return no("cooldown / limit / zaten açık pozisyon")
     # Korelasyon kapısı: aynı yönde çok pozisyon = tek bahis (BTC-korele küme riski)
     if S.max_same_direction > 0 and _open_side_count(side) >= S.max_same_direction:
         return no(f"aynı yönde pozisyon limiti ({S.max_same_direction})")
-    if S.skip_already_priced_pct > 0:
+    if S.skip_already_priced_pct > 0 and not playbook:
         m = getattr(item, "price_24h_pct", None)
         if m is not None and ((side == "long" and m >= S.skip_already_priced_pct)
                               or (side == "short" and m <= -S.skip_already_priced_pct)):
@@ -1936,7 +2074,7 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     # RVOL kapısı: hacim hareketi onaylamıyorsa haber muhtemelen fake → girme.
     # (Veri yoksa engelleme — eksik veri ≠ düşük hacim.) Eşik impact-ölçekli olabilir:
     # yüksek-güç haber daha çok hacim bekler (büyük haber piyasayı oransal hareketlendirir).
-    if S.min_rel_volume > 0:
+    if S.min_rel_volume > 0 and not playbook:
         rv = getattr(item, "rel_volume", None)
         req = _required_rvol(int(item.impact))
         if rv is not None and rv < req:
@@ -1989,7 +2127,11 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
     if S.portfolio_risk and price_series:
         heat_info = _portfolio_heat(symbol, side, price_series)
         usdt *= heat_info["factor"]
-    out = {"would_trade": True, "reason": "tier1-refleks" if tier1 else "uygun",
+    # Sepet: çok coinli senaryo duyurusunda toplam boyut coinlere bölünür (tek bahis)
+    usdt *= float(getattr(item, "basket_frac", 1.0) or 1.0)
+    reason = (_PLAYBOOK_REASON[pb_kind] if playbook and pb_kind
+              else ("tier1-refleks" if tier1 else "uygun"))
+    out = {"would_trade": True, "reason": reason,
            "side": side, "usdt": round(usdt, 2), "news_source": news_source}
     if heat_info is not None:
         out["portfolio_heat"] = heat_info
@@ -2111,7 +2253,14 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
     hold_min: int | None = None
     # Giriş beyni: mekanik kapıları geçen Tier-2 (refleks olmayan) adayda son yargı.
     # enter=False → veto; conviction → boyut; sl_tightness/hold_minutes → çıkış. Refleks atlanır.
-    if brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks":
+    pb_kind = next((k for k, r in _PLAYBOOK_REASON.items() if r == d["reason"]), None)
+    pb_exit = None
+    if pb_kind == "delist":
+        pb_exit = (S.delist_sl_pct, S.delist_tp_pct, S.delist_hold_min)
+    elif pb_kind == "monitoring":
+        pb_exit = (S.monitoring_sl_pct, S.monitoring_tp_pct, S.monitoring_hold_min)
+    if (brain is not None and S.use_entry_brain and d["reason"] != "tier1-refleks"
+            and pb_kind is None):
         verdict = _consult_brain(brain, item, d)
         if verdict is not None:
             if not verdict.get("enter", True):
@@ -2145,8 +2294,12 @@ def maybe_auto_trade(item: Any, *, feed_stale: bool = False,
                           news_source=d["news_source"], impact=int(item.impact),
                           reason=getattr(item, "reason", ""),
                           atr_pct=getattr(item, "atr_pct", None),
-                          sl_mult=sl_mult, time_stop_min=hold_min,
-                          rel_volume=getattr(item, "rel_volume", None))
+                          sl_mult=sl_mult,
+                          time_stop_min=pb_exit[2] if pb_exit else hold_min,
+                          rel_volume=getattr(item, "rel_volume", None),
+                          sl_pct_override=pb_exit[0] if pb_exit else None,
+                          tp_pct_override=pb_exit[1] if pb_exit else None,
+                          playbook=pb_kind or "")
     except OrderError as e:
         log.warning("Oto-işlem emri başarısız (%s): %s", item.symbol, e)
         _note_order_result(False)   # üst üste hata → devre kesici

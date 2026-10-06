@@ -102,6 +102,9 @@ MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsı
 # Arşiv eşiği uyarı eşiğinden AYRI: bildirim gürültüsü artmadan eşik-altı (ör. 5-6) yönlü
 # sinyaller de backtest/alpha verisi olarak birikir. Uyarı eşiğinden yüksekse etkisiz.
 ARCHIVE_MIN_IMPACT = int(os.environ.get("ARCHIVE_MIN_IMPACT", "5"))
+# RSS medya için Claude ön-filtresi (maliyet): yalnız kural-adayı RSS haberleri Claude'a.
+# Geçmiş veride medya haberleri iki puanlayıcıyla da edge üretmedi. "0" ile kapatılır.
+CLAUDE_RSS_PREFILTER = os.environ.get("CLAUDE_RSS_PREFILTER", "1") != "0"
 ARCHIVE_PRUNE_EVERY = 200   # her N yeni sinyalde bir eski kayıtları buda
 MAX_NEWS_AGE_HOURS = 24     # bundan eski haberler feed'den düşer
 REQUEST_TIMEOUT   = 15
@@ -192,6 +195,9 @@ RSS_FEEDS: dict[str, str] = {
 # Binance yeni listeleme duyuruları (catalogId=48) — en yüksek etkili sinyal
 BINANCE_ANN_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query"
 BINANCE_ANN_BASE = "https://www.binance.com/en/support/announcement/"
+# 48 = yeni listeleme, 161 = delisting, 49 = "Latest News" (Monitoring Tag duyuruları burada).
+# Not: bu CMS ucu ~120 sn önbellekli; asıl hızlı kaynak TreeNews 'Binance EN' — bu yedek.
+BINANCE_ANN_CATALOGS = (48, 161, 49)
 
 # TreeNews WebSocket — GERÇEK ZAMANLI haber (borsa duyuruları + Twitter + haber siteleri).
 # Ücretsiz, auth gerekmez. RSS'in 20sn gecikmesi yerine saniyeler içinde haber.
@@ -422,14 +428,16 @@ def fetch_rss(name: str, url: str) -> list[NewsItem]:
 
 def fetch_binance_announcements(session: requests.Session) -> list[NewsItem]:
     items: list[NewsItem] = []
-    r = session.get(
-        BINANCE_ANN_URL,
-        params={"catalogId": 48, "pageNo": 1, "pageSize": 20},
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    r.raise_for_status()
-    articles = (r.json().get("data") or {}).get("articles") or []
+    articles: list[dict[str, Any]] = []
+    for catalog in BINANCE_ANN_CATALOGS:
+        r = session.get(
+            BINANCE_ANN_URL,
+            params={"catalogId": catalog, "pageNo": 1, "pageSize": 20},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        articles += (r.json().get("data") or {}).get("articles") or []
     for a in articles:
         title = (a.get("title") or "").strip()
         code = a.get("code") or ""
@@ -575,9 +583,12 @@ def detect_coins(text: str) -> list[str]:
 _BINANCE_PAREN = re.compile(r"\(([A-Z0-9]{2,10})\)")
 _BINANCE_PAIR = re.compile(r"\b([A-Z0-9]{2,10})(?:USDT|USDC|USD|FDUSD|BTC|TRY|AED)\b")
 _BINANCE_STOP = {"USD", "USDT", "USDC", "FDUSD", "TRY", "AED", "BTC", "ETH", "SPOT"}
-# Çoklu delist: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20" (parantezsiz liste)
+# Parantezsiz ticker listeleri: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20",
+# "... Extend the Monitoring Tag to Include AVA, GNS, SCR & TOWNS on 2026-09-04"
 _BINANCE_DELIST_LIST = re.compile(
-    r"\bDelist\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
+    r"\b(?:Delist|Include)\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
+# Monitoring Tag EKLENMESİ (kaldırılması değil) — geçmişte short yönlü edge (bkz. trader.playbook_kind)
+_BINANCE_MONITORING_ADD = re.compile(r"monitoring tag.*\b(include|add)|\badd\w*\b.*monitoring tag", re.I)
 
 
 def extract_binance_tickers(title: str) -> list[str]:
@@ -593,6 +604,12 @@ def extract_binance_tickers(title: str) -> list[str]:
             if m and m not in _BINANCE_STOP:
                 found.append(m)
     return list(dict.fromkeys(found))
+
+
+def _is_binance_official(source: str) -> bool:
+    """Resmi Binance duyurusu mu: CMS poll ('Binance') veya TreeNews ('⚡Binance EN' vb.).
+    Baştaki harf-dışı önek (⚡, kodlama bozulmuş '?') yok sayılır."""
+    return re.sub(r"^[^A-Za-z]+", "", source or "").lower().startswith("binance")
 
 
 def score_item(item: NewsItem) -> None:
@@ -612,17 +629,21 @@ def score_item(item: NewsItem) -> None:
                 best_dir = direction
 
     # Binance yeni listeleme duyurusu = otomatik güçlü olumlu sinyal
-    if item.source == "Binance":
+    if _is_binance_official(item.source):
         tickers = extract_binance_tickers(text)
         if tickers:
             item.coins = list(dict.fromkeys(item.coins + tickers))
-        if re.search(r"\b(list|launch|add)\w*", text, re.I):
+        if _BINANCE_MONITORING_ADD.search(text):
+            best_impact = max(best_impact, 8)
+            best_dir = "bearish"
+            reasons.append("Binance monitoring tag")
+        elif re.search(r"\b(list|launch|add)\w*", text, re.I):
             best_impact = max(best_impact, 8)
             best_dir = "bullish"
             reasons.append("Binance listeleme")
 
     # Belirli bir coin yoksa ve haber jenerikse etkiyi biraz düşür
-    if not item.coins and best_impact > 0 and item.source != "Binance":
+    if not item.coins and best_impact > 0 and not _is_binance_official(item.source):
         best_impact = max(1, best_impact - 2)
 
     item.impact = best_impact
@@ -1783,11 +1804,17 @@ def process_items(
     if not new_items:
         return 0, 0
 
-    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı
+    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı.
+    # SLA'yı besleyen "ingest" aşamasına yalnız GERÇEK-ZAMANLI kaynaklar ve canlı tarama
+    # girer: RSS beslemeleri saatlerce eski haber taşır, açılış tohumlaması da eski
+    # haberleri bir kerede görür → p95 ~saatlere çıkıp latency guard'ı (halt_trade_on_latency)
+    # sürekli kapalı tutuyordu. RSS gecikmesi kaynak kırılımında görünür kalır.
     for it in new_items:
         ms = _ingest_ms(it)
-        latency.record("ingest", ms)
-        latency.record_source(_source_bucket(it), ms)
+        bucket = _source_bucket(it)
+        latency.record_source(bucket, ms)
+        if allow_notify and bucket != "rss":
+            latency.record("ingest", ms)
 
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]
@@ -1814,10 +1841,11 @@ def process_items(
                 notified.add(it.id)
 
     # Faz 2 — Claude ile rafine et (nihai skor); hata olursa kural skoru geçerli kalır
-    if USE_CLAUDE:
+    to_score = [it for it in new_items if _claude_worthy(it, threshold)] if USE_CLAUDE else []
+    if to_score:
         _t_score = time.monotonic()
         try:
-            score_with_claude(new_items)
+            score_with_claude(to_score)
             latency.record("score", (time.monotonic() - _t_score) * 1000.0)
         except Exception as e:
             log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
@@ -1840,9 +1868,13 @@ def process_items(
             if it.id not in notified:   # erken bildirilenleri tekrar bildirme
                 notify(it)
             _log_shadow_decision(it)    # A/B: aday ayar bu sinyalde ne karar verirdi (sanal)
-            _t_order = time.monotonic()
-            pos = trader.maybe_auto_trade(it, **_trade_context(it), brain=_brain_for_trade)
-            if pos:
+            # Senaryo duyurusu çok coin içerebilir (delist/monitoring dalgası) → bölünmüş sepet;
+            # diğer haberlerde tek eleman (it'nin kendisi).
+            for sub in trader.basket_items(it):
+                _t_order = time.monotonic()
+                pos = trader.maybe_auto_trade(sub, **_trade_context(sub), brain=_brain_for_trade)
+                if not pos:
+                    continue
                 # Gecikme: karar→emir + uçtan uca alım→emir (manşet aksiyon gecikmesi)
                 _now_mono = time.monotonic()
                 latency.record("order", (_now_mono - _t_order) * 1000.0)
@@ -1865,6 +1897,22 @@ def process_items(
                     _archive_signal(it)
 
     return len(new_items), len(alerts)
+
+
+def _claude_worthy(it: NewsItem, threshold: int) -> bool:
+    """Bu haber Claude puanlamasına gitmeli mi (maliyet ön-filtresi). Saf.
+
+    RSS medya haberleri geçmiş veride (2023-2025, 1643 örnek) ne kural ne Claude
+    puanlamasıyla edge üretti → RSS'ten yalnız kural-adayı (arşive/uyarıya girebilecek)
+    olanlar Claude'a gider. TreeNews/Binance (gerçek-zamanlı, resmi) her zaman gider.
+    """
+    if not CLAUDE_RSS_PREFILTER or _source_bucket(it) != "rss":
+        return True
+    if it.impact >= _alert_threshold_for(it, threshold):
+        return True   # kural uyarı verecekse Claude rafine etsin (şişirilmiş kural skoru)
+    return (it.impact >= ARCHIVE_MIN_IMPACT
+            and it.direction in ("bullish", "bearish")
+            and any(c not in _NOT_TRADEABLE for c in it.coins))
 
 
 def _archive_only(items: list[NewsItem], alerts: list[NewsItem]) -> list[NewsItem]:
@@ -3377,6 +3425,16 @@ class SettingsPatch(BaseModel):
     auto_tune: bool | None = None
     use_learned_vetoes: bool | None = None
     regime_adapt: bool | None = None
+    blocked_coins: str | None = None
+    watch_coins: str | None = None
+    delist_playbook: bool | None = None
+    delist_sl_pct: float | None = None
+    delist_tp_pct: float | None = None
+    delist_hold_min: int | None = None
+    monitoring_playbook: bool | None = None
+    monitoring_sl_pct: float | None = None
+    monitoring_tp_pct: float | None = None
+    monitoring_hold_min: int | None = None
 
 
 @app.get("/settings")

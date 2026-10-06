@@ -99,6 +99,9 @@ SCAN_STALL_SEC = float(os.environ.get("SCAN_STALL_SEC", "120"))         # arka p
 ALERT_THRESHOLD   = 7       # bu güç (1-10) ve üstü = bildirim at
 MAX_NEWS_KEEP     = 300     # bellekte tutulacak haber sayısı
 MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsız büyümeyi önler)
+# Arşiv eşiği uyarı eşiğinden AYRI: bildirim gürültüsü artmadan eşik-altı (ör. 5-6) yönlü
+# sinyaller de backtest/alpha verisi olarak birikir. Uyarı eşiğinden yüksekse etkisiz.
+ARCHIVE_MIN_IMPACT = int(os.environ.get("ARCHIVE_MIN_IMPACT", "5"))
 ARCHIVE_PRUNE_EVERY = 200   # her N yeni sinyalde bir eski kayıtları buda
 MAX_NEWS_AGE_HOURS = 24     # bundan eski haberler feed'den düşer
 REQUEST_TIMEOUT   = 15
@@ -572,6 +575,9 @@ def detect_coins(text: str) -> list[str]:
 _BINANCE_PAREN = re.compile(r"\(([A-Z0-9]{2,10})\)")
 _BINANCE_PAIR = re.compile(r"\b([A-Z0-9]{2,10})(?:USDT|USDC|USD|FDUSD|BTC|TRY|AED)\b")
 _BINANCE_STOP = {"USD", "USDT", "USDC", "FDUSD", "TRY", "AED", "BTC", "ETH", "SPOT"}
+# Çoklu delist: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20" (parantezsiz liste)
+_BINANCE_DELIST_LIST = re.compile(
+    r"\bDelist\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
 
 
 def extract_binance_tickers(title: str) -> list[str]:
@@ -582,6 +588,10 @@ def extract_binance_tickers(title: str) -> list[str]:
     for m in _BINANCE_PAIR.findall(title):
         if m not in _BINANCE_STOP:
             found.append(m)
+    for grp in _BINANCE_DELIST_LIST.findall(title):
+        for m in re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", grp):
+            if m and m not in _BINANCE_STOP:
+                found.append(m)
     return list(dict.fromkeys(found))
 
 
@@ -1845,7 +1855,31 @@ def process_items(
                     notify_remote(f"⚠️ DİKKAT: {pos['symbol']} borsa koruyucu stop KONULAMADI "
                                   f"— pozisyon yalnız bot çalışırken korumalı. Sebep: {pos['protect_error']}")
 
+        # Eşik-altı yönlü sinyaller: yalnız arşiv (bildirim/işlem YOK). Teyit para yolundan
+        # SONRA → işlem gecikmesine eklenmez; aynı fiyat bağlamı → arşiv satırları türdeş.
+        extra = _archive_only(new_items, alerts)
+        if extra:
+            _confirm_alerts(session, extra)
+            for it in extra:
+                if it.symbol:   # USDT paritesi yoksa backtest edilemez → arşivleme
+                    _archive_signal(it)
+
     return len(new_items), len(alerts)
+
+
+def _archive_only(items: list[NewsItem], alerts: list[NewsItem]) -> list[NewsItem]:
+    """Uyarı eşiğinin altında kalan ama arşive değer sinyaller. Saf.
+
+    impact ≥ ARCHIVE_MIN_IMPACT + yönlü (nötr değil) + işlem yapılabilir coin içeren.
+    """
+    alert_ids = {it.id for it in alerts}
+    return [
+        it for it in items
+        if it.id not in alert_ids
+        and it.impact >= ARCHIVE_MIN_IMPACT
+        and it.direction in ("bullish", "bearish")
+        and any(c not in _NOT_TRADEABLE for c in it.coins)
+    ]
 
 
 _archive_count = 0
@@ -2274,7 +2308,7 @@ def _acquire_singleton_lock() -> bool:
             msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
         else:
             import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
     except OSError:
         return False   # kilit başkası tarafından tutuluyor
     except Exception as e:

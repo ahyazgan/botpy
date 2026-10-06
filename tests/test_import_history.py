@@ -114,3 +114,15 @@ def test_min_impact_filter(store):
     res = import_rows(rows, store=store, min_impact=9)
     assert res["imported"] == 0
     assert res["skipped"]["below_min_impact"] == 1
+
+
+def test_import_applies_live_noise_filter(store):
+    rows = [
+        {"title": "Binance Futures Will Launch USDⓈ-Margined FOOUSDT Perpetual Contract",
+         "time": "2026-06-01T00:00:00Z", "source": "Binance"},
+        {"title": "Binance Margin Will Delist the JASMY/BTC Cross Margin Pair",
+         "time": "2026-06-02T00:00:00Z", "source": "Binance"},
+    ]
+    res = import_rows(rows, store=store)
+    assert res["imported"] == 0
+    assert res["skipped"]["noise"] == 2      # canlı bot bunları hiç görmez

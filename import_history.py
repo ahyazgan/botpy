@@ -105,17 +105,22 @@ def import_rows(rows: list[dict[str, Any]], *, default_source: str = "imported",
     """Ham satırları puanlayıp arşive yaz. Sayımlarla özet döndürür.
 
     Yalnız işlem-yapılabilir (symbol + bullish/bearish + impact≥min_impact) sinyaller
-    arşivlenir — backtest/alpha bunları kullanır. Diğerleri sebebiyle sayılır.
+    arşivlenir — backtest/alpha bunları kullanır. Diğerleri sebebiyle sayılır. Canlıdaki
+    gürültü filtresi (`_is_noise`: Binance perpetual/margin/earn...) burada da uygulanır —
+    canlı botun hiç görmeyeceği duyurular geçmiş backtest'i kirletmesin.
     `store` verilmezse `news_bot.get_store()` (kalıcı BOTPY_DB).
     """
     st = store if store is not None else nb.get_store()
-    imported = dupe = no_field = no_symbol = neutral = low_impact = 0
+    imported = dupe = no_field = no_symbol = neutral = low_impact = noise = 0
     for raw in rows:
         norm = normalize_row(raw)
         if norm is None:
             no_field += 1
             continue
         item = build_signal(norm, default_source)
+        if nb._is_noise(item):
+            noise += 1
+            continue
         if not item.symbol:
             no_symbol += 1
             continue
@@ -132,7 +137,7 @@ def import_rows(rows: list[dict[str, Any]], *, default_source: str = "imported",
     return {"imported": imported, "total": len(rows), "skipped": {
         "duplicate": dupe, "missing_title_or_time": no_field,
         "no_tradeable_symbol": no_symbol, "neutral_direction": neutral,
-        "below_min_impact": low_impact}}
+        "below_min_impact": low_impact, "noise": noise}}
 
 
 def load_file(path: str) -> list[dict[str, Any]]:

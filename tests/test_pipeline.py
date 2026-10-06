@@ -158,3 +158,50 @@ def test_two_phase_claude_failure_keeps_rule(pipeline, monkeypatch):
 
     n_new, n_alert = nb.process_items(None, [_item("a")], allow_notify=True)
     assert n_alert == 1                # Claude patladı → kural skoru geçerli
+
+
+# ── Arşiv eşiği uyarı eşiğinden ayrı: eşik-altı yönlü sinyaller yalnız arşive ──
+@pytest.fixture()
+def coin_pipeline(pipeline, monkeypatch):
+    scores, store = pipeline
+    dirs: dict[str, str] = {}
+    notified: list[str] = []
+    traded: list[str] = []
+
+    def fake_score(it):
+        it.impact = scores.get(it.id, 3)
+        it.direction = dirs.get(it.id, "bullish")
+        it.coins = ["FOO"]
+
+    def fake_confirm(session, it):
+        it.symbol = "FOOUSDT"
+
+    monkeypatch.setattr(nb, "score_item", fake_score)
+    monkeypatch.setattr(nb, "confirm_with_price", fake_confirm)
+    monkeypatch.setattr(nb, "notify", lambda it: notified.append(it.id))
+    monkeypatch.setattr(nb.trader, "maybe_auto_trade", lambda it, **kw: (traded.append(it.id), None)[1])
+    monkeypatch.setattr(nb, "ARCHIVE_MIN_IMPACT", 5)
+    return scores, dirs, store, notified, traded
+
+
+def test_below_alert_archived_without_notify_or_trade(coin_pipeline):
+    scores, _, store, notified, traded = coin_pipeline
+    scores.update({"a": 8, "b": 6, "c": 4})
+    assert nb.process_items(None, [_item("a"), _item("b"), _item("c")], allow_notify=True) == (3, 1)
+    ids = {s["id"] for s in store.list_signals(10)}
+    assert ids == {"a", "b"}                    # b eşik-altı ama arşivde; c ARCHIVE_MIN altı
+    assert notified == ["a"] and traded == ["a"]   # b bildirilmez/işlem açmaz
+
+
+def test_below_alert_skips_neutral_untradeable_and_priming(coin_pipeline, monkeypatch):
+    scores, dirs, store, _, _ = coin_pipeline
+    scores.update({"n": 6, "p": 6})
+    dirs["n"] = "neutral"
+    nb.process_items(None, [_item("n")], allow_notify=True)
+    nb.process_items(None, [_item("p")], allow_notify=False)   # tohumlama → arşiv yok
+    assert store.signal_span()["count"] == 0
+    # USDT paritesi bulunamadı (symbol yok) → backtest edilemez, arşivlenmez
+    monkeypatch.setattr(nb, "confirm_with_price", lambda session, it: None)
+    scores["x"] = 6
+    nb.process_items(None, [_item("x")], allow_notify=True)
+    assert store.signal_span()["count"] == 0

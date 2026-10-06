@@ -15,3 +15,14 @@ import tempfile
 _tmp_dir = tempfile.mkdtemp(prefix="botpy_test_")
 os.environ["BOTPY_DB"] = os.path.join(_tmp_dir, "botpy_test.db")
 os.environ["BOTPY_STATE"] = os.path.join(_tmp_dir, "trade_state_test.json")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_futures_listing_network(monkeypatch):
+    """Vadeli sembol listesi ağdan çekilmesin: varsayılan 'bilinmiyor' (kapı engellemez).
+    Kapıyı test eden testler kendi listesini monkeypatch'ler."""
+    import trader
+    monkeypatch.setattr(trader, "_futures_symbols", lambda: None)

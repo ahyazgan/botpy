@@ -396,6 +396,30 @@ def get_funding_rate(symbol: str) -> float | None:
         return None
 
 
+_FUTURES_TTL = 3600.0
+_futures_cache: dict[str, Any] = {"ts": 0.0, "symbols": None}
+
+
+def _futures_symbols() -> set[str] | None:
+    """Binance USDⓈ-M'de İŞLEMDE olan semboller (1 saat önbellek). Alınamazsa None.
+
+    Paper futures fiyatı spot'tan okur → vadelide olmayan coine 'short' açılabilirdi
+    (gerçekte imkânsız, paper sonucu şişer). Bu liste o kapıyı besler.
+    """
+    now = time.time()
+    if _futures_cache["symbols"] is not None and now - _futures_cache["ts"] < _FUTURES_TTL:
+        return set(_futures_cache["symbols"])
+    data = get_json(f"{BINANCE_FAPI}/exchangeInfo", timeout=15)
+    if not isinstance(data, dict):
+        return None
+    try:
+        syms = {s["symbol"] for s in data["symbols"] if s.get("status") == "TRADING"}
+    except (KeyError, TypeError):
+        return None
+    _futures_cache.update(ts=now, symbols=syms)
+    return set(syms)
+
+
 def _premium_index(symbol: str) -> dict[str, float] | None:
     """Binance futures premiumIndex: funding% + perpetual premium% (mark vs index). Auth'suz.
 
@@ -1966,6 +1990,10 @@ def auto_decision(item: Any, *, feed_stale: bool = False,
         return no("yön nötr")
     if S.market == "spot" and side == "short":
         return no("spot'ta short yok")
+    if S.market == "futures":
+        fut = _futures_symbols()   # liste alınamazsa engelleme (diğer veri kapıları gibi)
+        if fut is not None and symbol not in fut:
+            return no("vadeli piyasada parite yok")
     if not _can_auto_trade(symbol):
         return no("cooldown / limit / zaten açık pozisyon")
     # Korelasyon kapısı: aynı yönde çok pozisyon = tek bahis (BTC-korele küme riski)

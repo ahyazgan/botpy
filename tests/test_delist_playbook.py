@@ -118,3 +118,10 @@ def test_normal_position_still_gets_global_exits(book, monkeypatch):
     pos = trader.place_trade("FOOUSDT", "long")
     assert pos["playbook"] is None
     assert pos["sl_price"] == pytest.approx(97.0) and pos["tp_price"] == pytest.approx(106.0)
+
+
+def test_futures_gate_blocks_unlisted_symbol(gates, monkeypatch):
+    monkeypatch.setattr(trader, "_futures_symbols", lambda: {"BTCUSDT"})
+    assert trader.auto_decision(_Item())["reason"] == "vadeli piyasada parite yok"
+    monkeypatch.setattr(trader, "_futures_symbols", lambda: {"ANTUSDT"})
+    assert trader.auto_decision(_Item())["would_trade"] is True

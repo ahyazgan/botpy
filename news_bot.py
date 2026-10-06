@@ -575,6 +575,9 @@ def detect_coins(text: str) -> list[str]:
 _BINANCE_PAREN = re.compile(r"\(([A-Z0-9]{2,10})\)")
 _BINANCE_PAIR = re.compile(r"\b([A-Z0-9]{2,10})(?:USDT|USDC|USD|FDUSD|BTC|TRY|AED)\b")
 _BINANCE_STOP = {"USD", "USDT", "USDC", "FDUSD", "TRY", "AED", "BTC", "ETH", "SPOT"}
+# Çoklu delist: "Binance Will Delist ANT, MULTI, VAI, XMR on 2024-02-20" (parantezsiz liste)
+_BINANCE_DELIST_LIST = re.compile(
+    r"\bDelist\s+((?:[A-Z0-9]{2,10}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,10})\b")
 
 
 def extract_binance_tickers(title: str) -> list[str]:
@@ -585,6 +588,10 @@ def extract_binance_tickers(title: str) -> list[str]:
     for m in _BINANCE_PAIR.findall(title):
         if m not in _BINANCE_STOP:
             found.append(m)
+    for grp in _BINANCE_DELIST_LIST.findall(title):
+        for m in re.split(r"\s*,\s*|\s+and\s+|\s*&\s*", grp):
+            if m and m not in _BINANCE_STOP:
+                found.append(m)
     return list(dict.fromkeys(found))
 
 

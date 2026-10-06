@@ -231,3 +231,18 @@ def test_claude_prefilter_off_sends_all(coin_pipeline, monkeypatch):
     scores["weak"] = 3
     nb.process_items(None, [_item("weak", source="CoinDesk")], allow_notify=True)
     assert sent == ["weak"]
+
+
+# ── Gecikme SLA'sı: yalnız gerçek-zamanlı kaynak + canlı tarama "ingest"e girer ──
+def test_ingest_sla_ignores_rss_and_priming(pipeline):
+    import latency
+    latency.reset()
+    old = "2026-06-13T12:00:00+00:00"   # 24 saat eski yayın (RSS'te olağan)
+    rss = NewsItem(id="r", source="CoinDesk", title="t1", url="u", published=old, fetched_at=_NOW)
+    prime = NewsItem(id="p", source="⚡direct", title="t2", url="u", published=old, fetched_at=_NOW)
+    live = NewsItem(id="l", source="⚡direct", title="t3", url="u", published=_NOW, fetched_at=_NOW)
+    nb.process_items(None, [prime], allow_notify=False)   # açılış tohumlaması
+    nb.process_items(None, [rss, live], allow_notify=True)
+    assert latency.summary()["ingest"]["count"] == 1      # yalnız canlı TreeNews
+    assert latency.source_summary()["rss"]["count"] == 1  # RSS kırılımda görünür
+    latency.reset()

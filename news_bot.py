@@ -1790,11 +1790,17 @@ def process_items(
     if not new_items:
         return 0, 0
 
-    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı
+    # Gecikme: kaynak yayını → bot alımı (boru hattının ilk halkası) + kaynak kırılımı.
+    # SLA'yı besleyen "ingest" aşamasına yalnız GERÇEK-ZAMANLI kaynaklar ve canlı tarama
+    # girer: RSS beslemeleri saatlerce eski haber taşır, açılış tohumlaması da eski
+    # haberleri bir kerede görür → p95 ~saatlere çıkıp latency guard'ı (halt_trade_on_latency)
+    # sürekli kapalı tutuyordu. RSS gecikmesi kaynak kırılımında görünür kalır.
     for it in new_items:
         ms = _ingest_ms(it)
-        latency.record("ingest", ms)
-        latency.record_source(_source_bucket(it), ms)
+        bucket = _source_bucket(it)
+        latency.record_source(bucket, ms)
+        if allow_notify and bucket != "rss":
+            latency.record("ingest", ms)
 
     _load_news_settings()
     threshold = _news_settings["alert_threshold"]

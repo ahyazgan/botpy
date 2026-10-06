@@ -102,6 +102,9 @@ MAX_ARCHIVE_SIGNALS = 5000  # SQLite arşivinde tutulacak max sinyal (sınırsı
 # Arşiv eşiği uyarı eşiğinden AYRI: bildirim gürültüsü artmadan eşik-altı (ör. 5-6) yönlü
 # sinyaller de backtest/alpha verisi olarak birikir. Uyarı eşiğinden yüksekse etkisiz.
 ARCHIVE_MIN_IMPACT = int(os.environ.get("ARCHIVE_MIN_IMPACT", "5"))
+# RSS medya için Claude ön-filtresi (maliyet): yalnız kural-adayı RSS haberleri Claude'a.
+# Geçmiş veride medya haberleri iki puanlayıcıyla da edge üretmedi. "0" ile kapatılır.
+CLAUDE_RSS_PREFILTER = os.environ.get("CLAUDE_RSS_PREFILTER", "1") != "0"
 ARCHIVE_PRUNE_EVERY = 200   # her N yeni sinyalde bir eski kayıtları buda
 MAX_NEWS_AGE_HOURS = 24     # bundan eski haberler feed'den düşer
 REQUEST_TIMEOUT   = 15
@@ -192,6 +195,8 @@ RSS_FEEDS: dict[str, str] = {
 # Binance yeni listeleme duyuruları (catalogId=48) — en yüksek etkili sinyal
 BINANCE_ANN_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query"
 BINANCE_ANN_BASE = "https://www.binance.com/en/support/announcement/"
+# 48 = yeni listeleme, 161 = delisting (geçmiş veride tek anlamlı edge: delist → short)
+BINANCE_ANN_CATALOGS = (48, 161)
 
 # TreeNews WebSocket — GERÇEK ZAMANLI haber (borsa duyuruları + Twitter + haber siteleri).
 # Ücretsiz, auth gerekmez. RSS'in 20sn gecikmesi yerine saniyeler içinde haber.
@@ -422,14 +427,16 @@ def fetch_rss(name: str, url: str) -> list[NewsItem]:
 
 def fetch_binance_announcements(session: requests.Session) -> list[NewsItem]:
     items: list[NewsItem] = []
-    r = session.get(
-        BINANCE_ANN_URL,
-        params={"catalogId": 48, "pageNo": 1, "pageSize": 20},
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    r.raise_for_status()
-    articles = (r.json().get("data") or {}).get("articles") or []
+    articles: list[dict[str, Any]] = []
+    for catalog in BINANCE_ANN_CATALOGS:
+        r = session.get(
+            BINANCE_ANN_URL,
+            params={"catalogId": catalog, "pageNo": 1, "pageSize": 20},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "en"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        articles += (r.json().get("data") or {}).get("articles") or []
     for a in articles:
         title = (a.get("title") or "").strip()
         code = a.get("code") or ""
@@ -1814,10 +1821,11 @@ def process_items(
                 notified.add(it.id)
 
     # Faz 2 — Claude ile rafine et (nihai skor); hata olursa kural skoru geçerli kalır
-    if USE_CLAUDE:
+    to_score = [it for it in new_items if _claude_worthy(it, threshold)] if USE_CLAUDE else []
+    if to_score:
         _t_score = time.monotonic()
         try:
-            score_with_claude(new_items)
+            score_with_claude(to_score)
             latency.record("score", (time.monotonic() - _t_score) * 1000.0)
         except Exception as e:
             log.warning("Claude puanlama başarısız, kural skoru geçerli: %s", e)
@@ -1865,6 +1873,22 @@ def process_items(
                     _archive_signal(it)
 
     return len(new_items), len(alerts)
+
+
+def _claude_worthy(it: NewsItem, threshold: int) -> bool:
+    """Bu haber Claude puanlamasına gitmeli mi (maliyet ön-filtresi). Saf.
+
+    RSS medya haberleri geçmiş veride (2023-2025, 1643 örnek) ne kural ne Claude
+    puanlamasıyla edge üretti → RSS'ten yalnız kural-adayı (arşive/uyarıya girebilecek)
+    olanlar Claude'a gider. TreeNews/Binance (gerçek-zamanlı, resmi) her zaman gider.
+    """
+    if not CLAUDE_RSS_PREFILTER or _source_bucket(it) != "rss":
+        return True
+    if it.impact >= _alert_threshold_for(it, threshold):
+        return True   # kural uyarı verecekse Claude rafine etsin (şişirilmiş kural skoru)
+    return (it.impact >= ARCHIVE_MIN_IMPACT
+            and it.direction in ("bullish", "bearish")
+            and any(c not in _NOT_TRADEABLE for c in it.coins))
 
 
 def _archive_only(items: list[NewsItem], alerts: list[NewsItem]) -> list[NewsItem]:
@@ -3377,6 +3401,12 @@ class SettingsPatch(BaseModel):
     auto_tune: bool | None = None
     use_learned_vetoes: bool | None = None
     regime_adapt: bool | None = None
+    blocked_coins: str | None = None
+    watch_coins: str | None = None
+    delist_playbook: bool | None = None
+    delist_sl_pct: float | None = None
+    delist_tp_pct: float | None = None
+    delist_hold_min: int | None = None
 
 
 @app.get("/settings")

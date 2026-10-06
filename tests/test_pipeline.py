@@ -205,3 +205,29 @@ def test_below_alert_skips_neutral_untradeable_and_priming(coin_pipeline, monkey
     scores["x"] = 6
     nb.process_items(None, [_item("x")], allow_notify=True)
     assert store.signal_span()["count"] == 0
+
+
+# ── Claude maliyet ön-filtresi: RSS'ten yalnız kural-adayları Claude'a ──────
+def test_claude_prefilter_skips_weak_rss(coin_pipeline, monkeypatch):
+    scores, dirs, _, _, _ = coin_pipeline
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    monkeypatch.setattr(nb, "CLAUDE_RSS_PREFILTER", True)
+    sent: list[str] = []
+    monkeypatch.setattr(nb, "score_with_claude", lambda items: sent.extend(it.id for it in items))
+    scores.update({"weak": 3, "cand": 6, "neut": 6, "tree": 2})
+    dirs["neut"] = "neutral"
+    items = [_item("weak", source="CoinDesk"), _item("cand", source="CoinDesk"),
+             _item("neut", source="CoinDesk"), _item("tree", source="⚡direct")]
+    nb.process_items(None, items, allow_notify=True)
+    assert sorted(sent) == ["cand", "tree"]   # zayıf/nötr RSS atlandı; TreeNews her zaman
+
+
+def test_claude_prefilter_off_sends_all(coin_pipeline, monkeypatch):
+    scores, _, _, _, _ = coin_pipeline
+    monkeypatch.setattr(nb, "USE_CLAUDE", True)
+    monkeypatch.setattr(nb, "CLAUDE_RSS_PREFILTER", False)
+    sent: list[str] = []
+    monkeypatch.setattr(nb, "score_with_claude", lambda items: sent.extend(it.id for it in items))
+    scores["weak"] = 3
+    nb.process_items(None, [_item("weak", source="CoinDesk")], allow_notify=True)
+    assert sent == ["weak"]
